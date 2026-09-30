@@ -257,6 +257,13 @@ pub(in crate::view) enum ContextMenuAction {
         section: BranchSection,
         name: String,
     },
+    /// Fetch a single branch with the exact git invocation GitComet's
+    /// command-line mode uses, so the right-click entry behaves identically.
+    FetchBranch {
+        repo_id: RepoId,
+        remote: String,
+        branch: String,
+    },
     SetHistoryScope {
         repo_id: RepoId,
         scope: gitcomet_core::domain::LogScope,

@@ -22,6 +22,33 @@ pub(super) fn model(
         Loadable::Ready(branch) => Some(branch.clone()),
         _ => None,
     });
+    // Computed up front so the menu can gate the "Fetch" entry on it.
+    let is_current_branch = active_branch_name
+        .as_ref()
+        .is_some_and(|branch| branch == &name);
+
+    // First command entry: fetch the selected (non-current) branch with the
+    // exact git invocation GitComet's command-line mode uses.
+    if !is_current_branch {
+        let (fetch_remote, fetch_branch) = match target {
+            BranchMenuTarget::Local { name } => ("origin".to_string(), name.clone()),
+            BranchMenuTarget::Remote { remote, branch } => {
+                (remote.to_string(), branch.to_string())
+            }
+        };
+        items.push(ContextMenuItem::Entry {
+            label: "Fetch".into(),
+            icon: Some("icons/arrow_down.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::FetchBranch {
+                repo_id,
+                remote: fetch_remote,
+                branch: fetch_branch,
+            }),
+        });
+    }
+
     let active_branch = repo.and_then(|r| match (&r.branches, active_branch_name.as_ref()) {
         (Loadable::Ready(branches), Some(head)) => {
             branches.iter().find(|branch| branch.name == *head)
@@ -46,9 +73,6 @@ pub(super) fn model(
                 })
             })
     });
-    let is_current_branch = active_branch_name
-        .as_ref()
-        .is_some_and(|branch| branch == &name);
     // Name the branch being moved rather than the opaque "HEAD".
     let current_branch_label = active_branch_name
         .clone()

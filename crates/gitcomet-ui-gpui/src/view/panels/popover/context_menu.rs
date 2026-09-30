@@ -1313,6 +1313,75 @@ impl PopoverHost {
             ContextMenuAction::FetchAll { repo_id } => {
                 self.store.dispatch(Msg::FetchAll { repo_id });
             }
+            ContextMenuAction::FetchBranch {
+                repo_id,
+                remote,
+                branch,
+            } => {
+                let workdir = match self.workdir_for_repo(repo_id) {
+                    Some(workdir) => workdir,
+                    None => {
+                        self.warn_repository_gone(cx);
+                        return;
+                    }
+                };
+                // Exact invocation mirroring GitComet's command-line fetch:
+                // git -c diff.mnemonicprefix=false -c core.quotepath=false \
+                //     --no-optional-locks fetch --prune --tags <remote> <branch>:<branch>
+                let refspec = format!("{branch}:{branch}");
+                let mut command = gitcomet_core::process::git_command();
+                command
+                    .arg("-c")
+                    .arg("diff.mnemonicprefix=false")
+                    .arg("-c")
+                    .arg("core.quotepath=false")
+                    .arg("--no-optional-locks")
+                    .arg("fetch")
+                    .arg("--prune")
+                    .arg("--tags")
+                    .arg(&remote)
+                    .arg(&refspec)
+                    .current_dir(&workdir);
+                let branch_label = branch.clone();
+                let remote_label = remote.clone();
+                let weak = cx.weak_entity();
+                window
+                    .spawn(cx, async move |cx| {
+                        match command.output() {
+                            Ok(output) => {
+                                let success = output.status.success();
+                                let detail = gitcomet_core::process::bytes_to_text_preserving_utf8(
+                                    &output.stderr,
+                                );
+                                let _ = weak.update(cx, |this, cx| {
+                                    if success {
+                                        this.push_toast(
+                                            components::ToastKind::Success,
+                                            format!("Fetched {remote_label}/{branch_label}"),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.push_toast(
+                                            components::ToastKind::Error,
+                                            format!("Fetch failed for {branch_label}: {detail}"),
+                                            cx,
+                                        );
+                                    }
+                                });
+                            }
+                            Err(err) => {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.push_toast(
+                                        components::ToastKind::Error,
+                                        format!("Could not run git fetch: {err}"),
+                                        cx,
+                                    );
+                                });
+                            }
+                        }
+                    })
+                    .detach();
+            }
             ContextMenuAction::PruneMergedBranches { repo_id } => {
                 self.store.dispatch(Msg::PruneMergedBranches { repo_id });
             }
