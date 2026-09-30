@@ -355,6 +355,21 @@ pub(super) fn fetch_all(
     }]
 }
 
+pub(super) fn fetch_branch(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    remote: String,
+    branch: String,
+) -> Vec<Effect> {
+    bump_in_flight(repos, state, repo_id, InFlightKind::Pull);
+    vec![Effect::FetchBranch {
+        repo_id,
+        remote,
+        branch,
+    }]
+}
+
 pub(super) fn prune_merged_branches(
     repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
@@ -1151,6 +1166,7 @@ pub(super) fn repo_command_finished(
     let fetch_like_command = matches!(
         &command,
         RepoCommandKind::FetchAll
+            | RepoCommandKind::FetchBranch { .. }
             | RepoCommandKind::PruneMergedBranches
             | RepoCommandKind::Pull { .. }
             | RepoCommandKind::PullBranch { .. }
@@ -1194,6 +1210,7 @@ pub(super) fn repo_command_finished(
     }
     match &command {
         RepoCommandKind::FetchAll
+        | RepoCommandKind::FetchBranch { .. }
         | RepoCommandKind::PruneMergedBranches
         | RepoCommandKind::PruneLocalTags => {
             repo_state.pull_in_flight = repo_state.pull_in_flight.saturating_sub(1);

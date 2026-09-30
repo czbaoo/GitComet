@@ -1139,6 +1139,34 @@ impl GixRepo {
         self.fetch_all_with_optional_output_impl(prune, true)
     }
 
+    /// Fetch a single branch from a remote, mirroring the invocation GitComet's
+    /// command-line fetch uses:
+    /// `git -c diff.mnemonicprefix=false -c core.quotepath=false \
+    ///     --no-optional-locks fetch --prune --tags <remote> <branch>:<branch>`
+    pub(super) fn fetch_branch_with_output_impl(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<CommandOutput> {
+        validate_ref_like_arg(remote, "remote name")?;
+        validate_ref_like_arg(branch, "branch name")?;
+        let refspec = format!("{branch}:{branch}");
+        let label = format!("git fetch --prune --tags {remote} {refspec}");
+        let mut cmd = self.git_workdir_cmd();
+        cmd.arg("-c")
+            .arg("diff.mnemonicprefix=false")
+            .arg("-c")
+            .arg("core.quotepath=false")
+            .arg("--no-optional-locks")
+            .arg("fetch")
+            .arg("--prune")
+            .arg("--tags")
+            .arg("--")
+            .arg(remote)
+            .arg(&refspec);
+        run_git_command_with_optional_output(cmd, &label, true)
+    }
+
     /// Apply the pull mode's integration flags. Being explicit about
     /// fast-forward behavior keeps a user's `pull.ff` config from turning a
     /// fast-forwardable pull into a merge commit.

@@ -32,6 +32,7 @@ fn pull_mode_suffix(mode: PullMode) -> Option<&'static str> {
 fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
     let context = match command {
         RepoCommandKind::FetchAll => "All remotes".to_string(),
+        RepoCommandKind::FetchBranch { remote, branch } => format!("{remote}/{branch}"),
         RepoCommandKind::PruneMergedBranches => "Merged local branches".to_string(),
         RepoCommandKind::PruneLocalTags => "Local tags missing on remotes".to_string(),
         RepoCommandKind::Pull { mode } => pull_mode_suffix(*mode).map_or_else(
@@ -823,6 +824,27 @@ pub(super) fn schedule_fetch_all(
         repo_id,
         RepoCommandKind::FetchAll,
         move |repo| run_with_git_auth(auth, || repo.fetch_all_with_output_prune(prune)),
+    );
+}
+
+pub(super) fn schedule_fetch_branch(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    remote: String,
+    branch: String,
+) {
+    schedule_repo_command(
+        executor,
+        repos,
+        msg_tx,
+        repo_id,
+        RepoCommandKind::FetchBranch {
+            remote: remote.clone(),
+            branch: branch.clone(),
+        },
+        move |repo| repo.fetch_branch_with_output(&remote, &branch),
     );
 }
 

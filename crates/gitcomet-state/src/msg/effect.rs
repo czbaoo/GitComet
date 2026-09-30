@@ -494,6 +494,11 @@ pub enum Effect {
         prune: bool,
         auth: Option<StagedGitAuth>,
     },
+    FetchBranch {
+        repo_id: RepoId,
+        remote: String,
+        branch: String,
+    },
     PruneMergedBranches {
         repo_id: RepoId,
     },

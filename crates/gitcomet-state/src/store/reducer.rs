@@ -315,6 +315,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::CommitAmend { .. }
             | Msg::SafePushAfterCommit { .. }
             | Msg::FetchAll { .. }
+            | Msg::FetchBranch { .. }
             | Msg::PruneMergedBranches { .. }
             | Msg::PruneLocalTags { .. }
             | Msg::Pull { .. }
@@ -497,6 +498,11 @@ fn clear_stale_clone_banner_error(state: &mut AppState) {
 fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Option<Msg> {
     Some(match command {
         RepoCommandKind::FetchAll => Msg::FetchAll { repo_id },
+        RepoCommandKind::FetchBranch { remote, branch } => Msg::FetchBranch {
+            repo_id,
+            remote,
+            branch,
+        },
         RepoCommandKind::PruneMergedBranches => Msg::PruneMergedBranches { repo_id },
         RepoCommandKind::PruneLocalTags => Msg::PruneLocalTags { repo_id },
         RepoCommandKind::Pull { mode } => Msg::Pull { repo_id, mode },
@@ -1953,6 +1959,11 @@ fn reduce_inner(
             actions_emit_effects::safe_push_after_commit(repo_id, context)
         }
         Msg::FetchAll { repo_id } => actions_emit_effects::fetch_all(repos, state, repo_id),
+        Msg::FetchBranch {
+            repo_id,
+            remote,
+            branch,
+        } => actions_emit_effects::fetch_branch(repos, state, repo_id, remote, branch),
         Msg::PruneMergedBranches { repo_id } => {
             actions_emit_effects::prune_merged_branches(repos, state, repo_id)
         }

@@ -519,7 +519,23 @@ fn open_gitcomet_window(
         .map(|h| px(h as f32))
         .unwrap_or(default_size.height)
         .max(min_size.height);
-    let bounds = Bounds::centered(None, size(restored_w, restored_h), cx);
+    let mut bounds = Bounds::centered(None, size(restored_w, restored_h), cx);
+    // Keep the window fully inside the display so its top control bar is never
+    // pushed above the visible area. A window size restored from a previous
+    // session on a larger monitor can exceed the current display, and
+    // `Bounds::centered` would otherwise place its top (and the control bar)
+    // at a negative offset, off the screen.
+    if let Some(display) = cx.primary_display() {
+        let screen = display.bounds();
+        let clamped_width = bounds.size.width.clamp(px(0.0), screen.size.width);
+        let clamped_height = bounds.size.height.clamp(px(0.0), screen.size.height);
+        let max_x = (screen.origin.x + screen.size.width - clamped_width).max(screen.origin.x);
+        let max_y = (screen.origin.y + screen.size.height - clamped_height).max(screen.origin.y);
+        bounds.size.width = clamped_width;
+        bounds.size.height = clamped_height;
+        bounds.origin.x = bounds.origin.x.clamp(screen.origin.x, max_x);
+        bounds.origin.y = bounds.origin.y.clamp(screen.origin.y, max_y);
+    }
     let window_title = launch.title.clone();
     let app_id = launch.app_id.clone();
     let view_config = launch.view_config.clone();

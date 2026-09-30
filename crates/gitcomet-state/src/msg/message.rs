@@ -792,6 +792,11 @@ pub enum Msg {
     FetchAll {
         repo_id: RepoId,
     },
+    FetchBranch {
+        repo_id: RepoId,
+        remote: String,
+        branch: String,
+    },
     PruneMergedBranches {
         repo_id: RepoId,
     },

@@ -1282,6 +1282,7 @@ fn summarize_command(
     if !ok {
         let label = match command {
             RepoCommandKind::FetchAll => "Fetch",
+            RepoCommandKind::FetchBranch { .. } => "Fetch",
             RepoCommandKind::PruneMergedBranches => "Prune merged branches",
             RepoCommandKind::PruneLocalTags => "Prune local tags",
             RepoCommandKind::Pull { .. } => "Pull",
@@ -1370,6 +1371,14 @@ fn summarize_command(
             } else {
                 "Fetch: Synchronized".to_string()
             }
+        }
+        RepoCommandKind::FetchBranch { remote, branch } => {
+            let base = if output.stderr.trim().is_empty() && output.stdout.trim().is_empty() {
+                "Already up to date"
+            } else {
+                "Synchronized"
+            };
+            format!("Fetch {remote}/{branch}: {base}")
         }
         RepoCommandKind::PruneMergedBranches => "Prune merged branches: Completed".to_string(),
         RepoCommandKind::PruneLocalTags => "Prune local tags: Completed".to_string(),

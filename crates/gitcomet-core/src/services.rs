@@ -1284,6 +1284,12 @@ pub trait GitRepository: Send + Sync {
         self.fetch_all_with_output()
     }
 
+    fn fetch_branch_with_output(&self, _remote: &str, _branch: &str) -> Result<CommandOutput> {
+        Err(Error::new(ErrorKind::Unsupported(
+            "fetching a single branch is not implemented for this backend",
+        )))
+    }
+
     fn pull_with_output(&self, mode: PullMode) -> Result<CommandOutput> {
         self.pull(mode)?;
         Ok(CommandOutput::empty_success("git pull"))

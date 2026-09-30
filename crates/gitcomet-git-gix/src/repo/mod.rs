@@ -1144,6 +1144,10 @@ impl GitRepository for GixRepo {
         self.fetch_all_with_output_impl(prune)
     }
 
+    fn fetch_branch_with_output(&self, remote: &str, branch: &str) -> Result<CommandOutput> {
+        self.fetch_branch_with_output_impl(remote, branch)
+    }
+
     fn pull(&self, mode: PullMode) -> Result<()> {
         self.pull_impl(mode)
     }
