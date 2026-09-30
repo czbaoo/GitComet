@@ -21,8 +21,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        # 尊重仓库内的 rust-toolchain.toml（channel = 1.98）
+        # dtolnay/rust-toolchain 必须显式传 toolchain（不会自动读 rust-toolchain.toml）。
+        # 与仓库 rust-toolchain.toml 的 channel = "1.98" 保持一致，并装上同款组件。
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98
+          components: rustfmt, clippy
 
       - name: Cache cargo registry, index and build artifacts
         uses: Swatinem/rust-cache@v2
