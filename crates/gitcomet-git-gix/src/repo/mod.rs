@@ -493,6 +493,11 @@ pub(crate) struct GixRepo {
     /// Shared by row, diff and preview readers; refreshed with support metadata.
     large_file_scan: std::sync::Mutex<Option<Arc<large_files::CommittedPointerScan>>>,
     tree_index_cache: std::sync::Mutex<Option<TreeIndexCacheEntry>>,
+    /// Paths a stage/unstage just touched in the index. The next status reload
+    /// reads these to update the staged cache incrementally (recomputing only
+    /// the affected paths) instead of re-walking the whole tree↔index diff.
+    /// Cleared once it has served a reload.
+    pending_affected_paths: std::sync::Mutex<Option<Vec<PathBuf>>>,
     log_page_cache: std::sync::Mutex<Vec<LogPageCacheEntry>>,
     history_authors_cache: std::sync::Mutex<Option<log::HistoryAuthorsCache>>,
     range_reader: std::sync::Mutex<Option<RangeReader>>,
@@ -552,6 +557,7 @@ impl GixRepo {
             branch_tracking_config: std::sync::Mutex::new(None),
             large_file_scan: Default::default(),
             tree_index_cache: std::sync::Mutex::new(None),
+            pending_affected_paths: std::sync::Mutex::new(None),
             log_page_cache: std::sync::Mutex::new(Vec::new()),
             history_authors_cache: Default::default(),
             range_reader: Default::default(),

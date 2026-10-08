@@ -98,23 +98,49 @@ impl GixRepo {
         let head_oid = super::history::gix_head_id_or_none(&repo)?;
         cancellation.check_cancelled()?;
 
-        let cached_staged = {
+        // Read the staged cache once: the exact entry (HEAD + index stamp) and,
+        // if present, the entry for this HEAD under any stamp. The latter is the
+        // base for an incremental update after a stage/unstage touched only a
+        // few paths (see `pending_affected_paths`).
+        let (exact_cached_staged, prior_staged) = {
             let guard = self
                 .tree_index_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard
-                .as_ref()
-                .filter(|c| c.head_oid == head_oid && c.index_stamp == index_stamp)
-                .map(|c| c.staged.clone())
+            let entry = guard.as_ref().filter(|c| c.head_oid == head_oid);
+            (
+                entry
+                    .filter(|c| c.index_stamp == index_stamp)
+                    .map(|c| c.staged.clone()),
+                entry.map(|c| c.staged.clone()),
+            )
         };
-        let used_cached_staged = cached_staged.is_some();
+        let used_exact_cached = exact_cached_staged.is_some();
 
-        let staged = if let Some(cached_staged) = cached_staged {
-            cached_staged
+        // A stage/unstage just touched a handful of paths: recompute only those
+        // instead of the whole tree↔index diff, reusing the prior staged cache.
+        let pending_affected = self
+            .pending_affected_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let mut applied_incremental = false;
+
+        let staged = if let Some(exact) = exact_cached_staged {
+            exact
+        } else if let (Some(base), Some(paths)) = (&prior_staged, &pending_affected)
+            && paths.len() <= MAX_INCREMENTAL_STAGED_PATHS
+            && !base.iter().any(|e| e.kind == FileStatusKind::Renamed)
+        {
+            match staged_status_incremental(&repo, head_oid, base, paths) {
+                Ok(updated) => {
+                    applied_incremental = true;
+                    updated
+                }
+                Err(_) => staged_status_full(&repo)?,
+            }
         } else {
-            let tree = crate::refs::head_tree_id_or_empty(&repo)?;
-            collect_staged_status_from_tree_index(&repo, &tree)?
+            staged_status_full(&repo)?
         };
         cancellation.check_cancelled()?;
         // Use the same direct worktree walk on the first scan as on cached
@@ -132,7 +158,10 @@ impl GixRepo {
         )?;
         cancellation.check_cancelled()?;
 
-        if !used_cached_staged {
+        // Persist the staged cache under the current index stamp. After an
+        // incremental update the stamp changed, so re-store; an exact hit needs
+        // no rewrite.
+        if !used_exact_cached || applied_incremental {
             *self
                 .tree_index_cache
                 .lock()
@@ -220,6 +249,49 @@ impl GixRepo {
 
         if let Some(cached) = self.cached_staged_status(head_oid, &index_stamp) {
             return Ok(cached);
+        }
+
+        // Incremental update after a stage/unstage touched a few paths: reuse the
+        // prior staged cache (same HEAD) and recompute only the affected paths,
+        // avoiding the full tree↔index walk.
+        let prior_staged = {
+            let guard = self
+                .tree_index_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .as_ref()
+                .filter(|c| c.head_oid == head_oid)
+                .map(|c| c.staged.clone())
+        };
+        let pending_affected = self
+            .pending_affected_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let (Some(base), Some(paths)) = (&prior_staged, &pending_affected)
+            && paths.len() <= MAX_INCREMENTAL_STAGED_PATHS
+            && !base.iter().any(|e| e.kind == FileStatusKind::Renamed)
+        {
+            if let Ok(mut updated) = staged_status_incremental(&repo, head_oid, base, paths) {
+                if self.may_have_gitlink_status_supplement(&repo, &index_stamp) {
+                    supplement_gitlink_status_from_porcelain(
+                        &self.spec.workdir,
+                        &repo,
+                        &mut updated,
+                        &mut Vec::new(),
+                    )?;
+                }
+                sort_and_dedup_status_entries(&mut updated);
+                remove_conflicted_paths_from_staged(
+                    &mut updated,
+                    gix_unmerged_conflicts(&repo)?
+                        .into_iter()
+                        .map(|(path, _)| path),
+                );
+                self.store_staged_status_cache(head_oid, index_stamp, &updated);
+                return Ok(updated);
+            }
         }
 
         let Some(head_oid) = head_oid else {
@@ -433,6 +505,123 @@ fn collect_staged_status_from_tree_index(
     )
     .map_err(|e| Error::new(ErrorKind::Backend(format!("gix tree/index status: {e}"))))?;
     Ok(staged)
+}
+
+/// Above this many affected paths a stage/unstage falls back to a full
+/// tree↔index recompute rather than an incremental update. A stage/unstage
+/// touches at most a handful of paths, so the incremental path is the common
+/// case; this bound keeps an unusual bulk change from doing more per-path work
+/// than a single full walk.
+const MAX_INCREMENTAL_STAGED_PATHS: usize = 16;
+
+/// Recomputes the staged status the slow way: a full tree↔index diff. Used both
+/// as the common path and as the fallback when an incremental update is unsafe.
+fn staged_status_full(repo: &gix::Repository) -> Result<Vec<FileStatus>> {
+    let tree = crate::refs::head_tree_id_or_empty(repo)?;
+    collect_staged_status_from_tree_index(repo, &tree)
+}
+
+/// Updates `base` (the prior staged status for the same HEAD) for the given
+/// affected `paths` only, by comparing each path's HEAD-tree entry against its
+/// index entry. This is the targeted counterpart to [`staged_status_full`] and
+/// is what lets staging a single file avoid re-walking the whole tree↔index
+/// diff.
+fn staged_status_incremental(
+    repo: &gix::Repository,
+    head_oid: Option<gix::ObjectId>,
+    base: &[FileStatus],
+    paths: &[PathBuf],
+) -> Result<Vec<FileStatus>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| Error::new(ErrorKind::Backend(format!("gix index: {e}"))))?;
+    let mut staged = base.to_vec();
+    for path in paths {
+        // Drop any entry this path had, then re-add its current staged state.
+        staged.retain(|entry| &entry.path != path);
+        if let Some(status) = staged_status_for_path(repo, head_oid, &index, path)? {
+            staged.push(status);
+        }
+    }
+    Ok(staged)
+}
+
+/// Computes the staged `FileStatus` for a single path by comparing HEAD's tree
+/// entry against the index entry — the per-path counterpart to gix's
+/// `tree_index_status` walk.
+///
+/// Returns `Ok(None)` when the path is clean in the index (not staged), and
+/// `Err` (signalling a full recompute) on any ambiguity: a conflict, or a path
+/// that vanished from the unconflicted index without a clean deletion.
+fn staged_status_for_path(
+    repo: &gix::Repository,
+    head_oid: Option<gix::ObjectId>,
+    index: &gix::index::File,
+    path: &Path,
+) -> Result<Option<FileStatus>> {
+    use gix::index::entry::Stage;
+    let path_bstr = gix::path::os_str_into_bstr(path.as_os_str()).map_err(|_| {
+        Error::new(ErrorKind::Backend(String::from(
+            "staged incremental: path is not valid UTF-8",
+        )))
+    })?;
+    let index_entry = index.entry_by_path_and_stage(path_bstr, Stage::Unconflicted);
+    let (tree_oid, tree_mode): (Option<gix::ObjectId>, Option<gix::index::entry::Mode>) = match head_oid
+    {
+        Some(oid) => repo
+            .find_commit(oid)
+            .ok()
+            .and_then(|commit| commit.tree().ok())
+            .and_then(|tree| {
+                tree.lookup_entry_by_path(path)
+                    .ok()
+                    .flatten()
+                    .map(|entry| (Some(entry.object_id()), Some(entry.mode().into())))
+            })
+            .unwrap_or((None, None)),
+        None => (None, None),
+    };
+
+    if index_entry.is_none() && tree_oid.is_some() {
+        // The path disappeared from the unconflicted index. That is a clean
+        // deletion unless a conflict occupies a higher stage, in which case the
+        // full recompute reports it correctly.
+        let conflicted = [Stage::Base, Stage::Ours, Stage::Theirs]
+            .iter()
+            .any(|stage| index.entry_by_path_and_stage(path_bstr, *stage).is_some());
+        if conflicted {
+            return Err(Error::new(ErrorKind::Backend(
+                "staged incremental: conflicted path, falling back".into(),
+            )));
+        }
+    }
+
+    match (index_entry, tree_oid) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Ok(Some(FileStatus {
+            path: path.to_path_buf(),
+            kind: FileStatusKind::Added,
+            conflict: None,
+        })),
+        (None, Some(_)) => Ok(Some(FileStatus {
+            path: path.to_path_buf(),
+            kind: FileStatusKind::Deleted,
+            conflict: None,
+        })),
+        (Some(index_entry), Some(tree_oid)) => {
+            let same = index_entry.id == tree_oid
+                && index_entry.mode == tree_mode.unwrap_or(index_entry.mode);
+            if same {
+                Ok(None)
+            } else {
+                Ok(Some(FileStatus {
+                    path: path.to_path_buf(),
+                    kind: FileStatusKind::Modified,
+                    conflict: None,
+                }))
+            }
+        }
+    }
 }
 
 fn collect_staged_index_paths_from_tree_index(
