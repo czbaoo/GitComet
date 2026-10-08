@@ -11,6 +11,8 @@ pub struct UiSettings {
     pub repo_sidebar_pinned_branches: Option<BTreeMap<PathBuf, BTreeSet<String>>>,
     pub theme_mode: Option<String>,
     pub ui_scale_percent: Option<u32>,
+    pub window_controls_mode: Option<String>,
+    pub browser_open_target: Option<String>,
     pub ui_density: Option<String>,
     pub ui_font_size_px: Option<u32>,
     pub editor_font_size_px: Option<u32>,
@@ -23,6 +25,7 @@ pub struct UiSettings {
     pub show_timezone: Option<bool>,
     pub change_tracking_view: Option<String>,
     pub file_list_layout: Option<String>,
+    pub file_list_sort: Option<String>,
     pub repo_picker_sort: Option<String>,
     /// Whole replacement set — the repository picker owns it and always writes
     /// every collapsed section it knows about.
@@ -34,6 +37,7 @@ pub struct UiSettings {
     pub annotate_enabled: Option<bool>,
     pub diff_reveal_whitespace_chars: Option<bool>,
     pub diff_word_wrap: Option<bool>,
+    pub diff_tab_size: Option<u8>,
     pub diff_show_line_numbers: Option<bool>,
     pub remote_markdown_image_policy: Option<String>,
     pub allowed_remote_protocols: Option<BTreeSet<String>>,
@@ -60,11 +64,15 @@ pub struct UiSettings {
     pub history_relative_dates: Option<bool>,
     pub history_highlight_commit_chain: Option<bool>,
     pub file_browser_follow_selected_commit: Option<bool>,
+    pub annex_hide_bookkeeping_refs: Option<bool>,
+    pub annex_pull_push_on_adjusted: Option<bool>,
+    pub annex_sync_content: Option<bool>,
     pub history_tag_fetch_mode: Option<GitLogTagFetchMode>,
     pub default_history_mode: Option<HistoryMode>,
     pub commit_push_after_enabled: Option<bool>,
     pub default_tag_type: Option<DefaultTagType>,
     pub fetch_prune_deleted_remote_branches: Option<bool>,
+    pub recommend_repo_maintenance: Option<bool>,
     pub git_executable_path: Option<Option<PathBuf>>,
     pub external_code_editor: Option<Option<ExternalCodeEditorSetting>>,
 }
@@ -86,9 +94,7 @@ macro_rules! apply_setting {
 }
 
 pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Result<()> {
-    with_session_file_persist_lock(|| {
-        let mut file = load_file(path).unwrap_or_default();
-        file.version = CURRENT_SESSION_FILE_VERSION;
+    update_session_file(path, |file| {
         if settings.window_width.is_some() && settings.window_height.is_some() {
             file.window_width = settings.window_width;
             file.window_height = settings.window_height;
@@ -106,6 +112,8 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         }
         apply_setting!(settings, file, theme_mode);
         apply_setting!(settings, file, ui_scale_percent);
+        apply_setting!(settings, file, window_controls_mode);
+        apply_setting!(settings, file, browser_open_target);
         apply_setting!(settings, file, ui_density);
         apply_setting!(settings, file, ui_font_size_px);
         apply_setting!(settings, file, editor_font_size_px);
@@ -118,6 +126,7 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         apply_setting!(settings, file, show_timezone);
         apply_setting!(settings, file, change_tracking_view);
         apply_setting!(settings, file, file_list_layout);
+        apply_setting!(settings, file, file_list_sort);
         apply_setting!(settings, file, repo_picker_sort);
         // Owned by the repository picker (`repo_picker::persist_collapsed_sections`).
         apply_setting!(settings, file, repo_picker_collapsed_sections);
@@ -133,6 +142,7 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         apply_setting!(settings, file, mergetool_show_line_numbers);
         apply_setting!(settings, file, mergetool_view_three_way);
         apply_setting!(settings, file, diff_word_wrap);
+        apply_setting!(settings, file, diff_tab_size);
         apply_setting!(settings, file, remote_markdown_image_policy);
         apply_setting!(settings, file, allowed_remote_protocols);
         apply_setting!(settings, file, check_for_updates_on_startup);
@@ -163,6 +173,9 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         }
         apply_setting!(settings, file, history_highlight_commit_chain);
         apply_setting!(settings, file, file_browser_follow_selected_commit);
+        apply_setting!(settings, file, annex_hide_bookkeeping_refs);
+        apply_setting!(settings, file, annex_pull_push_on_adjusted);
+        apply_setting!(settings, file, annex_sync_content);
         apply_setting!(settings, file, history_relative_dates);
         apply_setting!(settings, file, history_tag_fetch_mode);
         if let Some(value) = settings.default_history_mode {
@@ -171,6 +184,7 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
         apply_setting!(settings, file, commit_push_after_enabled);
         apply_setting!(settings, file, default_tag_type);
         apply_setting!(settings, file, fetch_prune_deleted_remote_branches);
+        apply_setting!(settings, file, recommend_repo_maintenance);
         if let Some(path) = settings.git_executable_path {
             file.git_executable_path = path.map(|path| path_storage_key(&path));
         }
@@ -178,6 +192,27 @@ pub fn persist_ui_settings_to_path(settings: UiSettings, path: &Path) -> io::Res
             file.external_code_editor = editor.map(external_code_editor_to_file);
         }
 
-        persist_to_path(path, &file)
+        SessionUpdate::Write
+    })
+}
+
+/// The focused mergetool's window size, kept apart from the legacy
+/// `window_width`/`window_height` that normal windows and workspaces rewrite.
+pub fn persist_mergetool_window_size(width: u32, height: u32) -> io::Result<()> {
+    let Some(path) = default_session_file_path() else {
+        return Ok(());
+    };
+    persist_mergetool_window_size_to_path(width, height, &path)
+}
+
+pub fn persist_mergetool_window_size_to_path(
+    width: u32,
+    height: u32,
+    path: &Path,
+) -> io::Result<()> {
+    update_session_file(path, |file| {
+        file.mergetool_window_width = Some(width);
+        file.mergetool_window_height = Some(height);
+        SessionUpdate::Write
     })
 }

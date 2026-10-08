@@ -1,3 +1,6 @@
+use super::operation_progress::{
+    MAINTENANCE_RECOMMENDATION_TEXT, MaintenanceRecommendation, OperationProgress,
+};
 use super::*;
 use gitcomet_state::model::SubmoduleAddProgressState;
 
@@ -12,6 +15,7 @@ pub(super) struct ToastHost {
     root_view: WeakEntity<GitCometView>,
 
     toasts: Vec<ToastState>,
+    errors_hidden: bool,
     /// Monotonic, so an id is never reused. Deriving the next id from
     /// `toasts.last()` restarted numbering whenever the list emptied, and both
     /// removal paths are deferred — the TTL timer below and the launch
@@ -23,9 +27,16 @@ pub(super) struct ToastHost {
     clone_progress_dest: Option<std::sync::Arc<std::path::PathBuf>>,
     submodule_add_progress: Vec<SubmoduleAddProgressState>,
     hook_progress: Vec<HookProgressToast>,
+    operation_progress: Vec<OperationProgress>,
+    /// Asked until answered: never expires and is never pushed out of view.
+    maintenance_recommendations: Vec<MaintenanceRecommendation>,
+    /// Repaints elapsed times while an operation card is up.
+    progress_ticker: Option<gpui::Task<()>>,
     /// Progress remains live while Activity is open, but compact progress for
     /// the repository represented by that dialog must not render behind it.
     hook_activity_dialog_repo: Option<RepoId>,
+    #[cfg(any(test, feature = "benchmarks"))]
+    pub(in crate::view) render_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,13 +57,6 @@ fn clone_progress_shell_border_color(theme: AppTheme) -> gpui::Rgba {
     )
 }
 
-fn clone_progress_shell_accent_color(theme: AppTheme) -> gpui::Rgba {
-    with_alpha(
-        theme.colors.accent.foreground,
-        if theme.is_dark { 0.20 } else { 0.14 },
-    )
-}
-
 fn toast_viewport_corner() -> ToastViewportCorner {
     ToastViewportCorner::BottomLeft
 }
@@ -67,6 +71,15 @@ fn strip_code_message_indentation(message: &str) -> String {
         .map(|line| line.strip_prefix("    ").unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// How long a toast stays: errors until the user closes them.
+fn toast_ttl(kind: components::ToastKind) -> Option<Duration> {
+    match kind {
+        components::ToastKind::Error => None,
+        components::ToastKind::Warning => Some(Duration::from_secs(10)),
+        components::ToastKind::Success => Some(Duration::from_secs(6)),
+    }
 }
 
 fn apply_clone_progress_sync(
@@ -190,33 +203,35 @@ impl ToastHost {
             theme,
             root_view,
             toasts: Vec::new(),
+            errors_hidden: false,
             next_toast_id: 1,
             clone_progress: None,
             clone_progress_last_seq: 0,
             clone_progress_dest: None,
             submodule_add_progress: Vec::new(),
             hook_progress: Vec::new(),
+            operation_progress: Vec::new(),
+            maintenance_recommendations: Vec::new(),
+            progress_ticker: None,
             hook_activity_dialog_repo: None,
+            #[cfg(any(test, feature = "benchmarks"))]
+            render_count: 0,
         }
     }
 
-    fn route_error_to_banner(&mut self, message: String, cx: &mut gpui::Context<Self>) -> bool {
-        let root_view = self.root_view.clone();
-        cx.defer(move |cx| {
-            let _ = root_view.update(cx, |root, cx| {
-                root.show_error_banner(None, message);
-                cx.notify();
-            });
-        });
-        true
+    pub(super) fn set_errors_hidden(&mut self, hidden: bool, cx: &mut gpui::Context<Self>) {
+        if self.errors_hidden != hidden {
+            self.errors_hidden = hidden;
+            cx.notify();
+        }
     }
 
     pub(super) fn set_theme(&mut self, theme: AppTheme, cx: &mut gpui::Context<Self>) {
         self.theme = theme;
         for toast in &self.toasts {
-            toast
-                .input
-                .update(cx, |input, cx| input.set_theme(theme, cx));
+            if let ToastBody::Text { input, .. } = &toast.body {
+                input.update(cx, |input, cx| input.set_theme(theme, cx));
+            }
         }
         cx.notify();
     }
@@ -227,24 +242,108 @@ impl ToastHost {
         message: String,
         cx: &mut gpui::Context<Self>,
     ) {
-        if matches!(kind, components::ToastKind::Error)
-            && self.route_error_to_banner(message.clone(), cx)
-        {
+        if kind == components::ToastKind::Error {
+            self.push_error(ErrorReport::message(None, message), cx);
             return;
         }
-        let ttl = match kind {
-            components::ToastKind::Error => Duration::from_secs(15),
-            components::ToastKind::Warning => Duration::from_secs(10),
-            components::ToastKind::Success => Duration::from_secs(6),
-        };
         let _ = self.push_toast_inner(
             kind,
             message,
             Vec::new(),
             ToastDismissBehavior::Remove,
-            Some(ttl),
+            toast_ttl(kind),
             cx,
         );
+    }
+
+    /// Show `report` until the user closes it. The same message again bumps
+    /// the toast already showing it instead of stacking a copy.
+    pub(super) fn push_error(&mut self, report: ErrorReport, cx: &mut gpui::Context<Self>) {
+        if report.message.trim().is_empty() {
+            return;
+        }
+        let existing = self.toasts.iter().position(|toast| {
+            matches!(&toast.body, ToastBody::Error(notice) if notice.message == report.message)
+        });
+        if let Some(ix) = existing {
+            let mut toast = self.toasts.remove(ix);
+            if let ToastBody::Error(notice) = &mut toast.body {
+                std::rc::Rc::make_mut(notice).repeat(report);
+            }
+            self.toasts.push(toast);
+            cx.notify();
+            return;
+        }
+        let id = self.next_id();
+        self.toasts.push(ToastState {
+            id,
+            kind: components::ToastKind::Error,
+            body: ToastBody::Error(std::rc::Rc::new(ErrorNotice::new(report))),
+            actions: Vec::new(),
+            dismiss_behavior: ToastDismissBehavior::Remove,
+            ttl: None,
+        });
+        cx.notify();
+    }
+
+    /// Errors on screen, newest first.
+    pub(super) fn error_notices(&self) -> Vec<(u64, std::rc::Rc<ErrorNotice>)> {
+        self.toasts
+            .iter()
+            .rev()
+            .filter_map(|toast| match &toast.body {
+                ToastBody::Error(notice) => Some((toast.id, std::rc::Rc::clone(notice))),
+                ToastBody::Text { .. } => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn dismiss_all_errors(&mut self, cx: &mut gpui::Context<Self>) {
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|toast| !matches!(toast.body, ToastBody::Error(_)));
+        if self.toasts.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Drop the errors of repositories that are no longer open.
+    pub(super) fn retain_errors_of_open_repos(
+        &mut self,
+        is_open: impl Fn(RepoId) -> bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let before = self.toasts.len();
+        self.toasts.retain(|toast| match &toast.body {
+            ToastBody::Error(notice) => notice.repo_id.is_none_or(&is_open),
+            ToastBody::Text { .. } => true,
+        });
+        if self.toasts.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Open the details dialog on the error shown by toast `id`.
+    fn open_error_details(&self, id: u64, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let root_view = self.root_view.clone();
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                let _ = root_view.update(cx, |root, cx| {
+                    root.open_popover_centered(
+                        PopoverKind::ErrorDetails { toast_id: id },
+                        window,
+                        cx,
+                    );
+                });
+            });
+        });
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_toast_id;
+        self.next_toast_id = self.next_toast_id.wrapping_add(1).max(1);
+        id
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -256,16 +355,16 @@ impl ToastHost {
         link_label: String,
         cx: &mut gpui::Context<Self>,
     ) {
-        if matches!(kind, components::ToastKind::Error)
-            && self.route_error_to_banner(message.clone(), cx)
-        {
+        if kind == components::ToastKind::Error {
+            self.push_error(
+                ErrorReport::message(None, message).with_action(ErrorAction::OpenUrl {
+                    url: link_url,
+                    label: link_label,
+                }),
+                cx,
+            );
             return;
         }
-        let ttl = match kind {
-            components::ToastKind::Error => Duration::from_secs(15),
-            components::ToastKind::Warning => Duration::from_secs(10),
-            components::ToastKind::Success => Duration::from_secs(6),
-        };
         let _ = self.push_toast_inner(
             kind,
             message,
@@ -274,7 +373,29 @@ impl ToastHost {
                 label: link_label,
             }],
             ToastDismissBehavior::Remove,
-            Some(ttl),
+            toast_ttl(kind),
+            cx,
+        );
+    }
+
+    /// Like [`Self::push_toast_with_link`], but stays until closed.
+    pub(super) fn push_sticky_toast_with_link(
+        &mut self,
+        kind: components::ToastKind,
+        message: String,
+        link_url: String,
+        link_label: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let _ = self.push_toast_inner(
+            kind,
+            message,
+            vec![ToastAction::OpenUrl {
+                url: link_url,
+                label: link_label,
+            }],
+            ToastDismissBehavior::Remove,
+            None,
             cx,
         );
     }
@@ -287,11 +408,6 @@ impl ToastHost {
         operation_id: GitOperationId,
         cx: &mut gpui::Context<Self>,
     ) {
-        let ttl = match kind {
-            components::ToastKind::Error => Duration::from_secs(15),
-            components::ToastKind::Warning => Duration::from_secs(10),
-            components::ToastKind::Success => Duration::from_secs(6),
-        };
         let _ = self.push_toast_inner(
             kind,
             message,
@@ -301,7 +417,7 @@ impl ToastHost {
                 label: "View output".to_string(),
             }],
             ToastDismissBehavior::Remove,
-            Some(ttl),
+            toast_ttl(kind),
             cx,
         );
     }
@@ -362,6 +478,23 @@ impl ToastHost {
         );
     }
 
+    pub(in crate::view) fn push_hosted_toast(
+        &mut self,
+        kind: components::ToastKind,
+        message: String,
+        actions: Vec<gitcomet_extension_api::HostedAction>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.push_toast_inner(
+            kind,
+            message,
+            actions.into_iter().map(ToastAction::Hosted).collect(),
+            ToastDismissBehavior::Remove,
+            toast_ttl(kind),
+            cx,
+        );
+    }
+
     fn push_toast_inner(
         &mut self,
         kind: components::ToastKind,
@@ -371,8 +504,7 @@ impl ToastHost {
         ttl: Option<Duration>,
         cx: &mut gpui::Context<Self>,
     ) -> u64 {
-        let id = self.next_toast_id;
-        self.next_toast_id = self.next_toast_id.wrapping_add(1).max(1);
+        let id = self.next_id();
         let theme = self.theme;
         let is_code_message = looks_like_code_message(&message);
         let display_message = if is_code_message {
@@ -407,8 +539,10 @@ impl ToastHost {
         self.toasts.push(ToastState {
             id,
             kind,
-            input,
-            is_code_message,
+            body: ToastBody::Text {
+                input,
+                is_code_message,
+            },
             actions,
             dismiss_behavior,
             ttl,
@@ -441,7 +575,13 @@ impl ToastHost {
     pub(super) fn toasts_for_tests(&self, cx: &gpui::App) -> Vec<(components::ToastKind, String)> {
         self.toasts
             .iter()
-            .map(|toast| (toast.kind, toast.input.read(cx).text().to_string()))
+            .map(|toast| {
+                let text = match &toast.body {
+                    ToastBody::Text { input, .. } => input.read(cx).text().to_string(),
+                    ToastBody::Error(notice) => notice.message.clone(),
+                };
+                (toast.kind, text)
+            })
             .collect()
     }
 
@@ -489,6 +629,10 @@ impl ToastHost {
         cx: &mut gpui::Context<Self>,
     ) {
         match action {
+            ToastAction::Hosted(action) => {
+                self.remove_toast(id, cx);
+                action.invoke(cx);
+            }
             ToastAction::OpenUrl { url, .. } => {
                 // Keep the toast until the open succeeds: it carries the URL and
                 // its button, so dismissing it up front would leave a user whose
@@ -626,6 +770,54 @@ impl ToastHost {
         }
     }
 
+    pub(super) fn sync_operation_progress(
+        &mut self,
+        next: Vec<OperationProgress>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.operation_progress != next {
+            self.operation_progress = next;
+            cx.notify();
+        }
+        if self.operation_progress.is_empty() {
+            self.progress_ticker = None;
+        } else if self.progress_ticker.is_none()
+            && crate::ui_runtime::current().uses_progress_ticker()
+        {
+            self.progress_ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    pub(super) fn sync_maintenance_recommendations(
+        &mut self,
+        next: Vec<MaintenanceRecommendation>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.maintenance_recommendations != next {
+            self.maintenance_recommendations = next;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_progress_for_tests(&self) -> &[OperationProgress] {
+        &self.operation_progress
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_progress_ticker_for_tests(&self) -> bool {
+        self.progress_ticker.is_some()
+    }
+
     pub(super) fn set_hook_activity_dialog_repo(
         &mut self,
         repo_id: Option<RepoId>,
@@ -649,31 +841,21 @@ impl ToastHost {
             if theme.is_dark { 0.96 } else { 0.98 },
         );
         let shell_border = clone_progress_shell_border_color(theme);
-        let shell_accent = clone_progress_shell_accent_color(theme);
 
+        // No edge stripe: the rounded card would clip it. The spinner carries
+        // the accent.
         div()
-            .min_w(ui_scale.px(360.0))
-            .max_w(ui_scale.px(900.0))
-            .flex()
-            .gap(ui_scale.px(12.0))
+            .w(ui_scale.px(components::TOAST_WIDTH_PX))
             .bg(shell_bg)
             .border_1()
             .border_color(shell_border)
             .rounded(px(theme.radii.popover))
-            .overflow_hidden()
             .shadow(crate::theme::shadow_popover(theme))
-            .text_size(theme.ui_text(18.0))
+            .text_size(theme.ui_text(14.0))
             .text_color(theme.colors.foreground.primary)
-            .child(div().w(ui_scale.px(5.0)).bg(shell_accent).flex_shrink_0())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .pl(ui_scale.px(16.0))
-                    .pr(ui_scale.px(16.0))
-                    .py(ui_scale.px(12.0))
-                    .child(content),
-            )
+            .px(ui_scale.px(14.0))
+            .py(ui_scale.px(12.0))
+            .child(content)
             .into_any_element()
     }
 
@@ -687,27 +869,9 @@ impl ToastHost {
         let spinner_color = crate::view::clone_progress::clone_progress_color(theme, &op);
         let percent = op.progress.percent.min(100);
         let bar_fill_color = crate::view::clone_progress::clone_progress_bar_fill_color(theme, &op);
-        let bar_track = crate::view::clone_progress::clone_progress_bar_track_color(theme);
-        let bar_border = crate::view::clone_progress::clone_progress_bar_border_color(theme);
-        let (bar_fill_weight, bar_remainder_weight) =
-            crate::view::clone_progress::clone_progress_segment_weights(percent);
         let aborting = matches!(op.status, CloneOpStatus::Cancelling);
         let dest = op.dest.as_ref().clone();
         let root_view = self.root_view.clone();
-
-        let mut bar_fill = div()
-            .h_full()
-            .bg(bar_fill_color)
-            .rounded(px(999.0))
-            .when(percent > 0, |this| this.min_w(px(2.0)));
-        bar_fill.style().flex_grow = Some(bar_fill_weight);
-        bar_fill.style().flex_shrink = Some(0.0);
-        bar_fill.style().flex_basis = Some(relative(0.0).into());
-
-        let mut bar_remainder = div().h_full();
-        bar_remainder.style().flex_grow = Some(bar_remainder_weight);
-        bar_remainder.style().flex_shrink = Some(0.0);
-        bar_remainder.style().flex_basis = Some(relative(0.0).into());
 
         let mut abort_button = components::Button::new(
             "clone_progress_abort",
@@ -785,19 +949,12 @@ impl ToastHost {
                             .child(format!("{percent}%")),
                     ),
             )
-            .child(
-                div()
-                    .w_full()
-                    .h(ui_scale.px(8.0))
-                    .flex()
-                    .rounded(px(999.0))
-                    .overflow_hidden()
-                    .bg(bar_track)
-                    .border_1()
-                    .border_color(bar_border)
-                    .child(bar_fill)
-                    .child(bar_remainder),
-            )
+            .child(components::progress_bar(
+                theme,
+                ui_scale,
+                crate::view::clone_progress::clone_progress_fill_ratio(percent),
+                bar_fill_color,
+            ))
             .child(div().pt_1().child(abort_button));
 
         self.render_progress_shell(ui_scale, content)
@@ -847,6 +1004,195 @@ impl ToastHost {
                         ),
                 ),
         );
+        self.render_progress_shell(ui_scale, content)
+    }
+
+    fn render_maintenance_recommendation(
+        &self,
+        recommendation: &MaintenanceRecommendation,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let ui_scale = crate::ui_scale::UiScale::current(cx).with_appearance(theme.metrics);
+        let repo_id = recommendation.repo_id;
+        let dispatch = |msg: fn(RepoId) -> Msg| {
+            let root_view = self.root_view.clone();
+            move |_this: &mut Self,
+                  _e: &ClickEvent,
+                  _w: &mut Window,
+                  cx: &mut gpui::Context<Self>| {
+                let _ = root_view.update(cx, |root, _cx| root.store.dispatch(msg(repo_id)));
+            }
+        };
+        let start = components::Button::new(format!("maintenance_start_{}", repo_id.0), "Start")
+            .style(components::ButtonStyle::Outlined)
+            .on_click(
+                theme,
+                cx,
+                dispatch(|repo_id| Msg::StartRepoMaintenance { repo_id }),
+            )
+            .debug_selector(move || format!("maintenance_start_{}", repo_id.0));
+        let later = components::Button::new(
+            format!("maintenance_later_{}", repo_id.0),
+            "Remind me later",
+        )
+        .style(components::ButtonStyle::Transparent)
+        .borderless()
+        .on_click(
+            theme,
+            cx,
+            dispatch(|repo_id| Msg::SnoozeRepoMaintenance { repo_id }),
+        )
+        .debug_selector(move || format!("maintenance_later_{}", repo_id.0));
+
+        let content = div()
+            .debug_selector(move || format!("maintenance_recommendation_{}", repo_id.0))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Maintenance recommended"),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.ui_text(14.0))
+                            .text_color(theme.colors.foreground.secondary)
+                            .line_clamp(1)
+                            .overflow_hidden()
+                            .child(recommendation.repo_name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(theme.ui_text(14.0))
+                    .child(MAINTENANCE_RECOMMENDATION_TEXT),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(start)
+                    .child(later),
+            );
+        self.render_progress_shell(ui_scale, content)
+    }
+
+    fn render_operation_progress_toast(
+        &self,
+        progress: &OperationProgress,
+        now: std::time::SystemTime,
+        cx: &mut gpui::Context<Self>,
+    ) -> AnyElement {
+        let theme = self.theme;
+        let ui_scale = crate::ui_scale::UiScale::current(cx).with_appearance(theme.metrics);
+        let operation_id = progress.operation_id;
+        let repo_id = progress.repo_id;
+        let accent = theme.colors.accent.foreground;
+        let percent = progress
+            .progress
+            .as_ref()
+            .and_then(|meter| meter.percent)
+            .unwrap_or(0);
+
+        let root_view = self.root_view.clone();
+        let stop_button = components::Button::new(
+            format!("operation_progress_stop_{}", operation_id.0),
+            if progress.cancelling {
+                "Stopping…"
+            } else {
+                "Stop"
+            },
+        )
+        .style(components::ButtonStyle::Transparent)
+        .borderless()
+        .disabled(progress.cancelling)
+        .on_click(theme, cx, move |_this, _e, _w, cx| {
+            let _ = root_view.update(cx, |root, _cx| {
+                root.store.dispatch(Msg::CancelGitOperation {
+                    repo_id,
+                    operation_id,
+                });
+            });
+        })
+        .debug_selector(move || format!("operation_progress_stop_{}", operation_id.0));
+
+        let status = match progress.percent_label() {
+            Some(percent) => format!("{percent} · {}", progress.elapsed(now)),
+            None => progress.elapsed(now),
+        };
+        let content = div()
+            .debug_selector(move || format!("operation_progress_toast_{}", operation_id.0))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(svg_spinner(
+                        ("operation_progress_spinner", operation_id.0),
+                        accent,
+                        ui_scale.px(16.0),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().font_weight(FontWeight::BOLD).child(progress.title()))
+                            .child(
+                                div()
+                                    .text_size(theme.ui_text(14.0))
+                                    .text_color(theme.colors.foreground.secondary)
+                                    .line_clamp(1)
+                                    .overflow_hidden()
+                                    .child(progress.subtitle.clone()),
+                            ),
+                    ),
+            )
+            .when_some(progress.explanation(), |this, explanation| {
+                this.child(div().text_size(theme.ui_text(14.0)).child(explanation))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(theme.ui_text(14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_color(accent)
+                            .line_clamp(1)
+                            .overflow_hidden()
+                            .child(progress.phase().to_string()),
+                    )
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(status)),
+            )
+            .child(components::progress_bar(
+                theme,
+                ui_scale,
+                crate::view::clone_progress::clone_progress_fill_ratio(percent),
+                with_alpha(accent, if theme.is_dark { 0.88 } else { 0.80 }),
+            ))
+            .child(div().pt_1().child(stop_button));
+
         self.render_progress_shell(ui_scale, content)
     }
 
@@ -938,8 +1284,140 @@ impl ToastHost {
     }
 }
 
+impl ToastHost {
+    /// The shell every toast shares: the status card, the close button in its
+    /// corner and the fade/slide in and out.
+    fn render_toast_frame(
+        theme: AppTheme,
+        ui_scale_percent: u32,
+        toast: &ToastState,
+        message: impl IntoElement,
+        close: impl IntoElement,
+        animations: Vec<Animation>,
+    ) -> AnyElement {
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
+        div()
+            .relative()
+            .child(components::toast(
+                theme,
+                ui_scale_percent,
+                toast.kind,
+                message,
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top(scaled_px(12.0))
+                    .right(scaled_px(10.0))
+                    .child(close),
+            )
+            .with_animations(
+                ("toast", toast.id),
+                animations,
+                move |toast, animation_ix, delta| {
+                    let opacity = match animation_ix {
+                        0 => delta,
+                        1 => 1.0,
+                        2 => 1.0 - delta,
+                        _ => 1.0,
+                    };
+                    let slide_x = match animation_ix {
+                        0 => -(1.0 - delta) * TOAST_SLIDE_PX,
+                        2 => -delta * TOAST_SLIDE_PX,
+                        _ => 0.0,
+                    };
+                    toast.opacity(opacity).relative().left(px(slide_x))
+                },
+            )
+            .into_any_element()
+    }
+
+    /// An error in brief: what failed, where the output starts, and Show for
+    /// the rest.
+    fn render_error_toast_body(
+        theme: AppTheme,
+        ui_scale_percent: u32,
+        id: u64,
+        notice: &ErrorNotice,
+        cx: &mut gpui::Context<Self>,
+    ) -> gpui::Div {
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
+        let summary: SharedString = if notice.text.summary.is_empty() {
+            "Error".into()
+        } else {
+            notice.text.summary.clone().into()
+        };
+        let show = components::Button::new(format!("toast_error_show_{id}"), "Show")
+            .style(components::ButtonStyle::Outlined)
+            .on_click(theme, cx, move |this, _e, window, cx| {
+                this.open_error_details(id, window, cx);
+            })
+            .debug_selector(move || format!("toast_error_show_{id}"));
+        div()
+            .flex()
+            .flex_col()
+            .gap(scaled_px(2.0))
+            .child(
+                // As tall as the badge, so a one-line title centres on it.
+                div()
+                    .min_h(scaled_px(components::TOAST_BADGE_PX))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_clamp(2)
+                            .overflow_hidden()
+                            .child(summary),
+                    )
+                    .when(notice.count > 1, |row| {
+                        row.child(
+                            div()
+                                .debug_selector(move || format!("toast_error_count_{id}"))
+                                .flex_none()
+                                .px(scaled_px(7.0))
+                                .rounded(px(999.0))
+                                .bg(with_alpha(
+                                    theme.colors.foreground.primary,
+                                    if theme.is_dark { 0.10 } else { 0.07 },
+                                ))
+                                .text_color(theme.colors.foreground.secondary)
+                                .text_size(theme.ui_text(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("×{}", notice.count)),
+                        )
+                    }),
+            )
+            .when_some(notice.text.preview(), |body, preview| {
+                body.child(
+                    div()
+                        .text_size(theme.ui_text(13.0))
+                        .text_color(theme.colors.foreground.secondary)
+                        .line_clamp(2)
+                        .overflow_hidden()
+                        .child(preview.to_string()),
+                )
+            })
+            .child(
+                div()
+                    .pt(scaled_px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(show),
+            )
+    }
+}
+
 impl Render for ToastHost {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        #[cfg(any(test, feature = "benchmarks"))]
+        {
+            self.render_count += 1;
+        }
         let shows_hook_progress =
             |progress: &HookProgressToast| self.hook_activity_dialog_repo != Some(progress.repo_id);
         // Decide "nothing to show" before cloning anything: this renders every
@@ -948,9 +1426,12 @@ impl Render for ToastHost {
             && self.clone_progress.is_none()
             && self.submodule_add_progress.is_empty()
             && !self.hook_progress.iter().any(&shows_hook_progress)
+            && self.operation_progress.is_empty()
+            && self.maintenance_recommendations.is_empty()
         {
             return div().into_any_element();
         }
+        let now = std::time::SystemTime::now();
         let hook_progress = self
             .hook_progress
             .iter()
@@ -977,15 +1458,56 @@ impl Render for ToastHost {
         if !hook_progress.is_empty() {
             progress_toasts.push(self.render_hook_progress_toast(&hook_progress, cx));
         }
+        for recommendation in self.maintenance_recommendations.clone() {
+            progress_toasts.push(self.render_maintenance_recommendation(&recommendation, cx));
+        }
+        for progress in self
+            .operation_progress
+            .iter()
+            .filter(|progress| progress.is_visible(now))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            progress_toasts.push(self.render_operation_progress_toast(&progress, now, cx));
+        }
         let has_progress = !progress_toasts.is_empty();
         let max_other = if has_progress { 2 } else { 3 };
-        let mut displayed = self
+        let visible = self
             .toasts
             .iter()
             .rev()
-            .take(max_other)
-            .cloned()
+            .filter(|toast| !self.errors_hidden || !matches!(toast.body, ToastBody::Error(_)));
+        let mut displayed = visible.clone().take(max_other).cloned().collect::<Vec<_>>();
+        // Errors never expire, so ones pushed out of view must stay reachable.
+        let hidden_errors = visible
+            .skip(max_other)
+            .filter(|toast| matches!(toast.body, ToastBody::Error(_)))
+            .map(|toast| toast.id)
             .collect::<Vec<_>>();
+
+        let more_errors = hidden_errors.first().map(|&first_hidden| {
+            let count = hidden_errors.len();
+            let label = if count == 1 {
+                "+1 more error".to_string()
+            } else {
+                format!("+{count} more errors")
+            };
+            div()
+                .bg(theme.colors.surface.raised)
+                .border_1()
+                .border_color(theme.colors.stroke.default)
+                .rounded(px(theme.radii.popover))
+                .shadow(crate::theme::shadow_popover(theme))
+                .child(
+                    components::Button::new("toast_more_errors", label)
+                        .style(components::ButtonStyle::Transparent)
+                        .on_click(theme, cx, move |this, _e, window, cx| {
+                            this.open_error_details(first_hidden, window, cx);
+                        })
+                        .debug_selector(|| "toast_more_errors".to_string()),
+                )
+                .into_any_element()
+        });
 
         let fade_in = toast_fade_in_duration();
         let fade_out = toast_fade_out_duration();
@@ -1013,15 +1535,39 @@ impl Render for ToastHost {
                     .on_click(theme, cx, move |this, _e: &ClickEvent, _w, cx| {
                         this.dismiss_toast(toast_id, dismiss_behavior.clone(), cx);
                     })
+                    .debug_selector(move || format!("toast_close_{toast_id}"))
                     .gitcomet_tooltip(theme, "Dismiss notification".into());
 
+                let (input, is_code_message) = match &t.body {
+                    ToastBody::Text {
+                        input,
+                        is_code_message,
+                    } => (input.clone(), *is_code_message),
+                    ToastBody::Error(notice) => {
+                        let body = Self::render_error_toast_body(
+                            theme,
+                            ui_scale_percent,
+                            toast_id,
+                            notice,
+                            cx,
+                        );
+                        return Self::render_toast_frame(
+                            theme,
+                            ui_scale_percent,
+                            &t,
+                            body,
+                            close,
+                            animations,
+                        );
+                    }
+                };
                 let message_scroll = div()
                     .id(("toast_message_scroll", t.id))
                     .max_h(scaled_px(200.0))
                     .overflow_y_scroll()
                     .child(
                         div()
-                            .when(t.is_code_message, |this| {
+                            .when(is_code_message, |this| {
                                 this.font_family(
                                     crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
                                 )
@@ -1033,7 +1579,7 @@ impl Render for ToastHost {
                                 .px_2()
                                 .py_1()
                             })
-                            .child(t.input.clone()),
+                            .child(input),
                     );
 
                 let action_buttons = (!t.actions.is_empty()).then(|| {
@@ -1043,6 +1589,7 @@ impl Render for ToastHost {
                         .gap_2()
                         .children(t.actions.iter().enumerate().map(|(ix, action)| {
                             let label = match action {
+                                ToastAction::Hosted(action) => action.label().to_string(),
                                 ToastAction::OpenUrl { label, .. }
                                 | ToastAction::OpenSurvey { label, .. }
                                 | ToastAction::PostponeSurvey { label, .. }
@@ -1052,7 +1599,8 @@ impl Render for ToastHost {
                                 ToastAction::PostponeSurvey { .. } => {
                                     components::ButtonStyle::Transparent
                                 }
-                                ToastAction::OpenUrl { .. }
+                                ToastAction::Hosted(_)
+                                | ToastAction::OpenUrl { .. }
                                 | ToastAction::OpenSurvey { .. }
                                 | ToastAction::OpenHookActivity { .. } => {
                                     components::ButtonStyle::Outlined
@@ -1074,44 +1622,25 @@ impl Render for ToastHost {
                         }))
                 });
 
+                // As tall as the badge, so a one-line message centres on it.
                 let message = div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(message_scroll)
-                    .when_some(action_buttons, |this, buttons| this.child(buttons));
-
-                div()
-                    .relative()
-                    .child(components::toast(theme, ui_scale_percent, t.kind, message))
+                    .gap(scaled_px(8.0))
                     .child(
                         div()
-                            .absolute()
-                            .top(scaled_px(8.0))
-                            .right(scaled_px(8.0))
-                            .child(close),
+                            .min_h(scaled_px(components::TOAST_BADGE_PX))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(message_scroll),
                     )
-                    .with_animations(
-                        ("toast", t.id),
-                        animations,
-                        move |toast, animation_ix, delta| {
-                            let opacity = match animation_ix {
-                                0 => delta,
-                                1 => 1.0,
-                                2 => 1.0 - delta,
-                                _ => 1.0,
-                            };
-                            let slide_x = match animation_ix {
-                                0 => -(1.0 - delta) * TOAST_SLIDE_PX,
-                                2 => -delta * TOAST_SLIDE_PX,
-                                _ => 0.0,
-                            };
-                            toast.opacity(opacity).relative().left(px(slide_x))
-                        },
-                    )
-                    .into_any_element()
+                    .when_some(action_buttons, |this, buttons| this.child(buttons));
+
+                Self::render_toast_frame(theme, ui_scale_percent, &t, message, close, animations)
             })
             .collect::<Vec<_>>();
+        children.extend(more_errors);
         children.extend(progress_toasts);
 
         let root = div()
@@ -1143,6 +1672,13 @@ impl Render for ToastHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_stay_until_closed_and_other_toasts_expire() {
+        assert_eq!(toast_ttl(components::ToastKind::Error), None);
+        assert!(toast_ttl(components::ToastKind::Warning).is_some());
+        assert!(toast_ttl(components::ToastKind::Success).is_some());
+    }
     use crate::theme::with_alpha;
     use gitcomet_state::model::{CloneProgressMeter, CloneProgressStage};
     use palette::IntoColor;
@@ -1504,7 +2040,10 @@ mod tests {
         let toast_input = cx.update(|app| {
             let host = host.read(app);
             assert_eq!(host.toasts.len(), 1);
-            let input = host.toasts[0].input.clone();
+            let ToastBody::Text { input, .. } = &host.toasts[0].body else {
+                panic!("a survey toast is text");
+            };
+            let input = input.clone();
             assert_eq!(
                 input.read(app).debug_text_color(),
                 light.colors.foreground.primary.into_color()
@@ -1525,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_progress_shell_uses_subtle_accent_border_and_strip() {
+    fn clone_progress_shell_uses_a_subtle_accent_border() {
         let dark = AppTheme::gitcomet_dark();
         let light = AppTheme::gitcomet_light();
 
@@ -1534,16 +2073,8 @@ mod tests {
             with_alpha(dark.colors.accent.foreground, 0.36)
         );
         assert_eq!(
-            clone_progress_shell_accent_color(dark),
-            with_alpha(dark.colors.accent.foreground, 0.20)
-        );
-        assert_eq!(
             clone_progress_shell_border_color(light),
             with_alpha(light.colors.accent.foreground, 0.28)
-        );
-        assert_eq!(
-            clone_progress_shell_accent_color(light),
-            with_alpha(light.colors.accent.foreground, 0.14)
         );
     }
 

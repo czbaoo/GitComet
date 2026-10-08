@@ -38,6 +38,7 @@ impl MainPaneView {
         let annotate_enabled = preferences.diff.annotate_enabled;
         let diff_reveal_whitespace_chars = preferences.diff.reveal_whitespace_chars;
         let diff_word_wrap = preferences.diff.word_wrap;
+        let default_tab_size = preferences.diff.tab_size;
         let diff_show_line_numbers = preferences.diff.show_line_numbers;
         let remote_markdown_image_policy = preferences.security.remote_markdown_images;
         let auto_save_file_edits = preferences.file_editing.auto_save;
@@ -63,6 +64,7 @@ impl MainPaneView {
             });
         let subscription = cx.observe(&ui_model, |this, model, cx| {
             let next = Arc::clone(&model.read(cx).state);
+            this.process_file_editor_saves(&next, cx);
             let next_fingerprint = Self::notify_fingerprint_for(&next);
             if next_fingerprint == this.notify_fingerprint {
                 this.state = next;
@@ -74,6 +76,7 @@ impl MainPaneView {
             cx.notify();
         });
 
+        let diff_raw_scroll = ScrollHandle::new();
         let diff_raw_input = cx.new(|cx| {
             let mut input = components::TextInput::new(
                 components::TextInputOptions {
@@ -85,6 +88,7 @@ impl MainPaneView {
                 cx,
             );
             input.set_editor_font(cx);
+            input.set_vertical_scroll_handle(Some(diff_raw_scroll.clone()));
             input
         });
         let submodule_hash_inputs = (0..4)
@@ -306,7 +310,9 @@ impl MainPaneView {
         });
 
         let mut pane = Self {
-            store,
+            store: store.into(),
+            hosted_content_width: None,
+            hosted_decor: None,
             state,
             view_mode,
             focused_mergetool_labels,
@@ -341,6 +347,8 @@ impl MainPaneView {
             rendered_preview_modes: RenderedPreviewModes::default(),
             remote_markdown_images: RemoteMarkdownImages::new(remote_markdown_image_policy),
             diff_word_wrap,
+            default_tab_size,
+            display_tab_width: usize::from(default_tab_size),
             diff_show_line_numbers,
             diff_scroll_sync,
             diff_content_mode,
@@ -353,6 +361,7 @@ impl MainPaneView {
             diff_cache_repo_id: None,
             diff_cache_rev: 0,
             diff_cache_content_signature: None,
+            patch_signature_memo: None,
             diff_cache_target: None,
             diff_cache: Arc::from([]),
             diff_row_provider: None,
@@ -370,6 +379,7 @@ impl MainPaneView {
             diff_panel_focus_handle,
             diff_autoscroll_pending: false,
             diff_raw_input,
+            diff_raw_scroll,
             submodule_hash_inputs,
             submodule_summary_cache: None,
             diff_visible_indices: Arc::from([]),
@@ -515,6 +525,8 @@ impl MainPaneView {
             conflict_image_preview_cancel: None,
             worktree_preview_path: None,
             worktree_preview_source_path: None,
+            worktree_preview_decode_key: None,
+            worktree_preview_text_format: None,
             worktree_preview: Loadable::NotLoaded,
             worktree_preview_source_len: 0,
             worktree_preview_text: SharedString::default(),
@@ -533,13 +545,21 @@ impl MainPaneView {
             file_editor_input,
             _file_editor_input_subscription: file_editor_subscription,
             file_editor_key: None,
+            filesystem_pauses: std::collections::BTreeSet::new(),
+            file_editor_disk_versions: FxHashMap::default(),
+            file_editor_saves: std::collections::BTreeMap::new(),
             file_editor_language: None,
             file_editor_loading: false,
             file_editor_reread_seq: 0,
             file_editor_disk: DiskIdentity::default(),
             file_editor_error: None,
+            file_editor_text_format: None,
+            file_editor_source_text_format: None,
+            file_editor_decode_key: None,
+            file_editor_waiting_for_attributes: false,
             file_editor_dirty: false,
             file_editor_first_dirty_line: None,
+            file_editor_save_error: None,
             unsaved_file_edits_rev: 0,
             file_editor_saved_fingerprint: None,
             file_disk_notice: None,

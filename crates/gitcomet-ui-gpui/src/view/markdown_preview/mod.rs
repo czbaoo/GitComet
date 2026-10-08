@@ -153,6 +153,8 @@ pub(super) struct MarkdownPreviewRow {
     /// A later row of a list item (another paragraph, a line after a hard
     /// break): it keeps the item's indent but draws no second bullet.
     pub(super) continues_item: bool,
+    /// The `align` of the HTML block around it (`<p align="center">`).
+    pub(super) align: MarkdownTextAlign,
 }
 
 impl Default for MarkdownPreviewRow {
@@ -176,6 +178,7 @@ impl Default for MarkdownPreviewRow {
             table: None,
             task: None,
             continues_item: false,
+            align: MarkdownTextAlign::None,
         }
     }
 }
@@ -230,22 +233,43 @@ pub(super) fn task_line_hash(line: &[u8], column: usize) -> u64 {
 /// by `\t` so a copied selection reads as tab-separated values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MarkdownTableRow {
-    /// One range per column; a row shorter than the table gets empty cells.
-    pub(super) cells: Arc<[Range<usize>]>,
-    pub(super) table: Arc<MarkdownTableInfo>,
+    /// One entry per column; a row shorter than the table gets empty cells.
+    pub(super) cells: Arc<[MarkdownTableCell]>,
+    /// Table boundaries are independent of whether a row contains headers.
+    pub(super) starts_table: bool,
 }
 
-/// What the rows of one table share.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct MarkdownTableInfo {
-    /// One per column, from the `:---:` delimiter row.
-    pub(super) alignments: Vec<MarkdownTableAlign>,
-    /// Widest cell per column in chars, for the monospace row-list rendering.
-    pub(super) column_widths: Vec<usize>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MarkdownTableCell {
+    pub(super) range: Range<usize>,
+    pub(super) is_header: bool,
+    /// Resolved alignment, including default centering for headers.
+    pub(super) align: MarkdownTextAlign,
+    /// Empty for text-only cells; mixed content retains document order.
+    pub(super) content: Vec<MarkdownTableCellPart>,
 }
 
+impl MarkdownTableCell {
+    fn new(range: Range<usize>) -> Self {
+        Self {
+            range,
+            is_header: false,
+            align: MarkdownTextAlign::None,
+            content: Vec::new(),
+        }
+    }
+}
+
+/// Ranges address the row's logical text, including each image's alt text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum MarkdownTableCellPart {
+    Text(Range<usize>),
+    Image { index: usize, range: Range<usize> },
+}
+
+/// A table column's alignment, or an HTML block's `align`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum MarkdownTableAlign {
+pub(super) enum MarkdownTextAlign {
     #[default]
     None,
     Left,
@@ -291,7 +315,9 @@ impl MarkdownPreviewRow {
 pub(super) const MARKDOWN_PREVIEW_IMAGE_DEFAULT_HEIGHT_PX: u32 = 224;
 
 /// Combine the inline style stack into a single effective style.
-fn resolve_style_stack(stack: &[MarkdownInlineStyle]) -> MarkdownInlineStyle {
+fn resolve_style_stack(
+    stack: impl IntoIterator<Item = MarkdownInlineStyle>,
+) -> MarkdownInlineStyle {
     let mut has_bold = false;
     let mut has_italic = false;
     let mut has_strikethrough = false;
@@ -299,7 +325,7 @@ fn resolve_style_stack(stack: &[MarkdownInlineStyle]) -> MarkdownInlineStyle {
     let mut has_code = false;
     let mut has_underline = false;
 
-    for &s in stack {
+    for s in stack {
         match s {
             MarkdownInlineStyle::Bold => has_bold = true,
             MarkdownInlineStyle::Italic => has_italic = true,
@@ -350,3 +376,6 @@ pub(super) use wrap::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod table_tests;

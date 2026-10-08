@@ -5,7 +5,7 @@ use super::util::{
 use crate::model::{
     AppNotificationKind, AppState, CommitMultiSelection, ConflictFileLoadMode, DiagnosticKind,
     FileBrowserSettings, ForeignDiffOrigin, Loadable, PendingFileBrowserReopen, RangeSelection,
-    RepoId, RepoLoadsInFlight, RepoState, SidebarDataRequest, SidebarMode,
+    RepoId, RepoLoadsInFlight, RepoState, SidebarDataRequest, SidebarMode, WorktreeDirtyScope,
 };
 use crate::msg::{CommitSelectMode, ConflictAutosolveMode, Effect};
 use gitcomet_core::conflict_session::{
@@ -13,10 +13,10 @@ use gitcomet_core::conflict_session::{
     ConflictResolverStrategy, ConflictSession, reconstruct_conflict_marker_sides,
 };
 use gitcomet_core::domain::{
-    Branch, Commit, CommitDetails, CommitFileChange, CommitId, CommitSignature, EMPTY_TREE_ID,
-    FileEntry, FileSource, FileStatusKind, LogCursor, LogPage, RecentCommitMessage, RefMetadata,
-    ReflogEntry, Remote, RemoteBranch, RemoteTag, RepoStatus, StashEntry, Submodule, Tag,
-    UpstreamDivergence, Worktree, WorktreeDirtySummary,
+    Branch, Commit, CommitDetails, CommitId, CommitSignature, FileEntry, FileSource,
+    FileStatusKind, LogCursor, LogPage, RecentCommitMessage, RefMetadata, ReflogEntry, Remote,
+    RemoteBranch, RemoteTag, RepoStatus, StashEntry, Submodule, Tag, UpstreamDivergence, Worktree,
+    WorktreeDirtySummary, empty_tree_id_like, is_empty_tree_id,
 };
 use gitcomet_core::error::Error;
 use gitcomet_core::merge::{MergeSource, OrderedSelection};
@@ -107,11 +107,11 @@ pub(super) fn blame_loaded(
     result: std::result::Result<Vec<gitcomet_core::services::BlameLine>, Error>,
 ) -> Vec<Effect> {
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id)
-        && repo_state.history_state.blame_path.as_ref() == Some(&path)
-        && repo_state.history_state.blame_source.as_ref() == Some(&source)
+        && repo_state.diff_state.blame_path.as_ref() == Some(&path)
+        && repo_state.diff_state.blame_source.as_ref() == Some(&source)
     {
-        let retained = repo_state.history_state.retained_blame_while_loading.take();
-        repo_state.history_state.blame = match result {
+        let retained = repo_state.diff_state.retained_blame_while_loading.take();
+        repo_state.diff_state.blame = match result {
             // Reuse the retained allocation when the reload produced identical
             // annotations, so the view's `Arc`-identity fingerprints and the
             // memoized blame time range stay valid and nothing repaints.
@@ -590,13 +590,46 @@ pub(super) fn worktrees_loaded(
 pub(super) fn worktree_dirty_loaded(
     state: &mut AppState,
     repo_id: RepoId,
+    scope: WorktreeDirtyScope,
     result: std::result::Result<Vec<WorktreeDirtySummary>, Error>,
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
     let mut inline_refresh = None;
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         match result {
-            Ok(v) => repo_state.set_worktree_dirty(Loadable::Ready(v)),
+            Ok(mut refreshed) => {
+                let mut dirty = if matches!(scope, WorktreeDirtyScope::All) {
+                    refreshed
+                } else {
+                    let mut merged = Vec::new();
+                    if let Loadable::Ready(previous) = &repo_state.worktree_dirty {
+                        for summary in previous.iter() {
+                            if scope.includes(&summary.path) {
+                                if let Some(ix) =
+                                    refreshed.iter().position(|new| new.path == summary.path)
+                                {
+                                    merged.push(refreshed.remove(ix));
+                                }
+                            } else {
+                                merged.push(summary.clone());
+                            }
+                        }
+                    }
+                    merged.extend(refreshed);
+                    merged
+                };
+                // A reply may belong to a selection that has since moved. Keep
+                // details only for the currently selected checkout, including
+                // when a targeted update leaves other summaries untouched.
+                for summary in &mut dirty {
+                    if repo_state.history_state.worktree_selection.as_ref() != Some(&summary.path) {
+                        summary.staged.clear();
+                        summary.unstaged.clear();
+                        summary.line_stats = Default::default();
+                    }
+                }
+                repo_state.set_worktree_dirty(Loadable::Ready(dirty));
+            }
             // A worktree that cannot be opened (removed, on an unmounted
             // volume) is a routine condition, not something worth a diagnostic
             // banner -- the scan simply reports nothing for it, per worktree,
@@ -643,15 +676,25 @@ pub(super) fn worktree_dirty_loaded(
         if selected_worktree_is_gone {
             repo_state.set_worktree_selection(None);
         }
-        inline_refresh = refresh_worktree_inline_diff_entries(repo_state);
         if repo_state
-            .loads_in_flight
-            .finish(RepoLoadsInFlight::WORKTREE_DIRTY)
+            .diff_state
+            .inline_submodule_diff
+            .as_ref()
+            .is_some_and(|inline| scope.includes(&inline.submodule_repo_path))
         {
+            inline_refresh = refresh_worktree_inline_diff_entries(repo_state);
+        }
+        if let Some(scope) = repo_state.loads_in_flight.finish_worktree_dirty() {
             // Rebuilt rather than repeated: the selection may have moved while
             // the finished scan was running, and the repeat should carry the
             // file lists of whatever is selected now.
-            effects.push(worktree_dirty_effect(repo_state));
+            let scope = if matches!(repo_state.worktree_dirty, Loadable::Ready(_)) {
+                scope
+            } else {
+                // A failed initial scan left no complete snapshot to merge into.
+                WorktreeDirtyScope::All
+            };
+            effects.push(worktree_dirty_effect(repo_state, scope));
         }
     }
     // Outside the borrow above.
@@ -844,90 +887,23 @@ pub(super) fn select_commit_multi(
     commit_id: CommitId,
     mode: CommitSelectMode,
     clicked_index: Option<usize>,
-    mut visible_order: Option<Vec<CommitId>>,
+    visible_order: Option<Vec<CommitId>>,
 ) -> Vec<Effect> {
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
     };
 
-    let log_rev = repo_state.history_state.log_rev;
-    let mut sel = repo_state.history_state.multi_selection.clone();
-
-    let focus = match mode {
-        CommitSelectMode::Single => {
-            collapse_multi_selection_to(&mut sel, commit_id.clone(), clicked_index, log_rev);
-            commit_id
-        }
-        CommitSelectMode::Toggle => {
-            if let Some(ix) = sel.commits.iter().position(|c| *c == commit_id) {
-                Arc::make_mut(&mut sel.commits).remove(ix);
-                let Some(focus) = sel.commits.last().cloned() else {
-                    // Toggled the last commit away: clear the selection
-                    // entirely (also dissolves the multi-selection).
-                    repo_state.set_selected_commit(None);
-                    repo_state.set_commit_details(Loadable::NotLoaded);
-                    return Vec::new();
-                };
-                focus
-            } else {
-                Arc::make_mut(&mut sel.commits).push(commit_id.clone());
-                sel.anchor = Some(commit_id.clone());
-                sel.anchor_index = clicked_index;
-                sel.anchor_log_rev = Some(log_rev);
-                commit_id
-            }
-        }
-        CommitSelectMode::Range => {
-            let entries = visible_order.as_deref().unwrap_or(&[]);
-            let clicked_ix = commit_selection_entry_index(entries, &commit_id, clicked_index);
-            match clicked_ix {
-                None => {
-                    collapse_multi_selection_to(
-                        &mut sel,
-                        commit_id.clone(),
-                        clicked_index,
-                        log_rev,
-                    );
-                }
-                Some(clicked_ix) => {
-                    let anchor_ix = sel
-                        .anchor
-                        .as_ref()
-                        .and_then(|anchor| {
-                            let trusted_hint = sel
-                                .anchor_index
-                                .filter(|_| sel.anchor_log_rev == Some(log_rev));
-                            commit_selection_entry_index(entries, anchor, trusted_hint)
-                        })
-                        .unwrap_or(clicked_ix);
-                    let (a, b) = if anchor_ix <= clicked_ix {
-                        (anchor_ix, clicked_ix)
-                    } else {
-                        (clicked_ix, anchor_ix)
-                    };
-                    sel.commits = Arc::new(if a == 0 && b + 1 == entries.len() {
-                        visible_order.take().unwrap()
-                    } else {
-                        entries[a..=b].to_vec()
-                    });
-                    if sel.anchor.is_none() {
-                        sel.anchor = Some(commit_id.clone());
-                    }
-                    sel.anchor_index = Some(anchor_ix);
-                    sel.anchor_log_rev = Some(log_rev);
-                }
-            }
-            commit_id
-        }
-        CommitSelectMode::PreserveIfSelected => {
-            // Keep an existing multi-selection intact when the clicked commit
-            // is already part of it — only the focus moves. Otherwise collapse
-            // to the clicked commit like a plain click.
-            if !sel.commits.contains(&commit_id) {
-                collapse_multi_selection_to(&mut sel, commit_id.clone(), clicked_index, log_rev);
-            }
-            commit_id
-        }
+    let (sel, focus) = repo_state.history_state.multi_selection.select(
+        commit_id,
+        mode,
+        clicked_index,
+        visible_order,
+        repo_state.history_state.log_rev,
+    );
+    let Some(focus) = focus else {
+        repo_state.set_selected_commit(None);
+        repo_state.set_commit_details(Loadable::NotLoaded);
+        return Vec::new();
     };
 
     repo_state.set_commit_multi_selection(sel);
@@ -1043,7 +1019,7 @@ fn merged_selection_range(
             return Some((
                 index
                     .parent_commit_id(oldest, 0)
-                    .unwrap_or_else(|| CommitId(EMPTY_TREE_ID.into())),
+                    .or_else(|| empty_tree_id_like(&index.commit_id(oldest)?))?,
                 index.commit_id(newest)?,
             ));
         }
@@ -1078,7 +1054,7 @@ fn merged_selection_range(
         .parent_ids
         .first()
         .cloned()
-        .unwrap_or_else(|| CommitId(EMPTY_TREE_ID.into()));
+        .or_else(|| empty_tree_id_like(&oldest.id))?;
     Some((from, newest.id.clone()))
 }
 
@@ -1086,7 +1062,7 @@ fn merged_selection_range(
 /// or a name for the empty-tree base, whose sha would be meaningless on screen.
 fn range_endpoint_label(id: &CommitId) -> String {
     let full = id.as_ref();
-    if full == EMPTY_TREE_ID {
+    if is_empty_tree_id(full) {
         return "start of history".to_string();
     }
     full.get(..8).unwrap_or(full).to_string()
@@ -1122,6 +1098,29 @@ pub(super) fn compare_range(
     to_label: String,
     source: ComparisonSource,
 ) -> Vec<Effect> {
+    compare_range_with_options(
+        state,
+        repo_id,
+        from,
+        to,
+        from_label,
+        to_label,
+        Default::default(),
+        source,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compare_range_with_options(
+    state: &mut AppState,
+    repo_id: RepoId,
+    from: CommitId,
+    to: Option<CommitId>,
+    from_label: String,
+    to_label: String,
+    options: gitcomet_core::services::ComparisonOptions,
+    source: ComparisonSource,
+) -> Vec<Effect> {
     let request = {
         let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
             return Vec::new();
@@ -1130,10 +1129,8 @@ pub(super) fn compare_range(
             repo_state.set_commit_multi_selection(CommitMultiSelection::default());
         }
         repo_state.set_range_selection(Some(RangeSelection {
-            from: from.clone(),
-            to: to.clone(),
-            from_label,
-            to_label,
+            options,
+            ..RangeSelection::new(from.clone(), to.clone(), from_label, to_label)
         }));
         repo_state.set_range_files(Loadable::Loading);
         repo_state.begin_range_files_load()
@@ -1144,6 +1141,7 @@ pub(super) fn compare_range(
         repo_id,
         from,
         to,
+        options,
         request,
     });
     effects
@@ -1222,7 +1220,7 @@ pub(super) fn range_files_loaded(
     from: CommitId,
     to: Option<CommitId>,
     request: u64,
-    result: std::result::Result<Vec<CommitFileChange>, Error>,
+    result: std::result::Result<gitcomet_core::services::Comparison, Error>,
 ) -> Vec<Effect> {
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
@@ -1251,7 +1249,18 @@ pub(super) fn range_files_loaded(
     }
 
     let next = match result {
-        Ok(files) => Loadable::Ready(Arc::new(files)),
+        Ok(comparison) => {
+            if let Some(range) = repo_state.history_state.range_selection.as_ref()
+                && range.base.as_ref() != Some(&comparison.base)
+            {
+                let range = RangeSelection {
+                    base: Some(comparison.base),
+                    ..range.clone()
+                };
+                repo_state.set_range_selection(Some(range));
+            }
+            Loadable::Ready(Arc::new(comparison.files))
+        }
         Err(e) => {
             push_diagnostic(repo_state, DiagnosticKind::Error, e.to_string());
             Loadable::Error(e.to_string())
@@ -1264,36 +1273,19 @@ pub(super) fn range_files_loaded(
     if !std::mem::take(&mut repo_state.history_state.range_files_refresh_queued) {
         return Vec::new();
     }
+    let options = repo_state
+        .history_state
+        .range_selection
+        .as_ref()
+        .map(|range| range.options)
+        .unwrap_or_default();
     vec![Effect::LoadRangeFiles {
         repo_id,
         from,
         to,
+        options,
         request: repo_state.begin_range_files_load(),
     }]
-}
-
-fn collapse_multi_selection_to(
-    sel: &mut crate::model::CommitMultiSelection,
-    commit_id: CommitId,
-    clicked_index: Option<usize>,
-    log_rev: u64,
-) {
-    sel.commits = Arc::new(vec![commit_id.clone()]);
-    sel.anchor = Some(commit_id);
-    sel.anchor_index = clicked_index;
-    sel.anchor_log_rev = Some(log_rev);
-}
-
-/// Resolves `target`'s index in `entries`, preferring the index hint when it
-/// still points at the target.
-fn commit_selection_entry_index(
-    entries: &[CommitId],
-    target: &CommitId,
-    index_hint: Option<usize>,
-) -> Option<usize> {
-    index_hint
-        .filter(|&ix| entries.get(ix) == Some(target))
-        .or_else(|| entries.iter().position(|id| id == target))
 }
 
 pub(super) fn select_commit_and_load_details(
@@ -1342,13 +1334,13 @@ pub(super) fn select_worktree_uncommitted(
     }
     // Whatever this displaces -- another worktree's open diff, say -- is retired
     // by `retire_orphaned_worktree_diffs` once the reducer settles.
-    repo_state.set_worktree_selection(Some(path));
+    repo_state.set_worktree_selection(Some(path.clone()));
     repo_state.set_commit_details(Loadable::NotLoaded);
 
     // Only the selected worktree's changed files are carried in state, so the row
     // that was just selected needs a scan to fetch its own. The counts are already
     // on screen and stay there while it runs.
-    request_worktree_dirty_effect(repo_state)
+    request_worktree_dirty_path_effect(repo_state, path)
         .into_iter()
         .collect()
 }
@@ -1689,9 +1681,9 @@ pub(super) fn load_blame(
     // frames forks another `git blame --line-porcelain` for the same file.
     // `blame_path` + `blame_source` identify the request exactly, which a
     // repo-wide `RepoLoadsInFlight` bit could not.
-    let same_target = repo_state.history_state.blame_path.as_ref() == Some(&path)
-        && repo_state.history_state.blame_source.as_ref() == Some(&source);
-    if same_target && repo_state.history_state.blame.is_loading() {
+    let same_target = repo_state.diff_state.blame_path.as_ref() == Some(&path)
+        && repo_state.diff_state.blame_source.as_ref() == Some(&source);
+    if same_target && repo_state.diff_state.blame.is_loading() {
         return Vec::new();
     }
     if same_target {
@@ -1702,9 +1694,9 @@ pub(super) fn load_blame(
         // Re-targeting: anything held over describes a different file.
         repo_state.clear_retained_blame();
     }
-    repo_state.history_state.blame_path = Some(path.clone());
-    repo_state.history_state.blame_source = Some(source.clone());
-    repo_state.history_state.blame = Loadable::Loading;
+    repo_state.diff_state.blame_path = Some(path.clone());
+    repo_state.diff_state.blame_source = Some(source.clone());
+    repo_state.diff_state.blame = Loadable::Loading;
     vec![Effect::LoadBlame {
         repo_id,
         path,
@@ -1737,20 +1729,12 @@ pub(super) fn load_worktree_dirty(state: &mut AppState, repo_id: RepoId) -> Vec<
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
     };
-    if !matches!(repo_state.open, Loadable::Ready(())) {
-        return Vec::new();
-    }
     // Unlike the other loaders this one does not flip to `Loading`: the counts
     // stay on screen while a rescan runs, so a window-focus refresh does not
     // blank the rows it is about to redraw identically.
-    if repo_state
-        .loads_in_flight
-        .request(RepoLoadsInFlight::WORKTREE_DIRTY)
-    {
-        vec![worktree_dirty_effect(repo_state)]
-    } else {
-        Vec::new()
-    }
+    request_worktree_dirty_effect(repo_state)
+        .into_iter()
+        .collect()
 }
 
 /// Queues a rescan of the other worktrees' uncommitted changes, if one is not
@@ -1779,8 +1763,32 @@ pub(super) fn request_worktree_dirty_effect(repo_state: &mut RepoState) -> Optio
     }
     repo_state
         .loads_in_flight
-        .request(RepoLoadsInFlight::WORKTREE_DIRTY)
-        .then(|| worktree_dirty_effect(repo_state))
+        .request_worktree_dirty(WorktreeDirtyScope::All)
+        .then(|| worktree_dirty_effect(repo_state, WorktreeDirtyScope::All))
+}
+
+/// Selection and checkout-specific watches need only that checkout's status.
+/// Establish a full snapshot first if no completed or running scan exists.
+pub(super) fn request_worktree_dirty_path_effect(
+    repo_state: &mut RepoState,
+    path: PathBuf,
+) -> Option<Effect> {
+    if !matches!(repo_state.open, Loadable::Ready(())) {
+        return None;
+    }
+    let scope = if !matches!(repo_state.worktree_dirty, Loadable::Ready(_))
+        && !repo_state
+            .loads_in_flight
+            .is_in_flight(RepoLoadsInFlight::WORKTREE_DIRTY)
+    {
+        WorktreeDirtyScope::All
+    } else {
+        WorktreeDirtyScope::Paths(vec![gitcomet_core::domain::normalize_worktree_path(&path)])
+    };
+    repo_state
+        .loads_in_flight
+        .request_worktree_dirty(scope.clone())
+        .then(|| worktree_dirty_effect(repo_state, scope))
 }
 
 /// The scan effect, aimed at whichever worktree row is selected.
@@ -1788,10 +1796,11 @@ pub(super) fn request_worktree_dirty_effect(repo_state: &mut RepoState) -> Optio
 /// Built in one place so every trigger -- watcher flush, window focus, selecting
 /// a row -- asks for the file lists of the worktree that is actually on screen,
 /// and for counts alone everywhere else.
-pub(super) fn worktree_dirty_effect(repo_state: &RepoState) -> Effect {
+pub(super) fn worktree_dirty_effect(repo_state: &RepoState, scope: WorktreeDirtyScope) -> Effect {
     Effect::LoadWorktreeDirty {
         repo_id: repo_state.id,
         workdir: repo_state.spec.workdir.clone(),
+        scope,
         files_for: repo_state.history_state.worktree_selection.clone(),
     }
 }
@@ -1868,6 +1877,11 @@ pub(super) fn reveal_file_browser_path(
     };
     // `ancestors()` yields the path itself first — skip it, a file is not a
     // directory to expand — and stops before the empty root component.
+    repo_state.file_browser.revealed_paths.insert(path.clone());
+    repo_state
+        .file_browser
+        .selection
+        .click(path.clone(), &[], false, false, false);
     for ancestor in path.ancestors().skip(1) {
         if ancestor.as_os_str().is_empty() {
             continue;
@@ -1881,7 +1895,14 @@ pub(super) fn reveal_file_browser_path(
         repo_state.file_browser.search_query.clear();
     }
     repo_state.file_browser.bump_rev();
-    Vec::new()
+    if repo_state.file_browser.source == gitcomet_core::domain::FileSource::WorkingDirectory
+        && !matches!(&repo_state.file_browser.entries, Loadable::Ready(entries) if entries.iter().any(|entry| entry.path.as_ref() == &path))
+    {
+        repo_state.file_browser.stale = true;
+        request_file_browser_load(repo_state).into_iter().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether a query actually filters the file tree, and so force-expands every
@@ -1946,20 +1967,22 @@ pub(super) fn toggle_file_browser_dir(
         let path = Arc::new(path);
         if repo_state.file_browser.expanded_dirs.contains(&path) {
             repo_state.file_browser.expanded_dirs.remove(&path);
+            repo_state.file_browser.cancel_pending_expansions(&path);
         } else {
             repo_state.file_browser.expanded_dirs.insert(path);
         }
         repo_state.file_browser.bump_rev();
+        if repo_state.file_browser.show_ignored {
+            repo_state.file_browser.stale = true;
+            return request_file_browser_load(repo_state).into_iter().collect();
+        }
     }
     Vec::new()
 }
 
 /// Expand or collapse `path` and every directory under it.
 ///
-/// The backend enumerates the whole tree in one pass, so every descendant is
-/// already in `entries` and this needs no loading. `starts_with` on the flat
-/// list also covers `path` itself, which is what makes "Expand all under here"
-/// open the folder it was invoked on.
+/// Tracked descendants are already listed; ignored subtrees need another walk.
 pub(super) fn set_file_browser_dir_expanded_recursive(
     state: &mut AppState,
     repo_id: RepoId,
@@ -1983,30 +2006,45 @@ pub(super) fn set_file_browser_dir_expanded_recursive(
     let Loadable::Ready(entries) = &repo_state.file_browser.entries else {
         return Vec::new();
     };
-
-    // Cloning the Arc releases the borrow on `file_browser` so `expanded_dirs`
-    // can be written while the entry list is walked.
-    let entries = Arc::clone(entries);
-    let mut changed = false;
-    for entry in entries.iter() {
-        if entry.kind != gitcomet_core::domain::FileEntryKind::Directory
-            || !entry.path.starts_with(&path)
-        {
-            continue;
-        }
-        // Each entry already owns its path as an `Arc`, so expanding reuses it
-        // rather than allocating a second copy per directory.
-        changed |= if expanded {
-            repo_state
-                .file_browser
-                .expanded_dirs
-                .insert(Arc::clone(&entry.path))
-        } else {
-            repo_state.file_browser.expanded_dirs.remove(&entry.path)
-        };
+    if !entries.iter().any(|entry| {
+        entry.kind == gitcomet_core::domain::FileEntryKind::Directory
+            && entry.path.as_ref() == &path
+    }) {
+        return Vec::new();
     }
 
-    if changed {
+    let previous_len = repo_state.file_browser.expanded_dirs.len();
+    if expanded {
+        repo_state.file_browser.expanded_dirs.extend(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == gitcomet_core::domain::FileEntryKind::Directory
+                        && entry.path.starts_with(&path)
+                })
+                .map(|entry| Arc::clone(&entry.path)),
+        );
+        if repo_state.file_browser.show_ignored
+            && repo_state.file_browser.source == FileSource::WorkingDirectory
+        {
+            repo_state
+                .file_browser
+                .pending_recursive_expansions
+                .insert(path);
+            repo_state.file_browser.stale = true;
+            repo_state.file_browser.bump_rev();
+            return request_file_browser_load(repo_state).into_iter().collect();
+        }
+    } else {
+        // Include remembered descendants that a lazy listing no longer contains.
+        repo_state
+            .file_browser
+            .expanded_dirs
+            .retain(|p| !p.starts_with(&path));
+        repo_state.file_browser.cancel_pending_expansions(&path);
+    }
+
+    if repo_state.file_browser.expanded_dirs.len() != previous_len {
         repo_state.file_browser.bump_rev();
     }
     Vec::new()
@@ -2022,6 +2060,10 @@ pub(super) fn set_file_browser_search(
     {
         repo_state.file_browser.search_query = query;
         repo_state.file_browser.bump_rev();
+        if repo_state.file_browser.show_ignored {
+            repo_state.file_browser.stale = true;
+            return request_file_browser_load(repo_state).into_iter().collect();
+        }
     }
     Vec::new()
 }
@@ -2055,6 +2097,7 @@ pub(super) fn retarget_file_browser(repo_state: &mut RepoState, source: FileSour
     }
     repo_state.file_browser.pending_reopen = browse_open_content_path(repo_state);
     repo_state.file_browser.source = source;
+    repo_state.file_browser.pending_recursive_expansions.clear();
     if matches!(repo_state.file_browser.entries, Loadable::Ready(_)) {
         repo_state.file_browser.stale = true;
     } else {
@@ -2207,7 +2250,7 @@ fn browse_open_content_path(repo: &RepoState) -> Option<PendingFileBrowserReopen
         return None;
     }
     let path = match &repo.diff_state.diff_target {
-        Some(gitcomet_core::domain::DiffTarget::Commit { path: Some(p), .. }) => p.clone(),
+        Some(gitcomet_core::domain::DiffTarget::Commit { path: p, .. }) => p.clone(),
         Some(gitcomet_core::domain::DiffTarget::WorkingTree { path, .. }) => path.clone(),
         _ => return None,
     };
@@ -2250,8 +2293,11 @@ fn reopen_after_retarget(
                 && entry.path.as_path() == reopen.path.as_path()
         }) {
             ReopenDecision::Close
-        } else if super::diff_selection::content_view_target(source.clone(), reopen.path.clone())
-            == repo.diff_state.diff_target
+        } else if super::diff_selection::content_view_target(
+            source.clone(),
+            reopen.path.clone(),
+            None,
+        ) == repo.diff_state.diff_target
         {
             // Already showing this file at this point (retarget bounced back).
             ReopenDecision::Skip
@@ -2289,9 +2335,34 @@ pub(super) fn file_browser_loaded(
 
         let mut reopen = None;
         if repo_state.file_browser.source == source {
+            // A queued walk will include the latest expansion requests. An
+            // earlier, partial listing must not consume them.
+            let expansions = if has_pending {
+                Default::default()
+            } else {
+                std::mem::take(&mut repo_state.file_browser.pending_recursive_expansions)
+            };
             let pending = repo_state.file_browser.pending_reopen.take();
             repo_state.file_browser.entries = match result {
                 Ok(v) => {
+                    repo_state.file_browser.expanded_dirs.extend(
+                        v.iter()
+                            .filter(|entry| {
+                                entry.kind == gitcomet_core::domain::FileEntryKind::Directory
+                                    && expansions.iter().any(|root| entry.path.starts_with(root))
+                            })
+                            .map(|entry| Arc::clone(&entry.path)),
+                    );
+                    // A complete listing drops selected paths that are gone; a
+                    // partial one (a newer walk is queued) may predate them.
+                    if !has_pending {
+                        let present: FxHashSet<&std::path::Path> =
+                            v.iter().map(|entry| entry.path.as_path()).collect();
+                        repo_state
+                            .file_browser
+                            .selection
+                            .retain(|path| present.contains(path));
+                    }
                     let entries = Arc::new(v);
                     reopen = pending.map(|pending| (Arc::clone(&entries), pending));
                     Loadable::Ready(entries)
@@ -2479,6 +2550,9 @@ pub(super) fn uncommitted_line_stats_loaded(
     repo_id: RepoId,
     generation: crate::model::LineStatsGeneration,
     result: std::result::Result<gitcomet_core::domain::UncommittedLineStats, Error>,
+    large_files: Option<
+        std::result::Result<gitcomet_core::large_files::UncommittedLargeFiles, Error>,
+    >,
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
@@ -2495,9 +2569,172 @@ pub(super) fn uncommitted_line_stats_loaded(
         if current && let Ok(next) = result {
             repo_state.set_uncommitted_line_stats(Loadable::Ready(std::sync::Arc::new(next)));
         }
+        // Like the numbers, previous chips stand on failure.
+        if current
+            && repo_state.large_file_support_active()
+            && let Some(Ok(next)) = large_files
+        {
+            repo_state.set_uncommitted_large_files(std::sync::Arc::new(next));
+        }
         super::util::append_ready_line_stats_effect(repo_state, &mut effects);
     }
     effects
+}
+
+pub(super) fn large_file_support_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    result: std::result::Result<gitcomet_core::large_files::LargeFileSupport, Error>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let hide_preference = state.large_file_settings.hide_annex_refs;
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return effects;
+    };
+    let was_active = repo_state.large_file_support_active();
+    let support_changed = result.as_ref().is_ok_and(|support| {
+        repo_state.large_file_support.ready().is_none_or(|old| {
+            // Repository descriptions, trust, numcopies, restage and
+            // assistant state affect the sidebar, not content resolution.
+            old.lfs != support.lfs || old.annex.in_use() != support.annex.in_use()
+        })
+    });
+    match result {
+        Ok(support) => {
+            repo_state.set_large_file_support(Loadable::Ready(support));
+            repo_state.sync_annex_refs_hidden(hide_preference);
+        }
+        // Detection is advisory: keep what was known, never raise a banner.
+        Err(e) if matches!(e.kind(), gitcomet_core::error::ErrorKind::Cancelled) => {}
+        Err(e) => {
+            if !matches!(repo_state.large_file_support, Loadable::Ready(_)) {
+                repo_state.set_large_file_support(Loadable::Error(e.to_string()));
+            }
+        }
+    }
+    let replay = repo_state
+        .loads_in_flight
+        .finish(RepoLoadsInFlight::LARGE_FILE_SUPPORT);
+    if replay {
+        effects.push(Effect::LoadLargeFileSupport { repo_id });
+    }
+    let lockable = matches!(
+        &repo_state.large_file_support,
+        Loadable::Ready(support) if support.lfs.has_lockable_patterns
+    );
+    if lockable
+        && matches!(repo_state.lfs_locks, Loadable::NotLoaded)
+        && let Some(effect) = request_lfs_locks_effect(repo_state)
+    {
+        effects.push(effect);
+    }
+    // Rows and diffs may have used the previous backend support snapshot.
+    // Re-resolve them after capabilities/storage change, including when a
+    // formerly managed pointer becomes ordinary text. Invalidating the scan's
+    // generation also discards an old result that arrives after this refresh.
+    if support_changed && (was_active || repo_state.large_file_support_active()) {
+        repo_state.loads_in_flight.invalidate_line_stats();
+        super::util::append_ready_line_stats_effect(repo_state, &mut effects);
+        if let Some(target) = repo_state.diff_state.diff_target.clone() {
+            let plan = super::util::selected_diff_load_plan(repo_state, &target);
+            super::util::apply_selected_diff_load_plan_state_with_reload_mode(
+                repo_state,
+                plan,
+                super::util::DiffReloadMode::KeepLoaded,
+            );
+            repo_state.bump_diff_state_rev();
+            effects.extend(super::util::diff_reload_effects(
+                repo_state, repo_id, target,
+            ));
+        }
+        if let Some(commit_id) = repo_state.history_state.selected_commit.clone() {
+            effects.push(Effect::LoadCommitDetails { repo_id, commit_id });
+        }
+    }
+    effects
+}
+
+/// Ask for the Git LFS lock list, coalescing with a running load.
+pub(super) fn request_lfs_locks_effect(repo_state: &mut RepoState) -> Option<Effect> {
+    if matches!(
+        repo_state.lfs_locks,
+        Loadable::NotLoaded | Loadable::Error(_)
+    ) {
+        repo_state.set_lfs_locks(Loadable::Loading);
+    }
+    repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::LFS_LOCKS)
+        .then_some(Effect::LoadLfsLocks {
+            repo_id: repo_state.id,
+        })
+}
+
+pub(super) fn lfs_locks_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    result: std::result::Result<Vec<gitcomet_core::large_files::LfsLock>, Error>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return effects;
+    };
+    match result {
+        Ok(locks) => repo_state.set_lfs_locks(Loadable::Ready(locks)),
+        Err(e) if matches!(e.kind(), gitcomet_core::error::ErrorKind::Cancelled) => {}
+        // Many LFS servers have no lock API; say so on the rows, no banner.
+        Err(e) => repo_state.set_lfs_locks(Loadable::Error(e.to_string())),
+    }
+    if repo_state
+        .loads_in_flight
+        .finish(RepoLoadsInFlight::LFS_LOCKS)
+    {
+        effects.push(Effect::LoadLfsLocks { repo_id });
+    }
+    effects
+}
+
+/// Starts a `git annex unused` scan, or queues one replay behind a running scan.
+pub(super) fn request_annex_unused_effect(repo_state: &mut RepoState) -> Option<Effect> {
+    repo_state.set_annex_unused(Loadable::Loading);
+    repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::ANNEX_UNUSED)
+        .then_some(Effect::LoadAnnexUnused {
+            repo_id: repo_state.id,
+        })
+}
+
+pub(super) fn annex_unused_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    result: std::result::Result<gitcomet_core::large_files::AnnexUnused, Error>,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    // A queued rescan supersedes this result; stay Loading until it lands.
+    if repo_state
+        .loads_in_flight
+        .finish(RepoLoadsInFlight::ANNEX_UNUSED)
+    {
+        return vec![Effect::LoadAnnexUnused { repo_id }];
+    }
+    repo_state.set_annex_unused(match result {
+        Ok(unused) => Loadable::Ready(Arc::new(unused)),
+        Err(error) => Loadable::Error(error.to_string()),
+    });
+    Vec::new()
+}
+
+/// Ask for repository-level LFS/annex facts, coalescing with a running load.
+pub(super) fn request_large_file_support_effect(repo_state: &mut RepoState) -> Option<Effect> {
+    repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::LARGE_FILE_SUPPORT)
+        .then_some(Effect::LoadLargeFileSupport {
+            repo_id: repo_state.id,
+        })
 }
 
 pub(super) fn staged_status_loaded(
@@ -2605,12 +2842,21 @@ pub(super) fn head_branch_loaded(
                 Loadable::Error(e.to_string())
             }
         };
+        // Another branch can track other LFS patterns or be an annex adjusted
+        // branch, whether a GitComet checkout or a terminal moved HEAD.
+        let moved = matches!(
+            (&repo_state.head_branch, &head_branch),
+            (Loadable::Ready(before), Loadable::Ready(after)) if before != after
+        );
         repo_state.set_head_branch(head_branch);
         if repo_state
             .loads_in_flight
             .finish(RepoLoadsInFlight::HEAD_BRANCH)
         {
             effects.push(Effect::LoadHeadBranch { repo_id });
+        }
+        if moved && let Some(effect) = request_large_file_support_effect(repo_state) {
+            effects.push(effect);
         }
     }
     effects

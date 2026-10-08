@@ -163,7 +163,7 @@ fn git_ops_log_walk_fixture_reports_commit_count_metrics() {
 
 #[test]
 fn git_ops_diff_rename_fixture_reports_rename_metrics() {
-    let fixture = GitOpsFixture::diff_rename_heavy(8);
+    let fixture = GitOpsFixture::diff_range_rename_heavy(8);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -183,7 +183,7 @@ fn git_ops_diff_rename_fixture_reports_rename_metrics() {
 
 #[test]
 fn git_ops_diff_binary_fixture_reports_binary_metrics() {
-    let fixture = GitOpsFixture::diff_binary_heavy(4, 1_024);
+    let fixture = GitOpsFixture::diff_range_binary_heavy(4, 1_024);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -203,7 +203,7 @@ fn git_ops_diff_binary_fixture_reports_binary_metrics() {
 
 #[test]
 fn git_ops_large_single_file_fixture_reports_line_count_metrics() {
-    let fixture = GitOpsFixture::diff_large_single_file(512, 32);
+    let fixture = GitOpsFixture::diff_range_large_single_file(512, 32);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -3207,6 +3207,21 @@ fn fs_event_single_file_save_is_deterministic() {
     let h1 = fixture.run();
     let h2 = fixture.run();
     assert_eq!(h1, h2);
+}
+
+/// The benchmark times `refresh_status` alone, so the untimed setup and
+/// restoration around it must leave every iteration the same work.
+#[test]
+fn fs_event_untimed_restore_returns_the_tree_to_its_clean_state() {
+    let fixture = FsEventFixture::git_checkout_batch(100, 30);
+    for _ in 0..2 {
+        let mutation = fixture.apply_mutation();
+        let (_, metrics) = fixture.refresh_status(&mutation);
+        assert_eq!(metrics.dirty_files_detected, 30);
+        fixture.restore(mutation);
+    }
+    let (_, after) = fixture.refresh_status(&FsEventMutation::default());
+    assert_eq!(after.dirty_files_detected, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 use super::*;
 use crate::kit::click::PointerClickExt as _;
+use gitcomet_ui_kit::text_layout::TextLayoutExt as _;
 use rustc_hash::FxHasher;
 
 fn diff_text_empty_space_surface(
@@ -224,27 +225,6 @@ impl Element for DiffTextSelectionTracker {
     }
 }
 
-#[cfg(test)]
-mod empty_space_tests {
-    use super::*;
-
-    #[test]
-    fn trailing_space_is_only_the_unused_viewport_height() {
-        assert_eq!(
-            diff_text_trailing_space_height(px(400.0), px(0.0), px(20.0), 2),
-            px(360.0)
-        );
-        assert_eq!(
-            diff_text_trailing_space_height(px(400.0), px(0.0), px(20.0), 20),
-            px(0.0)
-        );
-        assert_eq!(
-            diff_text_trailing_space_height(px(400.0), px(-600.0), px(20.0), 50),
-            px(0.0)
-        );
-    }
-}
-
 /// section 30 split: zero-size element that ends a conflict row-drag on mouse-up
 /// anywhere in the window (per-row handlers cover extend inside the columns).
 pub(super) struct ConflictRowSelectionTracker {
@@ -427,10 +407,9 @@ impl Element for DiffTextSelectionOverlay {
                     strikethrough: None,
                     letter_spacing: style.letter_spacing,
                 };
-                let layout =
-                    window
-                        .text_system()
-                        .shape_line(self.text.clone(), font_size, &[run], None);
+                let layout = window
+                    .text_system()
+                    .shape_line(self.text.clone(), font_size, &[run]);
                 let x0 = selection
                     .as_ref()
                     .map(|r| layout.x_for_index(r.start.min(self.text.len())));
@@ -459,6 +438,7 @@ impl Element for DiffTextSelectionOverlay {
             .read(cx)
             .diff_text_visual_source_range_for_region(self.visible_ix, self.region);
         let hitbox = DiffTextHitbox {
+            atomic: false,
             bounds,
             layout_key,
             source_visible_ix,
@@ -478,5 +458,26 @@ impl Element for DiffTextSelectionOverlay {
             this.set_diff_text_hitbox(visible_ix, region, hitbox);
             this.touch_diff_text_layout_cache(layout_key, shaped);
         });
+    }
+}
+
+#[cfg(test)]
+mod empty_space_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_space_is_only_the_unused_viewport_height() {
+        assert_eq!(
+            diff_text_trailing_space_height(px(400.0), px(0.0), px(20.0), 2),
+            px(360.0)
+        );
+        assert_eq!(
+            diff_text_trailing_space_height(px(400.0), px(0.0), px(20.0), 20),
+            px(0.0)
+        );
+        assert_eq!(
+            diff_text_trailing_space_height(px(400.0), px(-600.0), px(20.0), 50),
+            px(0.0)
+        );
     }
 }

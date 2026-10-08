@@ -54,10 +54,7 @@ fn notify_fingerprint_tracks_line_stats_for_the_open_diff_area() {
     ));
 
     for area in [DiffArea::Staged, DiffArea::Unstaged] {
-        state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-            path: "a.rs".into(),
-            area,
-        });
+        state.repos[0].diff_state.diff_target = Some(DiffTarget::working_tree("a.rs".into(), area));
         let before = MainPaneView::notify_fingerprint_for(&state);
         match area {
             DiffArea::Staged => state.repos[0].staged_line_stats_rev += 1,
@@ -86,10 +83,8 @@ fn notify_fingerprint_tracks_disk_revs_only_for_working_tree_targets() {
         },
     ));
 
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: "a.rs".into(),
-        area: DiffArea::Unstaged,
-    });
+    state.repos[0].diff_state.diff_target =
+        Some(DiffTarget::working_tree("a.rs".into(), DiffArea::Unstaged));
     let before = MainPaneView::notify_fingerprint_for(&state);
     state.repos[0].worktree_change_rev += 1;
     let after_worktree = MainPaneView::notify_fingerprint_for(&state);
@@ -104,10 +99,10 @@ fn notify_fingerprint_tracks_disk_revs_only_for_working_tree_targets() {
         "a finished git command must reach the pane"
     );
 
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::Commit {
-        commit_id: gitcomet_core::domain::CommitId(std::sync::Arc::from("abc")),
-        path: Some("a.rs".into()),
-    });
+    state.repos[0].diff_state.diff_target = Some(DiffTarget::commit(
+        gitcomet_core::domain::CommitId(std::sync::Arc::from("abc")),
+        "a.rs".into(),
+    ));
     let commit_before = MainPaneView::notify_fingerprint_for(&state);
     state.repos[0].worktree_change_rev += 1;
     state.repos[0].local_worktree_write_rev += 1;
@@ -259,15 +254,47 @@ fn explicit_wheel_master_at_top_pulls_stale_follower_to_top() {
 
 #[test]
 fn revealed_whitespace_wrap_ranges_follow_rendered_tab_markers() {
-    let hidden = diff_wrap_byte_ranges_for_text("a    b", Some("a\tb"), 4, false)
-        .into_iter()
-        .map(rows::DiffWrapByteRange::range)
-        .collect::<Vec<_>>();
-    assert_eq!(hidden, vec![0..4, 4..6]);
+    let tab_width = 4;
 
-    let revealed = diff_wrap_byte_ranges_for_text("a    b", Some("a\tb"), 4, true)
+    // The tab after "a" runs to the stop at column 4.
+    let hidden = diff_wrap_byte_ranges_for_text(tab_width, "a   b", Some("a\tb"), 4, false)
         .into_iter()
         .map(rows::DiffWrapByteRange::range)
         .collect::<Vec<_>>();
-    assert_eq!(revealed, vec![0..6]);
+    assert_eq!(hidden, vec![0..4, 4..5]);
+
+    let revealed = diff_wrap_byte_ranges_for_text(tab_width, "a   b", Some("a\tb"), 4, true)
+        .into_iter()
+        .map(rows::DiffWrapByteRange::range)
+        .collect::<Vec<_>>();
+    assert_eq!(revealed, vec![0..5]);
+}
+
+/// Sidebar file search and folder expansion move `file_browser_rev` on every
+/// keystroke; the pane only shows the historical-browse tint, which follows
+/// the browser's `active` flag and `source`.
+#[test]
+fn notify_fingerprint_ignores_file_browser_search() {
+    let repo_id = RepoId(1);
+    let mut state = AppState::test_default();
+    state.active_repo = Some(repo_id);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        gitcomet_core::domain::RepoSpec {
+            workdir: "/tmp/repo".into(),
+        },
+    ));
+    let before = MainPaneView::notify_fingerprint_for(&state);
+
+    let browser = &mut state.repos[0].file_browser;
+    browser.search_query = "src".into();
+    browser.expanded_dirs.insert(Arc::new("src".into()));
+    browser.bump_rev();
+    assert_eq!(before, MainPaneView::notify_fingerprint_for(&state));
+
+    let browser = &mut state.repos[0].file_browser;
+    browser.active = true;
+    browser.source = gitcomet_core::domain::FileSource::Commit(CommitId("c1".into()));
+    browser.bump_rev();
+    assert_ne!(before, MainPaneView::notify_fingerprint_for(&state));
 }

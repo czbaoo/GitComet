@@ -166,8 +166,21 @@ pub(crate) fn repository_watch_info(
         {
             info.ignore_inputs.push(path);
         }
-        if let Some(submodules) = repo
-            .submodules()
+        if let Some(path) = config
+            .trusted_path("core.attributesFile")
+            .map_err(|error| Error::new(ErrorKind::Backend(format!("watch attributes: {error}"))))?
+        {
+            info.ignore_inputs.push(if path.is_absolute() {
+                path
+            } else {
+                workdir.join(path)
+            });
+        } else if let Some(path) =
+            gix::path::env::xdg_config("attributes", &mut |key| std::env::var_os(key))
+        {
+            info.ignore_inputs.push(path);
+        }
+        if let Some(submodules) = crate::refs::submodules(&repo)
             .map_err(|error| Error::new(ErrorKind::Backend(format!("watch submodules: {error}"))))?
         {
             for submodule in submodules {
@@ -228,8 +241,13 @@ pub(crate) fn repository_watch_info(
         }
     }
     for dir in &info.git_dirs {
-        info.cache_dirs
-            .extend([dir.join("objects"), dir.join("lfs")]);
+        // The rest of `annex/` is classified by the watcher itself.
+        info.cache_dirs.extend(
+            ["objects", "lfs"]
+                .into_iter()
+                .chain(gitcomet_core::annex::WATCH_PRIVATE_DIRS)
+                .map(|name| dir.join(name)),
+        );
         info.ignore_inputs.extend(
             ["config", "config.worktree", "commondir", "info/exclude"]
                 .into_iter()

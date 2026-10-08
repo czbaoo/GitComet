@@ -13,14 +13,20 @@ impl GixRepo {
         cancellation: &CancellationToken,
     ) -> Result<Arc<[Arc<str>]>> {
         cancellation.check_cancelled()?;
-        let repo = self._repo.to_thread_local();
-        let shallow = shallow_snapshot(&repo)?;
-        let tips = if mode == HistoryMode::AllBranches {
-            self.all_branches_tips(&repo, Some(cancellation))?
-        } else {
-            Arc::from(gix_head_id_or_none(&repo)?.into_iter().collect::<Vec<_>>())
-        };
-        let snapshot = HistorySnapshot(format!("{mode:?}|{tips:?}|{shallow:?}").into());
+        let (store, shared) = self.fresh_history_store()?;
+        let generation = shared.id;
+        let repo = store.to_thread_local();
+        let query = self.resolve_history_query(
+            &repo,
+            shared.id,
+            shared.common.id,
+            mode,
+            None,
+            cancellation,
+        )?;
+        let snapshot = query.snapshot();
+        let tips = query.tips;
+        let shallow = query.shallow;
         if let Some(cached) = self
             .history_authors_cache
             .lock()
@@ -31,12 +37,13 @@ impl GixRepo {
             return Ok(cached.names.clone());
         }
         let mut walk = new_log_paged_walk(
-            &self._repo,
+            &store,
             tips.iter().copied(),
             mode,
             &shallow,
             Some(cancellation),
             None,
+            Some((&shared.topology, generation)),
         )?;
         let mut buffer = Vec::new();
         let mut seen = FxHashSet::default();
@@ -44,7 +51,7 @@ impl GixRepo {
         for info in &mut walk.walk {
             cancellation.check_cancelled()?;
             let info = info.map_err(|error| {
-                Error::new(ErrorKind::Backend(format!("gix history authors: {error}")))
+                crate::repo::object_store::gix_error("gix history authors", &*error)
             })?;
             if !mode_includes(mode, info.parent_ids.len()) {
                 continue;
@@ -53,7 +60,10 @@ impl GixRepo {
                 .objects
                 .find_commit(info.id.as_ref(), &mut buffer)
                 .map_err(|error| {
-                    Error::new(ErrorKind::Backend(format!("gix history author: {error}")))
+                    crate::repo::object_store::gix_error(
+                        "gix history author",
+                        &gix::Error::from(error),
+                    )
                 })?;
             let name = commit
                 .author()

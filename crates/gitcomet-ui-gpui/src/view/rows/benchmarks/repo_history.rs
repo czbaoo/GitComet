@@ -57,7 +57,11 @@ struct HistoryShortShaVm(SharedString);
 
 impl HistoryShortShaVm {
     fn new(commit_id: &str) -> Self {
-        Self(commit_id.chars().take(7).collect::<String>().into())
+        Self(
+            gitcomet_core::domain::short_commit_id(commit_id)
+                .to_owned()
+                .into(),
+        )
     }
 
     fn as_str(&self) -> &str {
@@ -450,6 +454,20 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
     for row in rows.iter().take(256) {
         std::mem::discriminant(row).hash(&mut h);
         match row {
+            BranchSidebarRow::ContributionHeader {
+                title,
+                collapsed,
+                collapse_key,
+                ..
+            } => {
+                title.hash(&mut h);
+                collapsed.hash(&mut h);
+                collapse_key.hash(&mut h);
+            }
+            BranchSidebarRow::ContributionItem { label, key, .. } => {
+                label.hash(&mut h);
+                key.hash(&mut h);
+            }
             BranchSidebarRow::SectionHeader {
                 section,
                 top_border,
@@ -463,13 +481,6 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
                 .hash(&mut h);
                 top_border.hash(&mut h);
                 collapsed.hash(&mut h);
-            }
-            BranchSidebarRow::FilterGroupHeader { section } => {
-                match section {
-                    BranchSection::Local => 0u8,
-                    BranchSection::Remote => 1u8,
-                }
-                .hash(&mut h);
             }
             BranchSidebarRow::Placeholder { section, message } => {
                 match section {
@@ -567,14 +578,14 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
                 message.len().hash(&mut h);
                 tooltip.len().hash(&mut h);
             }
-            BranchSidebarRow::PinnedHeader { collapsed, .. } => {
-                collapsed.hash(&mut h);
-            }
             BranchSidebarRow::SectionSpacer
             | BranchSidebarRow::WorktreesHeader { .. }
             | BranchSidebarRow::WorktreePlaceholder { .. }
             | BranchSidebarRow::SubmodulesHeader { .. }
             | BranchSidebarRow::SubmodulePlaceholder { .. }
+            | BranchSidebarRow::AnnexHeader { .. }
+            | BranchSidebarRow::AnnexPlaceholder { .. }
+            | BranchSidebarRow::AnnexRepositoryItem { .. }
             | BranchSidebarRow::StashHeader { .. }
             | BranchSidebarRow::StashPlaceholder { .. } => {}
         }
@@ -1032,11 +1043,13 @@ impl RepoSwitchMetrics {
 fn hash_repo_switch_outcome(state: &AppState, effects: &[Effect]) -> u64 {
     fn hash_diff_target(target: &DiffTarget, h: &mut FxHasher) {
         match target {
-            DiffTarget::WorkingTree { path, area } => {
+            DiffTarget::WorkingTree { path, area, .. } => {
                 path.hash(h);
                 (*area as u8).hash(h);
             }
-            DiffTarget::Commit { commit_id, path } => {
+            DiffTarget::Commit {
+                commit_id, path, ..
+            } => {
                 commit_id.hash(h);
                 path.hash(h);
             }
@@ -1044,6 +1057,7 @@ fn hash_repo_switch_outcome(state: &AppState, effects: &[Effect]) -> u64 {
                 from_commit_id,
                 to_commit_id,
                 path,
+                ..
             } => {
                 from_commit_id.hash(h);
                 to_commit_id.hash(h);

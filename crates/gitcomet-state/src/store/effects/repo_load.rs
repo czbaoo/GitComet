@@ -1,4 +1,4 @@
-use crate::model::{AppState, ConflictFileLoadMode};
+use crate::model::{AppState, ConflictFileLoadMode, WorktreeDirtyScope};
 use crate::msg::Msg;
 use gitcomet_core::conflict_session::{ConflictPayload, ConflictSession, ConflictStageParts};
 use gitcomet_core::domain::{
@@ -11,7 +11,7 @@ use gitcomet_core::mergetool_trace::{
 };
 use gitcomet_core::path_utils::canonicalize_or_original;
 use gitcomet_core::services::{CancellationToken, ConflictFileStages, GitBackend, GitRepository};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
@@ -25,6 +25,8 @@ use super::util::{
 };
 
 pub(super) struct SelectedDiffLoadOptions {
+    /// Read the file's `.gitattributes` and text config.
+    pub(super) load_text_attributes: bool,
     pub(super) load_patch_diff: bool,
     pub(super) load_file_text: bool,
     pub(super) preview_text_side: Option<DiffPreviewTextSide>,
@@ -116,10 +118,7 @@ mod selected_diff_guard_tests {
     use gitcomet_core::domain::RepoSpec;
 
     fn target(path: &str) -> DiffTarget {
-        DiffTarget::WorkingTree {
-            path: PathBuf::from(path),
-            area: DiffArea::Unstaged,
-        }
+        DiffTarget::working_tree(PathBuf::from(path), DiffArea::Unstaged)
     }
 
     fn thread_state_with_target(
@@ -168,6 +167,79 @@ mod selected_diff_guard_tests {
         let stale_target =
             SelectedDiffLoadGuard::new(thread_state, repo_id, target("src/main.rs"), 7);
         assert!(!stale_target.is_current());
+    }
+
+    fn finish_filesystem_rename(
+        thread_state: &Arc<RwLock<Arc<AppState>>>,
+    ) -> Vec<crate::msg::Effect> {
+        let mut state = (**thread_state.read().unwrap()).clone();
+        let root = &state.repos[0].spec.workdir;
+        let changes = vec![gitcomet_core::filesystem::PathChange {
+            old: Some(root.join("src")),
+            new: Some(root.join("renamed")),
+        }];
+        let effects = crate::store::reducer::reduce(
+            &mut Default::default(),
+            &std::sync::atomic::AtomicU64::new(2),
+            &mut state,
+            Msg::FilesystemPathsChanged(changes),
+        );
+        *thread_state.write().unwrap() = Arc::new(state);
+        effects
+    }
+
+    #[test]
+    fn filesystem_changes_preserve_pending_loads_for_unchanged_diff_targets() {
+        use gitcomet_core::domain::CommitId;
+        for selected in [
+            DiffTarget::commit_range(CommitId("abc".into()), Some(CommitId("def".into())), None),
+            DiffTarget::commit(CommitId("abc".into()), "src/lib.rs".into()),
+            DiffTarget::commit_range(
+                CommitId("abc".into()),
+                Some(CommitId("def".into())),
+                Some("src/lib.rs".into()),
+            ),
+            DiffTarget::working_tree("src/lib.rs".into(), DiffArea::Staged),
+            target("unrelated.rs"),
+        ] {
+            let state = thread_state_with_target(RepoId(1), selected.clone(), 7);
+            let guard = SelectedDiffLoadGuard::new(state.clone(), RepoId(1), selected, 7);
+            finish_filesystem_rename(&state);
+            assert!(
+                guard.is_current(),
+                "an unaffected pending read must still be delivered"
+            );
+        }
+    }
+
+    #[test]
+    fn filesystem_moves_replace_pending_diff_loads_for_the_retargeted_path() {
+        use crate::model::Loadable;
+        use crate::msg::{Effect, InternalMsg};
+        let selected = target("src/lib.rs");
+        let state = thread_state_with_target(RepoId(1), selected.clone(), 7);
+        let guard = SelectedDiffLoadGuard::new(state.clone(), RepoId(1), selected, 7);
+        let effects = finish_filesystem_rename(&state);
+        assert!(!guard.is_current());
+        let expected = target("renamed/lib.rs");
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::LoadDiff { target, .. } if target == &expected)));
+        let mut next = (**state.read().unwrap()).clone();
+        assert!(matches!(next.repos[0].diff_state.diff, Loadable::Loading));
+        crate::store::reducer::reduce(
+            &mut Default::default(),
+            &std::sync::atomic::AtomicU64::new(2),
+            &mut next,
+            Msg::Internal(InternalMsg::DiffLoaded {
+                repo_id: RepoId(1),
+                target: expected.clone(),
+                result: Ok(gitcomet_core::domain::Diff {
+                    target: expected,
+                    lines: vec![],
+                }),
+            }),
+        );
+        assert!(matches!(next.repos[0].diff_state.diff, Loadable::Ready(_)));
     }
 
     /// The repo-load trace explains slow or stuck loads, so selected-diff work
@@ -238,6 +310,7 @@ mod selected_diff_guard_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let msg_tx = StoreWorkerSender::for_test_msg_sender(tx);
         let load = |patch, text, summary, image| SelectedDiffLoadOptions {
+            load_text_attributes: false,
             load_patch_diff: patch,
             load_file_text: text,
             preview_text_side: None,
@@ -514,6 +587,7 @@ pub(super) fn schedule_load_uncommitted_line_stats(
     repo_id: RepoId,
     generation: crate::model::LineStatsGeneration,
     status: std::sync::Arc<gitcomet_core::domain::RepoStatus>,
+    large_files: bool,
     cancellation: CancellationToken,
 ) {
     spawn_detached_with_repo_or_else(
@@ -523,15 +597,20 @@ pub(super) fn schedule_load_uncommitted_line_stats(
         repo_id,
         msg_tx,
         move |repo, msg_tx| {
+            // Cancellable: this reads every changed file, so a superseded scan
+            // must not hold the repo-load worker.
+            let result = repo.uncommitted_line_stats_for_status_cancellable(&status, &cancellation);
+            // Same snapshot and generation, so the rows stay coherent.
+            let large_files = large_files.then(|| {
+                repo.uncommitted_large_files_for_status_cancellable(&status, &cancellation)
+            });
             send_or_log(
                 &msg_tx,
                 Msg::Internal(crate::msg::InternalMsg::UncommittedLineStatsLoaded {
                     repo_id,
                     generation,
-                    // Cancellable: this reads every changed file, so a
-                    // superseded scan must not hold the repo-load worker.
-                    result: repo
-                        .uncommitted_line_stats_for_status_cancellable(&status, &cancellation),
+                    result,
+                    large_files,
                 }),
             );
         },
@@ -542,6 +621,7 @@ pub(super) fn schedule_load_uncommitted_line_stats(
                     repo_id,
                     generation,
                     result: Err(missing_repo_error(repo_id)),
+                    large_files: None,
                 }),
             );
         },
@@ -827,6 +907,7 @@ pub(super) fn schedule_load_conflict_file(
     repo_id: RepoId,
     path: PathBuf,
     mode: ConflictFileLoadMode,
+    encoding: Option<gitcomet_core::text_format::TextEncoding>,
 ) {
     spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
         let trace_path = path.clone();
@@ -834,7 +915,11 @@ pub(super) fn schedule_load_conflict_file(
 
         let conflict_session_started = Instant::now();
         let conflict_session = load_full
-            .then(|| repo.conflict_session(&path).ok().flatten())
+            .then(|| {
+                repo.conflict_session_with_encoding(&path, encoding)
+                    .ok()
+                    .flatten()
+            })
             .flatten();
         let session_ref = conflict_session.as_ref();
         mergetool_trace::record_with(|| {
@@ -867,10 +952,7 @@ pub(super) fn schedule_load_conflict_file(
             match repo.conflict_file_stages(&path) {
                 Ok(v) => Ok(v),
                 Err(e) if matches!(e.kind(), ErrorKind::Unsupported(_)) => repo
-                    .diff_file_text(&DiffTarget::WorkingTree {
-                        path: path.clone(),
-                        area: DiffArea::Unstaged,
-                    })
+                    .diff_file_text(&DiffTarget::working_tree(path.clone(), DiffArea::Unstaged))
                     .map(|opt| {
                         opt.map(|d| {
                             let ours_bytes = d
@@ -979,7 +1061,7 @@ pub(super) fn schedule_load_conflict_file(
                 repo_id,
                 path,
                 result: Box::new(result),
-                conflict_session,
+                conflict_session: conflict_session.map(Box::new),
             }),
         );
     });
@@ -1041,6 +1123,19 @@ pub(super) fn schedule_load_file_history(
     });
 }
 
+/// Blame for `path` at `source`: History's and diff sessions' shared reader.
+pub(super) fn load_blame(
+    repo: &dyn GitRepository,
+    path: &Path,
+    source: &gitcomet_core::domain::BlameSource,
+) -> gitcomet_core::services::Result<Vec<gitcomet_core::services::BlameLine>> {
+    use gitcomet_core::domain::BlameSource;
+    match source {
+        BlameSource::Revision(rev) => repo.blame_file(path, rev.as_deref()),
+        BlameSource::WorkingTree(area) => repo.blame_worktree_file(path, *area),
+    }
+}
+
 pub(super) fn schedule_load_blame(
     executor: &TaskExecutor,
     repos: &RepoMap,
@@ -1049,12 +1144,8 @@ pub(super) fn schedule_load_blame(
     path: PathBuf,
     source: gitcomet_core::domain::BlameSource,
 ) {
-    use gitcomet_core::domain::BlameSource;
     spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
-        let result = match &source {
-            BlameSource::Revision(rev) => repo.blame_file(&path, rev.as_deref()),
-            BlameSource::WorkingTree(area) => repo.blame_worktree_file(&path, *area),
-        };
+        let result = load_blame(repo.as_ref(), &path, &source);
         send_or_log(
             &msg_tx,
             Msg::Internal(crate::msg::InternalMsg::BlameLoaded {
@@ -1101,7 +1192,7 @@ pub(super) fn schedule_load_worktrees(
     );
 }
 
-/// Scans every *other* linked worktree for uncommitted changes.
+/// Scans all other linked worktrees, or just the requested checkouts.
 ///
 /// The worktree list is re-read inside the task rather than passed in from
 /// state: this way the scan can never disagree with the paths it walks, and it
@@ -1118,9 +1209,11 @@ pub(super) fn schedule_load_worktree_dirty(
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
     own_workdir: PathBuf,
+    scope: WorktreeDirtyScope,
     files_for: Option<PathBuf>,
     cancellation: CancellationToken,
 ) {
+    let missing_scope = scope.clone();
     spawn_detached_with_repo_or_else(
         executor,
         "load-worktree-dirty",
@@ -1162,6 +1255,9 @@ pub(super) fn schedule_load_worktree_dirty(
                             continue;
                         }
                         scanned.push(worktree.path.clone());
+                        if !scope.includes(&worktree.path) {
+                            continue;
+                        }
                         let Some(handle) = worktree_scan_handle(
                             worktree_scan_handles(),
                             &*backend,
@@ -1187,7 +1283,6 @@ pub(super) fn schedule_load_worktree_dirty(
                                 // removed or replaced underneath it.
                                 forget_worktree_scan_handle(
                                     worktree_scan_handles(),
-                                    repo_id,
                                     &worktree.path,
                                 );
                                 continue;
@@ -1231,7 +1326,11 @@ pub(super) fn schedule_load_worktree_dirty(
                 });
             send_or_log(
                 &msg_tx,
-                Msg::Internal(crate::msg::InternalMsg::WorktreeDirtyLoaded { repo_id, result }),
+                Msg::Internal(crate::msg::InternalMsg::WorktreeDirtyLoaded {
+                    repo_id,
+                    scope,
+                    result,
+                }),
             );
         },
         move |msg_tx| {
@@ -1239,6 +1338,7 @@ pub(super) fn schedule_load_worktree_dirty(
                 &msg_tx,
                 Msg::Internal(crate::msg::InternalMsg::WorktreeDirtyLoaded {
                     repo_id,
+                    scope: missing_scope,
                     result: Err(missing_repo_error(repo_id)),
                 }),
             );
@@ -1254,26 +1354,26 @@ pub(super) fn schedule_load_worktree_dirty(
 /// the index and the worktree, so a reused handle reports fresh results; a handle
 /// that fails is dropped ([`forget_worktree_scan_handle`]) and reopened next time.
 ///
-/// Keyed by repo as well as path: entries are pruned against the worktree list of
-/// the scan that owns them ([`retain_worktree_scan_handles`]), dropped outright
-/// when the repo's tab closes ([`release_worktree_scan_handles`]), and one repo's
-/// scan must not evict another's.
+/// Keyed by canonical checkout path so linked tabs share warm status caches.
+/// Owners are tracked separately: pruning or closing one tab releases only its
+/// ownership, and a handle is dropped when no tabs still need it.
 static WORKTREE_SCAN_HANDLES: OnceLock<Mutex<WorktreeScanHandles>> = OnceLock::new();
 
 /// Handles held open across scans. Each one keeps file descriptors and mapped
 /// index data alive, so the total is capped rather than left to grow with every
 /// worktree the session has ever looked at.
-const WORKTREE_SCAN_HANDLE_LIMIT: usize = 16;
+const WORKTREE_SCAN_HANDLE_LIMIT: usize = 64;
 
 #[derive(Default)]
 struct WorktreeScanHandles {
-    entries: FxHashMap<(RepoId, PathBuf), WorktreeScanHandle>,
+    entries: FxHashMap<PathBuf, WorktreeScanHandle>,
     /// Ticks once per lookup; the entry holding the highest tick is the hottest.
     clock: u64,
 }
 
 struct WorktreeScanHandle {
     handle: Arc<dyn GitRepository>,
+    owners: FxHashSet<RepoId>,
     last_used: u64,
 }
 
@@ -1285,15 +1385,10 @@ impl WorktreeScanHandles {
 
     /// Frees a slot for a new entry belonging to `repo_id`.
     ///
-    /// The slot comes out of whichever repo holds the most, with the requester
-    /// winning ties. That first step is what keeps repos from starving each
-    /// other: the map is process-wide, and a rule that always spent the
-    /// requester's own budget froze whatever split the tabs happened to open in.
-    /// Two repos of ten worktrees each, the first to scan taking ten slots and
-    /// the second the remaining six, left the second pinned at six forever --
-    /// every scan re-paying discovery and config parsing for the tail of its
-    /// list, which is the cost this cache exists to avoid. Taking from the
-    /// largest holder walks that split down to an even one and then holds there.
+    /// Take from the largest owner, with the requester winning ties, so a new
+    /// repository can earn a fair share rather than staying pinned to whatever
+    /// slots were free when it opened. Shared checkouts occupy one slot but
+    /// count toward each owner's share.
     ///
     /// Within the requester's own entries the *most* recently used goes, not the
     /// coldest. A scan walks `list_worktrees` in order and every scan walks the
@@ -1310,8 +1405,10 @@ impl WorktreeScanHandles {
     /// keep.
     fn evict_one_for(&mut self, repo_id: RepoId) -> bool {
         let mut held: FxHashMap<RepoId, usize> = FxHashMap::default();
-        for (entry_repo, _) in self.entries.keys() {
-            *held.entry(*entry_repo).or_default() += 1;
+        for entry in self.entries.values() {
+            for owner in &entry.owners {
+                *held.entry(*owner).or_default() += 1;
+            }
         }
         let Some(largest) = held
             .into_iter()
@@ -1328,7 +1425,7 @@ impl WorktreeScanHandles {
         let of_largest = self
             .entries
             .iter()
-            .filter(|((entry_repo, _), _)| *entry_repo == largest);
+            .filter(|(_, entry)| entry.owners.contains(&largest));
         let victim = if largest == repo_id {
             of_largest.max_by_key(|(_, entry)| entry.last_used)
         } else {
@@ -1367,12 +1464,13 @@ fn worktree_scan_handle(
     repo_id: RepoId,
     path: &Path,
 ) -> Option<Arc<dyn GitRepository>> {
-    let key = (repo_id, path.to_path_buf());
+    let key = canonicalize_or_original(path.to_path_buf());
     {
         let mut handles = lock_worktree_scan_handles(handles);
         let now = handles.tick();
         if let Some(entry) = handles.entries.get_mut(&key) {
             entry.last_used = now;
+            entry.owners.insert(repo_id);
             return Some(Arc::clone(&entry.handle));
         }
     }
@@ -1382,16 +1480,58 @@ fn worktree_scan_handle(
     // stall every other repo's scan behind it.
     let handle = backend.open(path).ok()?;
     let mut handles = lock_worktree_scan_handles(handles);
+    // A diff load and the scanner can open the same checkout concurrently.
+    let now = handles.tick();
+    if let Some(entry) = handles.entries.get_mut(&key) {
+        entry.last_used = now;
+        entry.owners.insert(repo_id);
+        return Some(Arc::clone(&entry.handle));
+    }
     while handles.entries.len() >= WORKTREE_SCAN_HANDLE_LIMIT && handles.evict_one_for(repo_id) {}
     let last_used = handles.tick();
     handles.entries.insert(
         key,
         WorktreeScanHandle {
             handle: Arc::clone(&handle),
+            owners: FxHashSet::from_iter([repo_id]),
             last_used,
         },
     );
     Some(handle)
+}
+
+/// A handle on `repo`'s linked worktree at `path`, from the scan's cache.
+/// Errors when `path` is not one of `repo`'s linked worktrees.
+pub(super) fn linked_worktree_handle(
+    backend: &dyn GitBackend,
+    repo_id: RepoId,
+    repo: &dyn GitRepository,
+    path: &Path,
+) -> Result<Arc<dyn GitRepository>, Error> {
+    let path = gitcomet_core::domain::normalize_worktree_path(path);
+    let canonical = canonicalize_or_original(path.clone());
+    // Git lists canonical paths; a caller may hold another spelling.
+    let names_path = |candidate: &Path| {
+        gitcomet_core::domain::normalize_worktree_path(candidate) == path
+            || canonicalize_or_original(candidate.to_path_buf()) == canonical
+    };
+    let linked = !names_path(&repo.spec().workdir)
+        && repo
+            .list_worktrees()?
+            .iter()
+            .any(|worktree| names_path(&worktree.path));
+    if !linked {
+        return Err(Error::new(ErrorKind::Backend(format!(
+            "{} is not a linked worktree of this repository",
+            path.display()
+        ))));
+    }
+    worktree_scan_handle(worktree_scan_handles(), backend, repo_id, &path).ok_or_else(|| {
+        Error::new(ErrorKind::Backend(format!(
+            "Could not open the worktree at {}",
+            path.display()
+        )))
+    })
 }
 
 /// Drops this repo's handles for worktrees the current scan did not walk — ones
@@ -1403,27 +1543,35 @@ fn retain_worktree_scan_handles(
     repo_id: RepoId,
     seen: &[PathBuf],
 ) {
+    let seen: FxHashSet<_> = seen
+        .iter()
+        .map(|path| canonicalize_or_original(path.clone()))
+        .collect();
     lock_worktree_scan_handles(handles)
         .entries
-        .retain(|(entry_repo, path), _| *entry_repo != repo_id || seen.contains(path));
+        .retain(|path, entry| {
+            if !seen.contains(path) {
+                entry.owners.remove(&repo_id);
+            }
+            !entry.owners.is_empty()
+        });
 }
 
-fn forget_worktree_scan_handle(handles: &Mutex<WorktreeScanHandles>, repo_id: RepoId, path: &Path) {
+fn forget_worktree_scan_handle(handles: &Mutex<WorktreeScanHandles>, path: &Path) {
     lock_worktree_scan_handles(handles)
         .entries
-        .remove(&(repo_id, path.to_path_buf()));
+        .remove(&canonicalize_or_original(path.to_path_buf()));
 }
 
-/// Drops every handle a repo holds, for when the repo itself goes away.
-///
-/// Nothing else can: the per-scan prune only runs from that repo's own scan, so a
-/// closed tab's handles -- file descriptors and mapped index data, one set per
-/// linked worktree -- would otherwise sit there for the life of the process,
-/// released only if unrelated repos happened to push the map to its limit.
-pub(in crate::store) fn release_worktree_scan_handles(repo_id: RepoId) {
+/// Drops every scan handle, e.g. after a fetch, so none keeps old packs mapped.
+pub(in crate::store) fn release_all_worktree_scan_handles() {
     lock_worktree_scan_handles(worktree_scan_handles())
         .entries
-        .retain(|(entry_repo, _), _| *entry_repo != repo_id);
+        .clear();
+}
+
+pub(in crate::store) fn release_worktree_scan_handles(repo_id: RepoId) {
+    retain_worktree_scan_handles(worktree_scan_handles(), repo_id, &[]);
 }
 
 /// Whether `worktree_path` is the worktree this tab already has open — those
@@ -1541,15 +1689,154 @@ pub(super) fn schedule_load_submodules(
     );
 }
 
+pub(in crate::store::effects) mod explorer_listing;
+
+pub(super) fn schedule_load_large_file_support(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    cancellation: CancellationToken,
+) {
+    spawn_with_repo_or_else(
+        executor,
+        repos,
+        repo_id,
+        msg_tx,
+        move |repo, msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::LargeFileSupportLoaded {
+                    repo_id,
+                    result: repo.large_file_support_cancellable(&cancellation),
+                }),
+            );
+        },
+        move |msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::LargeFileSupportLoaded {
+                    repo_id,
+                    result: Err(missing_repo_error(repo_id)),
+                }),
+            );
+        },
+    );
+}
+
+pub(super) fn schedule_load_lfs_locks(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    cancellation: CancellationToken,
+) {
+    spawn_with_repo_or_else(
+        executor,
+        repos,
+        repo_id,
+        msg_tx,
+        move |repo, msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::LfsLocksLoaded {
+                    repo_id,
+                    result: repo.lfs_locks_cancellable(&cancellation),
+                }),
+            );
+        },
+        move |msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::LfsLocksLoaded {
+                    repo_id,
+                    result: Err(missing_repo_error(repo_id)),
+                }),
+            );
+        },
+    );
+}
+
+pub(super) fn schedule_load_annex_unused(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    cancellation: CancellationToken,
+) {
+    spawn_with_repo_or_else(
+        executor,
+        repos,
+        repo_id,
+        msg_tx,
+        move |repo, msg_tx| {
+            let result = repo.annex_unused_cancellable(&cancellation);
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::AnnexUnusedLoaded { repo_id, result }),
+            );
+        },
+        move |msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::AnnexUnusedLoaded {
+                    repo_id,
+                    result: Err(missing_repo_error(repo_id)),
+                }),
+            );
+        },
+    );
+}
+
+pub(super) fn schedule_load_annex_whereis(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    key: String,
+    cancellation: CancellationToken,
+) {
+    let missing_key = key.clone();
+    spawn_with_repo_or_else(
+        executor,
+        repos,
+        repo_id,
+        msg_tx,
+        move |repo, msg_tx| {
+            let result = repo.annex_whereis_cancellable(&key, &cancellation);
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::AnnexWhereisLoaded {
+                    repo_id,
+                    key,
+                    result,
+                }),
+            );
+        },
+        move |msg_tx| {
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(crate::msg::InternalMsg::AnnexWhereisLoaded {
+                    repo_id,
+                    key: missing_key,
+                    result: Err(missing_repo_error(repo_id)),
+                }),
+            );
+        },
+    );
+}
+
 pub(super) fn schedule_load_file_browser(
     executor: &TaskExecutor,
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
     source: gitcomet_core::domain::FileSource,
-    _cancellation: CancellationToken,
+    cancellation: CancellationToken,
+    options: explorer_listing::Options,
 ) {
     let source_for_err = source.clone();
+    let cancellation_for_err = cancellation.clone();
     spawn_with_repo_or_else(
         executor,
         repos,
@@ -1557,7 +1844,16 @@ pub(super) fn schedule_load_file_browser(
         msg_tx,
         move |repo, msg_tx| {
             let result = match &source {
-                gitcomet_core::domain::FileSource::WorkingDirectory => repo.list_worktree_files(),
+                gitcomet_core::domain::FileSource::WorkingDirectory => {
+                    repo.list_worktree_files().and_then(|entries| {
+                        explorer_listing::augment(
+                            &repo.spec().workdir,
+                            entries,
+                            options,
+                            &cancellation,
+                        )
+                    })
+                }
                 gitcomet_core::domain::FileSource::Commit(commit_id) => {
                     repo.list_tree_files_at_commit(commit_id)
                 }
@@ -1570,6 +1866,7 @@ pub(super) fn schedule_load_file_browser(
             send_or_log(
                 &msg_tx,
                 Msg::Internal(crate::msg::InternalMsg::FileBrowserLoaded {
+                    cancellation: Some(cancellation),
                     repo_id,
                     source,
                     result,
@@ -1580,6 +1877,7 @@ pub(super) fn schedule_load_file_browser(
             send_or_log(
                 &msg_tx,
                 Msg::Internal(crate::msg::InternalMsg::FileBrowserLoaded {
+                    cancellation: Some(cancellation_for_err),
                     repo_id,
                     source: source_for_err,
                     result: Err(missing_repo_error(repo_id)),
@@ -1756,25 +2054,6 @@ pub(super) fn schedule_load_hover_commit_message(
     );
 }
 
-pub(super) fn schedule_load_commit_details(
-    executor: &TaskExecutor,
-    repos: &RepoMap,
-    msg_tx: StoreWorkerSender,
-    repo_id: RepoId,
-    commit_id: gitcomet_core::domain::CommitId,
-) {
-    spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
-        send_or_log(
-            &msg_tx,
-            Msg::Internal(crate::msg::InternalMsg::CommitDetailsLoaded {
-                repo_id,
-                commit_id: commit_id.clone(),
-                result: repo.commit_details(&commit_id),
-            }),
-        );
-    });
-}
-
 pub(super) fn schedule_verify_commit_signatures(
     executor: &TaskExecutor,
     repos: &RepoMap,
@@ -1854,6 +2133,7 @@ pub(super) fn schedule_resolve_commit_lookup(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn schedule_load_range_files(
     executor: &TaskExecutor,
     repos: &RepoMap,
@@ -1861,10 +2141,12 @@ pub(super) fn schedule_load_range_files(
     repo_id: RepoId,
     from: gitcomet_core::domain::CommitId,
     to: Option<gitcomet_core::domain::CommitId>,
+    options: gitcomet_core::services::ComparisonOptions,
     request: u64,
 ) {
     spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
-        let result = repo.diff_range_files(&from, to.as_ref());
+        // History and hosted views share this comparison service.
+        let result = repo.compare_files(&from, to.as_ref(), &options, &CancellationToken::new());
         send_or_log(
             &msg_tx,
             Msg::Internal(crate::msg::InternalMsg::RangeFilesLoaded {
@@ -1972,10 +2254,7 @@ pub(super) fn schedule_open_file_at_commit(
         } else {
             Msg::SelectDiff {
                 repo_id,
-                target: gitcomet_core::domain::DiffTarget::Commit {
-                    commit_id,
-                    path: Some(resolved),
-                },
+                target: gitcomet_core::domain::DiffTarget::commit(commit_id, resolved),
             }
         };
         send_or_log(&msg_tx, message);
@@ -2020,7 +2299,7 @@ pub(super) fn schedule_open_file_at_commit_parent(
                 // instead of silently doing nothing.
                 send_or_log(
                     &msg_tx,
-                    Msg::ShowBannerError {
+                    Msg::ReportError {
                         repo_id: Some(repo_id),
                         message: format!("Could not open file at parent commit: {e}"),
                     },
@@ -2050,16 +2329,37 @@ pub(super) fn schedule_load_recent_commit_messages(
     });
 }
 
+/// The user's encoding choice for `path`, when it is the open file.
+pub(super) fn file_encoding_override(
+    thread_state: &RwLock<Arc<AppState>>,
+    repo_id: RepoId,
+    path: &Path,
+) -> Option<gitcomet_core::text_format::TextEncoding> {
+    let state = thread_state.read().unwrap_or_else(|e| e.into_inner());
+    state
+        .repos
+        .iter()
+        .find(|repo| repo.id == repo_id)?
+        .diff_state
+        .text_override_for(path)?
+        .encoding
+}
+
 pub(super) fn schedule_load_diff(
     executor: &TaskExecutor,
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
     target: DiffTarget,
+    encoding: Option<gitcomet_core::text_format::TextEncoding>,
 ) {
     spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
         // UI consumes this parsed diff through paged/lazy row adapters.
-        let result = repo.diff_parsed(&target);
+        let result = repo.diff_parsed_with_encoding_cancellable(
+            &target,
+            encoding,
+            &CancellationToken::new(),
+        );
         send_or_log(
             &msg_tx,
             Msg::Internal(crate::msg::InternalMsg::DiffLoaded {
@@ -2077,9 +2377,14 @@ pub(super) fn schedule_load_diff_file(
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
     target: DiffTarget,
+    encoding: Option<gitcomet_core::text_format::TextEncoding>,
 ) {
     spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, msg_tx| {
-        let result = repo.diff_file_text(&target);
+        let result = repo.diff_file_text_with_encoding_cancellable(
+            &target,
+            encoding,
+            &CancellationToken::new(),
+        );
         send_or_log(
             &msg_tx,
             Msg::Internal(crate::msg::InternalMsg::DiffFileLoaded {
@@ -2260,7 +2565,38 @@ pub(super) fn schedule_load_selected_diff(
     options: SelectedDiffLoadOptions,
 ) {
     let (target, target_rev) = selection;
+    let encoding = target
+        .file_path()
+        .and_then(|path| file_encoding_override(&thread_state, repo_id, path));
     let guard = SelectedDiffLoadGuard::new(thread_state, repo_id, target.clone(), target_rev);
+    if options.load_text_attributes
+        && let Some(path) = target.file_path().map(Path::to_path_buf)
+    {
+        let target = target.clone();
+        spawn_with_selected_diff_guard(
+            executor,
+            &slots.text_attributes,
+            "selected_diff_text_attributes",
+            repos,
+            repo_id,
+            msg_tx.clone(),
+            guard.clone(),
+            move |repo, msg_tx, guard| {
+                let result = repo.text_attributes(&path);
+                if !guard.is_current() {
+                    return;
+                }
+                send_or_log(
+                    &msg_tx,
+                    Msg::Internal(crate::msg::InternalMsg::TextAttributesLoaded {
+                        repo_id,
+                        target,
+                        result,
+                    }),
+                );
+            },
+        );
+    }
     if options.load_patch_diff {
         let target = target.clone();
         let msg_tx = msg_tx.clone();
@@ -2276,7 +2612,8 @@ pub(super) fn schedule_load_selected_diff(
             guard,
             move |repo, msg_tx, guard| {
                 // UI consumes this parsed diff through paged/lazy row adapters.
-                let result = repo.diff_parsed_cancellable(&target, &cancellation);
+                let result =
+                    repo.diff_parsed_with_encoding_cancellable(&target, encoding, &cancellation);
                 if !guard.is_current() {
                     return;
                 }
@@ -2303,7 +2640,8 @@ pub(super) fn schedule_load_selected_diff(
             msg_tx.clone(),
             guard.clone(),
             move |repo, msg_tx, guard| {
-                let result = repo.diff_file_text_cancellable(&target, &cancellation);
+                let result =
+                    repo.diff_file_text_with_encoding_cancellable(&target, encoding, &cancellation);
                 if !guard.is_current() {
                     return;
                 }
@@ -2635,6 +2973,68 @@ mod worktree_scan_handle_tests {
         Mutex::new(WorktreeScanHandles::default())
     }
 
+    #[test]
+    fn twenty_worktrees_stay_warm_across_linked_tabs() {
+        let handles = handles();
+        let backend = CountingBackend::new();
+        let paths: Vec<_> = (0..20)
+            .map(|ix| PathBuf::from(format!("/wt/shared-warm-{ix}")))
+            .collect();
+        let mut first_handles = Vec::new();
+        for path in &paths {
+            first_handles
+                .push(worktree_scan_handle(&handles, &backend, RepoId(4100), path).unwrap());
+        }
+        for repo_id in [RepoId(4101), RepoId(4100), RepoId(4101)] {
+            for (path, first) in paths.iter().zip(&first_handles) {
+                let reused = worktree_scan_handle(&handles, &backend, repo_id, path).unwrap();
+                assert!(
+                    Arc::ptr_eq(first, &reused),
+                    "the checkout keeps its warmed status state"
+                );
+            }
+        }
+        assert_eq!(
+            backend.opens(),
+            paths.len(),
+            "each physical checkout is opened just once"
+        );
+        assert_eq!(
+            lock_worktree_scan_handles(&handles).entries.len(),
+            paths.len()
+        );
+        retain_worktree_scan_handles(&handles, RepoId(4100), &[]);
+        assert_eq!(
+            lock_worktree_scan_handles(&handles).entries.len(),
+            paths.len(),
+            "closing one tab retains shared handles"
+        );
+        retain_worktree_scan_handles(&handles, RepoId(4101), &[]);
+        assert!(
+            lock_worktree_scan_handles(&handles).entries.is_empty(),
+            "closing the last owner releases the cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alternate_checkout_paths_share_a_cache_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&checkout).unwrap();
+        std::os::unix::fs::symlink(&checkout, &alias).unwrap();
+        let handles = handles();
+        let backend = CountingBackend::new();
+        let first = worktree_scan_handle(&handles, &backend, RepoId(4102), &checkout).unwrap();
+        let second = worktree_scan_handle(&handles, &backend, RepoId(4103), &alias).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(backend.opens(), 1);
+        retain_worktree_scan_handles(&handles, RepoId(4102), &[]);
+        retain_worktree_scan_handles(&handles, RepoId(4103), &[alias]);
+        assert_eq!(lock_worktree_scan_handles(&handles).entries.len(), 1);
+    }
+
     /// Opening a repository is discovery plus config parsing, and the scan runs on
     /// every git-state flush. A repo with more worktrees than the cache holds must
     /// still keep its hottest ones: clearing the map wholesale at the limit made
@@ -2688,6 +3088,9 @@ mod worktree_scan_handle_tests {
                 worktree_scan_handle(&handles, &backend, repo_id, path)
                     .expect("stub backend opens");
             }
+            assert!(
+                lock_worktree_scan_handles(&handles).entries.len() <= WORKTREE_SCAN_HANDLE_LIMIT
+            );
             backend.opens() - before
         };
 
@@ -2754,14 +3157,14 @@ mod worktree_scan_handle_tests {
 
         worktree_scan_handle(&handles, &backend, mine, &path).expect("stub backend opens");
         worktree_scan_handle(&handles, &backend, theirs, &path).expect("stub backend opens");
-        assert_eq!(backend.opens(), 2);
+        assert_eq!(backend.opens(), 1, "tabs share a single checkout handle");
 
         retain_worktree_scan_handles(&handles, mine, &[]);
 
         worktree_scan_handle(&handles, &backend, theirs, &path).expect("stub backend opens");
         assert_eq!(
             backend.opens(),
-            2,
+            1,
             "the other repo's handle must survive this repo's prune"
         );
     }
@@ -2793,8 +3196,8 @@ mod worktree_scan_handle_tests {
         let held = |repo_id: RepoId| {
             lock_worktree_scan_handles(&handles)
                 .entries
-                .keys()
-                .filter(|(entry_repo, _)| *entry_repo == repo_id)
+                .values()
+                .filter(|entry| entry.owners.contains(&repo_id))
                 .count()
         };
 
@@ -2845,8 +3248,8 @@ mod worktree_scan_handle_tests {
         let held = |repo_id: RepoId| {
             lock_worktree_scan_handles(shared)
                 .entries
-                .keys()
-                .filter(|(entry_repo, _)| *entry_repo == repo_id)
+                .values()
+                .filter(|entry| entry.owners.contains(&repo_id))
                 .count()
         };
         assert_eq!(held(closed), 0, "the closed repo must hold nothing");
@@ -2884,6 +3287,96 @@ mod worktree_dirty_files_tests {
             branch: Some("side".into()),
             detached: false,
         }
+    }
+
+    #[test]
+    fn targeted_worker_opens_only_the_requested_checkout_and_full_worker_scans_all() {
+        use crate::msg::InternalMsg;
+        use crate::store::tests::repo_with_linked_worktree;
+        use std::time::Duration;
+        struct CountingBackend {
+            opened: Mutex<Vec<PathBuf>>,
+        }
+        impl GitBackend for CountingBackend {
+            fn open(&self, path: &Path) -> gitcomet_core::services::Result<Arc<dyn GitRepository>> {
+                self.opened
+                    .lock()
+                    .unwrap()
+                    .push(canonicalize_or_original(path.to_path_buf()));
+                gitcomet_git_gix::GixBackend.open(path)
+            }
+        }
+        let (dir, own, selected) = repo_with_linked_worktree();
+        let other = dir.path().join("other");
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&own)
+            .args(["worktree", "add", "-q", "-b", "other"])
+            .arg(&other)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let other = canonicalize_or_original(other);
+        std::fs::write(selected.join("a.txt"), "selected checkout edit\n").unwrap();
+        std::fs::write(other.join("a.txt"), "other checkout edit\n").unwrap();
+        let repo_id = RepoId(4104);
+        let repos =
+            FxHashMap::from_iter([(repo_id, gitcomet_git_gix::GixBackend.open(&own).unwrap())]);
+        let backend = Arc::new(CountingBackend {
+            opened: Mutex::new(Vec::new()),
+        });
+        let executor = TaskExecutor::new(1);
+        let scan = |scope: WorktreeDirtyScope, files_for| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            schedule_load_worktree_dirty(
+                &executor,
+                backend.clone(),
+                &repos,
+                StoreWorkerSender::for_test_msg_sender(tx),
+                repo_id,
+                own.clone(),
+                scope.clone(),
+                files_for,
+                CancellationToken::new(),
+            );
+            loop {
+                let msg = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                if let Msg::Internal(InternalMsg::WorktreeDirtyLoaded {
+                    scope: returned,
+                    result,
+                    ..
+                }) = msg
+                {
+                    assert_eq!(returned, scope);
+                    break result.unwrap();
+                }
+            }
+        };
+        let summaries = scan(
+            WorktreeDirtyScope::Paths(vec![selected.clone()]),
+            Some(selected.clone()),
+        );
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].path, selected);
+        assert_eq!(summaries[0].unstaged[0].path, PathBuf::from("a.txt"));
+        assert_eq!(
+            *backend.opened.lock().unwrap(),
+            vec![selected.clone()],
+            "unrelated checkouts must not be opened or scanned"
+        );
+        let summaries = scan(WorktreeDirtyScope::All, None);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|summary| summary.unstaged.is_empty()));
+        assert!(summaries.iter().any(|summary| summary.path == other));
+        // A removed target returns a scoped empty result; it cannot erase other rows.
+        let missing = dir.path().join("missing");
+        assert!(scan(WorktreeDirtyScope::Paths(vec![missing]), None).is_empty());
+        executor.join();
+        release_worktree_scan_handles(repo_id);
     }
 
     /// The file lists are the expensive part of a summary -- an un-ignored build

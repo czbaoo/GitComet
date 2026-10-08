@@ -1,11 +1,11 @@
 use crate::msg::{InternalMsg, Msg, RepoCommandKind};
 use gitcomet_core::auth::{ScopedStagedGitAuth, StagedGitAuth};
-use gitcomet_core::domain::Upstream;
+use gitcomet_core::domain::{DiffTarget, Upstream};
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::remote_url::RemoteUrlPolicy;
 use gitcomet_core::services::{
-    CommandOutput, ConflictSide, ForcePushLease, GitRepository, InteractiveRebaseEntry, PullMode,
-    RemoteUrlKind, ResetMode, SafePushAfterCommitContext, SafePushAfterCommitTarget,
+    CommandOutput, ConflictSide, ForcePushLease, GitBackend, GitRepository, InteractiveRebaseEntry,
+    PullMode, RemoteUrlKind, ResetMode, SafePushAfterCommitContext, SafePushAfterCommitTarget,
     SubmoduleTrustTarget,
 };
 use std::path::{Component, Path, PathBuf};
@@ -29,12 +29,77 @@ fn pull_mode_suffix(mode: PullMode) -> Option<&'static str> {
     }
 }
 
+/// One-line subject for an activity row: the paths, patterns or remote.
+fn large_file_command_context(command: &gitcomet_core::large_files::LargeFileCommand) -> String {
+    use gitcomet_core::large_files::LargeFileCommand as C;
+    let paths = |paths: &[PathBuf]| match paths {
+        [] => "all files".to_string(),
+        [path] => path.display().to_string(),
+        many => format!("{} files", many.len()),
+    };
+    match command {
+        C::LfsPull { paths: p } | C::LfsLock { paths: p } => paths(p),
+        C::LfsFetchForDiff { target } => match target {
+            DiffTarget::WorkingTree { path, .. }
+            | DiffTarget::Commit { path, .. }
+            | DiffTarget::CommitRange {
+                path: Some(path), ..
+            } => path.display().to_string(),
+            _ => "selected revisions".to_string(),
+        },
+        C::LfsUnlock { paths: p, force } => {
+            format!("{}{}", paths(p), if *force { " · force" } else { "" })
+        }
+        C::LfsPushAll { remote } => remote.clone(),
+        C::LfsTrack { patterns, .. } => patterns.join(", "),
+        C::LfsFetchAll => "all refs".to_string(),
+        C::LfsPrune | C::LfsFsck | C::LfsInstall => "this repository".to_string(),
+        C::AnnexGet { paths: p, from } | C::AnnexDrop { paths: p, from, .. } => match from {
+            Some(from) => format!("{} · {from}", paths(p)),
+            None => paths(p),
+        },
+        C::AnnexGetKeys { keys } => match keys.as_slice() {
+            [key] => key.clone(),
+            many => format!("{} versions", many.len()),
+        },
+        C::AnnexCopy { paths: p, to } | C::AnnexMove { paths: p, to } => {
+            format!("{} · to {to}", paths(p))
+        }
+        C::AnnexUnlock { paths: p } | C::AnnexLock { paths: p } | C::AnnexAdd { paths: p } => {
+            paths(p)
+        }
+        C::AnnexPull { content } | C::AnnexPush { content } | C::AnnexSync { content } => {
+            if *content {
+                "with content".to_string()
+            } else {
+                "branches only".to_string()
+            }
+        }
+        C::AnnexAdjust { mode } => mode.label().to_string(),
+        C::AnnexLeaveAdjusted { base } => base.clone(),
+        C::AnnexEnableRemote { name, .. } | C::AnnexInitRemote { name, .. } => name.clone(),
+        C::AnnexTrust { repository, trust } => format!("{repository} · {}", trust.label()),
+        C::AnnexDescribe { repository, .. } => repository.clone(),
+        C::AnnexNumcopies { copies } => copies.to_string(),
+        C::AnnexDropUnused { force, .. } => {
+            format!("unused content{}", if *force { " · force" } else { "" })
+        }
+        C::AnnexInit | C::AnnexFsck | C::AnnexRestage | C::AnnexWebapp | C::AnnexStopAssistant => {
+            "this repository".to_string()
+        }
+    }
+}
+
 fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
     let context = match command {
         RepoCommandKind::FetchAll => "All remotes".to_string(),
         RepoCommandKind::FetchBranch { remote, branch } => format!("{remote}/{branch}"),
+        RepoCommandKind::FetchRefspecs { remote, refspecs } => {
+            format!("{remote}: {}", refspecs.join(" "))
+        }
         RepoCommandKind::PruneMergedBranches => "Merged local branches".to_string(),
         RepoCommandKind::PruneLocalTags => "Local tags missing on remotes".to_string(),
+        RepoCommandKind::RunMaintenance => "Repacking objects".to_string(),
         RepoCommandKind::Pull { mode } => pull_mode_suffix(*mode).map_or_else(
             || "Configured upstream → current branch".to_string(),
             |mode| format!("Configured upstream → current branch · {mode}"),
@@ -93,7 +158,7 @@ fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
         RepoCommandKind::RebaseContinue => "Current rebase".to_string(),
         RepoCommandKind::RebaseAbort => "Current rebase".to_string(),
         RepoCommandKind::InteractiveRebase { base, .. } => format!("Current branch onto {base}"),
-        RepoCommandKind::InteractiveCherryPick { entries } => match entries.as_slice() {
+        RepoCommandKind::InteractiveCherryPick { entries, .. } => match entries.as_slice() {
             [] => "Selected commits".to_string(),
             [entry] => {
                 message_subject(&entry.summary).unwrap_or_else(|| short_commit_id(&entry.commit_id))
@@ -111,6 +176,13 @@ fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
         | RepoCommandKind::Revert {
             commit_id, summary, ..
         } => message_subject(summary).unwrap_or_else(|| short_commit_id(commit_id.as_ref())),
+        RepoCommandKind::ApplyFileChange { target, .. } => {
+            let revision = gitcomet_core::services::apply_change_revision(&target.source);
+            match target.paths.as_slice() {
+                [path] => format!("{} · {revision}", path.display()),
+                paths => format!("{} files · {revision}", paths.len()),
+            }
+        }
         RepoCommandKind::MergeAbort => "Current merge".to_string(),
         RepoCommandKind::CreateTag { name, target, .. } => format!("{name} at {target}"),
         RepoCommandKind::DeleteTag { name } => name.clone(),
@@ -134,6 +206,8 @@ fn repo_command_context(command: &RepoCommandKind) -> Option<String> {
             path.display(),
             if *stage { " · stage after saving" } else { "" }
         ),
+        RepoCommandKind::LargeFile { command } => large_file_command_context(command),
+        RepoCommandKind::AppendGitattributesRule { rule } => rule.clone(),
         RepoCommandKind::AppendGitignorePatterns { patterns } => match patterns.as_slice() {
             [] => GITIGNORE_FILE_NAME.to_string(),
             [pattern] => pattern.clone(),
@@ -186,7 +260,7 @@ fn schedule_repo_command_with_context<F>(
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
-    command: RepoCommandKind,
+    mut command: RepoCommandKind,
     context_override: Option<String>,
     run: F,
 ) where
@@ -203,12 +277,32 @@ fn schedule_repo_command_with_context<F>(
         repo_id,
         msg_tx,
         move |repo, msg_tx| {
-            let operation = GitOperationTask::start(repo_id, label, context, &msg_tx);
+            let fetches_objects = command.fetches_objects();
+            let operation = GitOperationTask::start_with_progress_lane(
+                repo_id,
+                label,
+                context,
+                command.shows_progress(),
+                &msg_tx,
+            );
             let result = {
                 let _scope = operation.attach();
-                run(repo)
+                run(Arc::clone(&repo))
             };
+            if fetches_objects {
+                // The refresh this command triggers should read the new packs
+                // through a fresh store, and old packs must not stay mapped.
+                repo.release_object_store();
+                super::repo_load::release_all_worktree_scan_handles();
+            }
             let outcome = GitOperationTask::outcome(&result);
+            if let RepoCommandKind::ApplyFileChange { commit_retry, .. } = &mut command
+                && let Err(error) = &result
+                && let ErrorKind::Git(failure) = error.kind()
+                && let Some(retry) = failure.apply_file_change_retry()
+            {
+                *commit_retry = Some(retry.clone());
+            }
             operation.finish(
                 outcome,
                 InternalMsg::RepoCommandFinished {
@@ -327,15 +421,28 @@ pub(super) struct CheckSubmoduleAddTrustRequest {
     pub(super) remote_url_policy: RemoteUrlPolicy,
 }
 
+pub(super) struct SaveWorktreeFileRequest {
+    pub path: PathBuf,
+    pub contents: crate::msg::ContentBytes,
+    pub expected_contents: Option<std::sync::Arc<[u8]>>,
+    pub stage: bool,
+    pub completion: Option<smol::channel::Sender<bool>>,
+}
+
 pub(super) fn schedule_save_worktree_file(
     executor: &TaskExecutor,
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
-    path: PathBuf,
-    contents: String,
-    stage: bool,
+    request: SaveWorktreeFileRequest,
 ) {
+    let SaveWorktreeFileRequest {
+        path,
+        contents,
+        expected_contents,
+        stage,
+        completion,
+    } = request;
     let command_path = path.clone();
     schedule_repo_command(
         executor,
@@ -347,28 +454,67 @@ pub(super) fn schedule_save_worktree_file(
             stage,
         },
         move |repo| {
-            let (relative_path, full) = resolve_worktree_save_target(&repo.spec().workdir, &path)?;
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+            let result = (|| {
+                let mut filesystem = gitcomet_core::filesystem::global()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let (relative_path, full) =
+                    resolve_worktree_save_target(&repo.spec().workdir, &path)?;
+                guarded_worktree_save(
+                    &mut filesystem,
+                    &full,
+                    contents.as_bytes(),
+                    expected_contents.as_deref(),
+                )?;
+                if stage {
+                    let path_ref: &Path = &relative_path;
+                    repo.stage(&[path_ref])?;
+                }
+                Ok(CommandOutput {
+                    command: format!(
+                        "Save {}{}",
+                        relative_path.display(),
+                        if stage { " (staged)" } else { "" }
+                    ),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                })
+            })();
+            if let Some(completion) = completion {
+                let _ = completion.try_send(result.is_ok());
             }
-            std::fs::write(&full, contents.as_bytes())
-                .map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
-            if stage {
-                let path_ref: &Path = &relative_path;
-                repo.stage(&[path_ref])?;
-            }
-            Ok(CommandOutput {
-                command: format!(
-                    "Save {}{}",
-                    relative_path.display(),
-                    if stage { " (staged)" } else { "" }
-                ),
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: Some(0),
-            })
+            result
         },
     );
+}
+
+fn guarded_worktree_save(
+    filesystem: &mut gitcomet_core::filesystem::Filesystem,
+    path: &Path,
+    contents: &[u8],
+    expected_contents: Option<&[u8]>,
+) -> Result<(), Error> {
+    let io_error = |e: std::io::Error| Error::new(ErrorKind::Backend(e.to_string()));
+    let version = match gitcomet_core::filesystem::DiskVersion::read(path) {
+        Ok(version) => Some(version),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    if current.as_deref() != expected_contents {
+        return Err(Error::new(ErrorKind::Backend(
+            "The file changed on disk. Reload the conflict before saving; the current file was preserved.".into(),
+        )));
+    }
+    filesystem
+        .save(path, contents, version.as_ref(), false)
+        .map_err(io_error)?;
+    Ok(())
 }
 
 /// Append patterns to the repository-root `.gitignore`.
@@ -397,11 +543,65 @@ pub(super) fn schedule_append_gitignore_patterns(
     );
 }
 
+pub(super) fn schedule_append_gitattributes_rule(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    rule: String,
+) {
+    let command_rule = rule.clone();
+    schedule_repo_command(
+        executor,
+        repos,
+        msg_tx,
+        repo_id,
+        RepoCommandKind::AppendGitattributesRule { rule: command_rule },
+        move |repo| append_gitattributes_rule_in_workdir(&repo.spec().workdir, &rule),
+    );
+}
+
+/// Read and write in the worker, byte for byte: the file may be in any
+/// encoding and may be edited elsewhere at the same time.
+fn append_gitattributes_rule_in_workdir(
+    workdir: &Path,
+    rule: &str,
+) -> Result<CommandOutput, Error> {
+    use gitcomet_core::gitattributes::{GITATTRIBUTES_FILE_NAME, NOTHING_TO_ADD, append_rule};
+    let (_, full) = resolve_worktree_save_target(workdir, Path::new(GITATTRIBUTES_FILE_NAME))?;
+    let existing = match std::fs::read(&full) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(Error::new(ErrorKind::Io(e.kind()))),
+    };
+    let stdout = match append_rule(&existing, rule) {
+        Some(updated) => {
+            std::fs::write(&full, updated).map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+            String::new()
+        }
+        None => NOTHING_TO_ADD.to_string(),
+    };
+    Ok(CommandOutput {
+        command: format!("Update {GITATTRIBUTES_FILE_NAME}"),
+        stdout,
+        stderr: String::new(),
+        exit_code: Some(0),
+    })
+}
+
 fn append_gitignore_patterns_in_workdir(
     workdir: &Path,
     patterns: &[String],
 ) -> Result<CommandOutput, Error> {
+    let mut filesystem = gitcomet_core::filesystem::global()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (_, full) = resolve_worktree_save_target(workdir, Path::new(GITIGNORE_FILE_NAME))?;
+    let version = match gitcomet_core::filesystem::DiskVersion::read(&full) {
+        Ok(version) => Some(version),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::new(ErrorKind::Io(error.kind()))),
+    };
 
     // Read bytes and convert explicitly: `read_to_string` would report a
     // Latin-1 `.gitignore` as a bare `InvalidData` I/O error, which tells
@@ -425,7 +625,9 @@ fn append_gitignore_patterns_in_workdir(
         });
     };
 
-    std::fs::write(&full, updated.as_bytes()).map_err(|e| Error::new(ErrorKind::Io(e.kind())))?;
+    filesystem
+        .save(&full, updated.as_bytes(), version.as_ref(), false)
+        .map_err(|error| Error::new(ErrorKind::Backend(error.to_string())))?;
 
     Ok(CommandOutput {
         command: format!("Update {GITIGNORE_FILE_NAME}"),
@@ -762,7 +964,7 @@ pub(super) fn schedule_stage_hunk(
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
-    patch: String,
+    patch: crate::msg::ContentBytes,
 ) {
     schedule_repo_command(
         executor,
@@ -770,7 +972,7 @@ pub(super) fn schedule_stage_hunk(
         msg_tx,
         repo_id,
         RepoCommandKind::StageHunk,
-        move |repo| repo.apply_unified_patch_to_index_with_output(&patch, false),
+        move |repo| repo.apply_unified_patch_to_index_with_output(patch.as_bytes(), false),
     );
 }
 
@@ -779,7 +981,7 @@ pub(super) fn schedule_unstage_hunk(
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
-    patch: String,
+    patch: crate::msg::ContentBytes,
 ) {
     schedule_repo_command(
         executor,
@@ -787,7 +989,7 @@ pub(super) fn schedule_unstage_hunk(
         msg_tx,
         repo_id,
         RepoCommandKind::UnstageHunk,
-        move |repo| repo.apply_unified_patch_to_index_with_output(&patch, true),
+        move |repo| repo.apply_unified_patch_to_index_with_output(patch.as_bytes(), true),
     );
 }
 
@@ -796,7 +998,7 @@ pub(super) fn schedule_apply_worktree_patch(
     repos: &RepoMap,
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
-    patch: String,
+    patch: crate::msg::ContentBytes,
     reverse: bool,
 ) {
     schedule_repo_command(
@@ -805,8 +1007,24 @@ pub(super) fn schedule_apply_worktree_patch(
         msg_tx,
         repo_id,
         RepoCommandKind::ApplyWorktreePatch { reverse },
-        move |repo| repo.apply_unified_patch_to_worktree_with_output(&patch, reverse),
+        move |repo| repo.apply_unified_patch_to_worktree_with_output(patch.as_bytes(), reverse),
     );
+}
+
+pub(super) fn schedule_large_file_command(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    command: gitcomet_core::large_files::LargeFileCommand,
+    auth: Option<StagedGitAuth>,
+) {
+    let kind = RepoCommandKind::LargeFile {
+        command: command.clone(),
+    };
+    schedule_repo_command(executor, repos, msg_tx, repo_id, kind, move |repo| {
+        run_with_git_auth(auth, || repo.run_large_file_command(&command))
+    });
 }
 
 pub(super) fn schedule_fetch_all(
@@ -848,6 +1066,24 @@ pub(super) fn schedule_fetch_branch(
     );
 }
 
+pub(super) fn schedule_fetch_refspecs(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    remote: String,
+    refspecs: Vec<String>,
+    auth: Option<StagedGitAuth>,
+) {
+    let command = RepoCommandKind::FetchRefspecs {
+        remote: remote.clone(),
+        refspecs: refspecs.clone(),
+    };
+    schedule_repo_command(executor, repos, msg_tx, repo_id, command, move |repo| {
+        run_with_git_auth(auth, || repo.fetch_refspecs_with_output(&remote, &refspecs))
+    });
+}
+
 pub(super) fn schedule_prune_merged_branches(
     executor: &TaskExecutor,
     repos: &RepoMap,
@@ -877,6 +1113,72 @@ pub(super) fn schedule_prune_local_tags(
         repo_id,
         RepoCommandKind::PruneLocalTags,
         |repo| repo.prune_local_tags_with_output(),
+    );
+}
+
+/// Maintenance can run for hours, so it gets a thread of its own rather than
+/// holding one of the primary pool's.
+fn maintenance_executor() -> TaskExecutor {
+    TaskExecutor::shared_for_store(super::super::executor::StoreExecutorPool::Maintenance, 1)
+}
+
+/// Asks git whether the repository needs maintenance, at most once a day per
+/// repository: the claim lives in the session file, shared by its worktrees
+/// and every window.
+pub(super) fn schedule_check_maintenance(
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+) {
+    spawn_with_repo(
+        &maintenance_executor(),
+        repos,
+        repo_id,
+        msg_tx,
+        move |repo, msg_tx| {
+            let Some(common_dir) = repo.common_dir() else {
+                return;
+            };
+            if !crate::session::claim_repo_maintenance_check(&common_dir).unwrap_or(false) {
+                return;
+            }
+            // Unsupported or failed checks only mean no recommendation.
+            let needed = repo.maintenance_needed().unwrap_or(false);
+            send_or_log(
+                &msg_tx,
+                Msg::Internal(InternalMsg::RepoMaintenanceChecked { repo_id, needed }),
+            );
+        },
+    );
+}
+
+pub(super) fn schedule_run_maintenance(
+    repos: &RepoMap,
+    backend: Arc<dyn GitBackend>,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+) {
+    schedule_repo_command(
+        &maintenance_executor(),
+        repos,
+        msg_tx,
+        repo_id,
+        RepoCommandKind::RunMaintenance,
+        move |repo| {
+            // Every store mapping these packs, in any window, keeps Windows
+            // from deleting them; afterwards, stores must see the new pack.
+            let common_dir = repo.common_dir();
+            let release = || {
+                if let Some(common_dir) = &common_dir {
+                    backend.release_object_stores(common_dir);
+                }
+                super::repo_load::release_all_worktree_scan_handles();
+            };
+            release();
+            let result = repo.run_maintenance_with_output();
+            release();
+            result
+        },
     );
 }
 
@@ -1376,6 +1678,7 @@ pub(super) fn schedule_interactive_cherry_pick(
     msg_tx: StoreWorkerSender,
     repo_id: RepoId,
     entries: Vec<InteractiveRebaseEntry>,
+    commit: bool,
 ) {
     let command_entries = entries.clone();
     schedule_repo_command(
@@ -1385,8 +1688,9 @@ pub(super) fn schedule_interactive_cherry_pick(
         repo_id,
         RepoCommandKind::InteractiveCherryPick {
             entries: command_entries,
+            commit,
         },
-        move |repo| repo.interactive_cherry_pick_with_output(&entries),
+        move |repo| repo.interactive_cherry_pick_with_output(&entries, commit),
     );
 }
 
@@ -1399,6 +1703,7 @@ pub(super) fn schedule_cherry_pick_commit(
     commit: bool,
     mainline: Option<usize>,
     summary: String,
+    auth: Option<StagedGitAuth>,
 ) {
     let command_commit_id = commit_id.clone();
     schedule_repo_command(
@@ -1412,7 +1717,11 @@ pub(super) fn schedule_cherry_pick_commit(
             mainline,
             summary,
         },
-        move |repo| repo.cherry_pick_with_output(&commit_id, commit, mainline),
+        move |repo| {
+            run_with_git_auth(auth, || {
+                repo.cherry_pick_with_output(&commit_id, commit, mainline)
+            })
+        },
     );
 }
 
@@ -1458,6 +1767,88 @@ pub(super) fn schedule_revert_commit(
             output
         },
     );
+}
+
+pub(super) fn schedule_apply_file_change(
+    executor: &TaskExecutor,
+    repos: &RepoMap,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+    target: gitcomet_core::domain::ApplyChangeTarget,
+    commit: bool,
+    commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
+    auth: Option<StagedGitAuth>,
+) {
+    let command_target = target.clone();
+    let suggestion_tx = msg_tx.clone();
+    schedule_repo_command(
+        executor,
+        repos,
+        msg_tx,
+        repo_id,
+        RepoCommandKind::ApplyFileChange {
+            target: command_target,
+            commit,
+            commit_retry: commit_retry.clone(),
+        },
+        move |repo| {
+            let output = run_with_git_auth(auth, || match &commit_retry {
+                Some(retry) => repo.commit_applied_file_change_with_output(retry),
+                None => repo.apply_file_change_with_output(&target, commit),
+            });
+            // A change left staged or conflicted still needs a commit the user
+            // types, so offer the message the committing path would use.
+            let awaits_commit = match &output {
+                Ok(output) => {
+                    !commit
+                        && !output.stdout.contains(
+                            gitcomet_core::services::APPLY_FILE_CHANGE_ALREADY_APPLIED_SENTINEL,
+                        )
+                }
+                Err(error) => matches!(
+                    error.kind(),
+                    gitcomet_core::error::ErrorKind::Git(failure) if matches!(
+                        failure.id(),
+                        gitcomet_core::error::GitFailureId::ApplyChangeConflict
+                            | gitcomet_core::error::GitFailureId::ApplyChangeCommitFailed
+                    )
+                ),
+            };
+            if (awaits_commit || (commit && output.is_ok()))
+                && let Some(message) = applied_change_commit_message(&*repo, &target)
+            {
+                send_or_log(
+                    &suggestion_tx,
+                    Msg::Internal(if awaits_commit {
+                        InternalMsg::CommitMessageSuggested { repo_id, message }
+                    } else {
+                        InternalMsg::CommitMessageSuggestionConsumed { repo_id, message }
+                    }),
+                );
+            }
+            output
+        },
+    );
+}
+
+/// The message "Apply change" commits with: the source commit's own message,
+/// or for a comparison one naming the range.
+fn applied_change_commit_message(
+    repo: &dyn gitcomet_core::services::GitRepository,
+    target: &gitcomet_core::domain::ApplyChangeTarget,
+) -> Option<String> {
+    use gitcomet_core::domain::ApplyChangeSource;
+    match &target.source {
+        ApplyChangeSource::Commit(commit_id) => repo
+            .commit_messages(std::slice::from_ref(commit_id))
+            .ok()?
+            .pop()
+            .map(|message| message.trim_end().to_string())
+            .filter(|message| !message.is_empty()),
+        ApplyChangeSource::Range { from, to } => Some(
+            gitcomet_core::services::apply_file_change_range_message(from, to, &target.paths),
+        ),
+    }
 }
 
 pub(super) fn schedule_merge_abort(
@@ -1745,6 +2136,60 @@ mod worktree_save_target_tests {
     use super::resolve_worktree_save_target;
     use gitcomet_core::error::ErrorKind;
     use std::path::Path;
+
+    #[test]
+    fn markdown_checkbox_saves_accept_the_read_baseline_and_reject_intervening_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let mut filesystem = gitcomet_core::filesystem::Filesystem::default();
+        let unchecked = b"- [ ] ship it\n";
+        let checked = b"- [x] ship it\n";
+        std::fs::write(&path, unchecked).unwrap();
+        super::guarded_worktree_save(&mut filesystem, &path, checked, Some(unchecked)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), checked);
+        super::guarded_worktree_save(&mut filesystem, &path, unchecked, Some(checked)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), unchecked);
+        std::fs::write(&path, b"external edits\n").unwrap();
+        assert!(
+            super::guarded_worktree_save(&mut filesystem, &path, checked, Some(unchecked)).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"external edits\n");
+    }
+
+    #[test]
+    fn merge_save_preserves_external_edits_and_does_not_recreate_a_moved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.txt");
+        let mut filesystem = gitcomet_core::filesystem::Filesystem::default();
+        std::fs::write(&path, b"external edit").unwrap();
+        assert!(
+            super::guarded_worktree_save(&mut filesystem, &path, b"resolved", Some(b"markers"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"external edit");
+        std::fs::rename(&path, dir.path().join("renamed.txt")).unwrap();
+        assert!(
+            super::guarded_worktree_save(
+                &mut filesystem,
+                &path,
+                b"resolved",
+                Some(b"external edit")
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+        super::guarded_worktree_save(
+            &mut filesystem,
+            &dir.path().join("renamed.txt"),
+            b"resolved",
+            Some(b"external edit"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("renamed.txt")).unwrap(),
+            b"resolved"
+        );
+    }
 
     #[test]
     fn git_metadata_paths_are_refused() {

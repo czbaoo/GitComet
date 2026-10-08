@@ -88,6 +88,11 @@ impl std::fmt::Debug for InternalMsg {
                 .field("repo_id", repo_id)
                 .field("spec", spec)
                 .finish_non_exhaustive(),
+            InternalMsg::RepoMaintenanceChecked { repo_id, needed } => f
+                .debug_struct("RepoMaintenanceChecked")
+                .field("repo_id", repo_id)
+                .field("needed", needed)
+                .finish(),
             InternalMsg::RepoOpenedErr {
                 repo_id,
                 spec,
@@ -128,11 +133,16 @@ impl std::fmt::Debug for InternalMsg {
                 repo_id,
                 generation,
                 result,
+                large_files,
             } => f
                 .debug_struct("UncommittedLineStatsLoaded")
                 .field("generation", generation)
                 .field("repo_id", repo_id)
                 .field("ok", &result.is_ok())
+                .field(
+                    "large_files_ok",
+                    &large_files.as_ref().map(|result| result.is_ok()),
+                )
                 .finish(),
             InternalMsg::StatusLoaded { repo_id, result } => f
                 .debug_struct("StatusLoaded")
@@ -230,6 +240,11 @@ impl std::fmt::Debug for InternalMsg {
                 .field("requested_count", &requested_ids.len())
                 .field("ok", &result.is_ok())
                 .finish(),
+            InternalMsg::CommitMessageSuggestionConsumed { repo_id, message } => f
+                .debug_struct("CommitMessageSuggestionConsumed")
+                .field("repo_id", repo_id)
+                .field("message_len", &message.len())
+                .finish(),
             InternalMsg::CommitMessageSuggested { repo_id, message } => f
                 .debug_struct("CommitMessageSuggested")
                 .field("repo_id", repo_id)
@@ -291,8 +306,13 @@ impl std::fmt::Debug for InternalMsg {
                 .field("repo_id", repo_id)
                 .field("result", result)
                 .finish(),
-            InternalMsg::WorktreeDirtyLoaded { repo_id, result } => f
+            InternalMsg::WorktreeDirtyLoaded {
+                repo_id,
+                scope,
+                result,
+            } => f
                 .debug_struct("WorktreeDirtyLoaded")
+                .field("scope", scope)
                 .field("repo_id", repo_id)
                 .field("result", result)
                 .finish(),
@@ -306,7 +326,33 @@ impl std::fmt::Debug for InternalMsg {
                 .field("repo_id", repo_id)
                 .field("result", result)
                 .finish(),
+            InternalMsg::LargeFileSupportLoaded { repo_id, result } => f
+                .debug_struct("LargeFileSupportLoaded")
+                .field("repo_id", repo_id)
+                .field("result", result)
+                .finish(),
+            InternalMsg::LfsLocksLoaded { repo_id, result } => f
+                .debug_struct("LfsLocksLoaded")
+                .field("repo_id", repo_id)
+                .field("result", result)
+                .finish(),
+            InternalMsg::AnnexWhereisLoaded {
+                repo_id,
+                key,
+                result,
+            } => f
+                .debug_struct("AnnexWhereisLoaded")
+                .field("repo_id", repo_id)
+                .field("key", key)
+                .field("result", result)
+                .finish(),
+            InternalMsg::AnnexUnusedLoaded { repo_id, result } => f
+                .debug_struct("AnnexUnusedLoaded")
+                .field("repo_id", repo_id)
+                .field("result", result)
+                .finish(),
             InternalMsg::FileBrowserLoaded {
+                cancellation: _,
                 repo_id,
                 source,
                 result,
@@ -455,6 +501,16 @@ impl std::fmt::Debug for InternalMsg {
                 result,
             } => f
                 .debug_struct("DiffFileLoaded")
+                .field("repo_id", repo_id)
+                .field("target", target)
+                .field("result", result)
+                .finish(),
+            InternalMsg::TextAttributesLoaded {
+                repo_id,
+                target,
+                result,
+            } => f
+                .debug_struct("TextAttributesLoaded")
                 .field("repo_id", repo_id)
                 .field("target", target)
                 .field("result", result)

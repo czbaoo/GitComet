@@ -24,6 +24,7 @@ fn setup_repo_with_conflict(
         id_alloc,
         state,
         Msg::Internal(crate::msg::InternalMsg::RepoOpenedOk {
+            preferences: None,
             repo_id,
             spec: RepoSpec {
                 workdir: PathBuf::from("/tmp/repo"),
@@ -239,7 +240,7 @@ fn current_only_session_preserves_first_paint_pick_on_full_upgrade() {
             repo_id,
             path: PathBuf::from("file.txt"),
             result: Box::new(Ok(Some(sample_marker_conflict_file("file.txt")))),
-            conflict_session: Some(backend_session),
+            conflict_session: Some(Box::new(backend_session)),
         }),
     );
 
@@ -882,7 +883,7 @@ fn conflict_file_loaded_prefers_backend_session_when_provided() {
             repo_id,
             path: PathBuf::from("file.txt"),
             result: Box::new(Ok(Some(file))),
-            conflict_session: Some(provided_session.clone()),
+            conflict_session: Some(Box::new(provided_session.clone())),
         }),
     );
 
@@ -3656,10 +3657,7 @@ fn conflict_reload_via_stash_keeps_ordered_resolution() {
         &mut state,
         Msg::SelectDiff {
             repo_id,
-            target: DiffTarget::WorkingTree {
-                path: PathBuf::from("file.txt"),
-                area: DiffArea::Unstaged,
-            },
+            target: DiffTarget::working_tree(PathBuf::from("file.txt"), DiffArea::Unstaged),
         },
     );
     assert!(

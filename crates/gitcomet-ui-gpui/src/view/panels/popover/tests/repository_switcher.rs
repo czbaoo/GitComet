@@ -55,7 +55,12 @@ fn repository_switcher_opens_the_repo_picker_with_a_fresh_search_input(
         ));
 
         let host = popover_host.read(app);
-        assert!(matches!(host.popover, Some(PopoverKind::RepoPicker)));
+        assert!(matches!(
+            host.popover,
+            Some(PopoverKind::RepoPicker {
+                scope: RepoPickerScope::All
+            })
+        ));
 
         let input = host
             .repo_picker_search_input
@@ -158,7 +163,7 @@ fn repository_switcher_selecting_recent_repo_opens_it_subprocess(cx: &mut gpui::
             this.toggle_repository_switcher(window, cx);
         });
         let _ = window.draw(app);
-        window.activate_window();
+        window.activate();
     });
 
     let item_bounds = cx
@@ -247,7 +252,7 @@ fn repository_switcher_removes_a_recent_repo_subprocess(cx: &mut gpui::TestAppCo
             this.toggle_repository_switcher(window, cx);
         });
         let _ = window.draw(app);
-        window.activate_window();
+        window.activate();
     });
 
     // The remove button only appears once its row is hovered.

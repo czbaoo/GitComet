@@ -22,7 +22,7 @@ use gitcomet_state::model::{
     AppNotificationKind, AppState, AuthPromptKind, BranchExistsPromptOperation,
     BranchExistsPromptState, CloneOpState, CloneOpStatus, DefaultTagType, DiagnosticKind,
     FileBrowserSettings, GitHookOperation, GitHookOperationStatus, GitHookRunStatus, Loadable,
-    RemoteSettings, RepoId, RepoState, SubmoduleTrustPromptOperation,
+    MaintenanceSettings, RemoteSettings, RepoId, RepoState, SubmoduleTrustPromptOperation,
 };
 use gitcomet_state::msg::{BranchExistsChoice, Msg, StoreEvent};
 use gitcomet_state::session;
@@ -115,6 +115,7 @@ actions!(
         TextInputDiffPrevChange,
         TextInputDiffNextChange,
         OpenActiveViewSearch,
+        HistoryFindPrevious,
         PopoverPromptDismiss,
         PopoverPromptTabNext,
         PopoverPromptTabPrev,
@@ -206,11 +207,44 @@ fn repo_activation_msg(
     Some(Msg::RepoActivated { repo_id })
 }
 
+/// Opening a repository already schedules a full refresh. Count that load
+/// toward the focus throttle too: the compositor's initial activation can
+/// arrive after RepoOpened and otherwise queues the same work a second time.
+fn note_opened_repos_for_activation(
+    previous: &AppState,
+    next: &AppState,
+    last_activation_dispatch: &mut FxHashMap<RepoId, Instant>,
+    now: Instant,
+) {
+    if previous.repos.len() == next.repos.len()
+        && previous.repos.iter().zip(&next.repos).all(|(old, new)| {
+            old.id == new.id
+                && matches!(old.open, Loadable::Ready(_)) == matches!(new.open, Loadable::Ready(_))
+        })
+    {
+        return;
+    }
+    last_activation_dispatch.retain(|id, _| next.repos.iter().any(|repo| repo.id == *id));
+    for repo in &next.repos {
+        if matches!(repo.open, Loadable::Ready(_))
+            && !previous
+                .repos
+                .iter()
+                .any(|old| old.id == repo.id && matches!(old.open, Loadable::Ready(_)))
+        {
+            last_activation_dispatch.insert(repo.id, now);
+        }
+    }
+}
+
 mod app_model;
+mod bottom_panel_providers;
 mod branch_sidebar;
 mod caches;
+mod changed_file_list;
 pub(crate) mod chrome;
 pub(crate) mod clone_progress;
+mod close_guards;
 mod color;
 mod command_palette;
 mod commit_message_hover;
@@ -225,19 +259,31 @@ mod diff_preview;
 mod diff_text_model;
 mod diff_text_selection;
 mod diff_utils;
+pub(crate) mod documents;
+pub(crate) mod error_notices;
+pub(crate) mod extension_host;
+mod extension_panels;
 mod external_drag;
+mod fetch_ref;
 mod file_diff_display;
-mod file_icons;
+mod file_list_controller;
+mod file_operations;
 mod fingerprint;
+mod git_version_notice;
 mod history_graph;
 pub(crate) mod history_mode;
 mod history_refs_hover;
-mod icons;
+mod home;
+pub(crate) mod hosted;
+mod large_file_card;
 #[cfg(any(test, target_os = "linux", target_os = "freebsd"))]
 mod linux_desktop_integration;
 mod markdown_preview;
 mod mod_helpers;
+mod native_transfers;
 mod open_source_licenses_data;
+mod operation_progress;
+mod pane_store;
 mod panels;
 mod panes;
 mod patch_split;
@@ -246,38 +292,48 @@ mod perf;
 mod permalink;
 pub(super) mod platform_open;
 mod poller;
+mod pop_out;
 mod preference_sync;
 mod preferences;
 mod reflog_panel;
 mod repo_open;
+mod repository_views;
 mod reveal_commit;
 pub(crate) mod rows;
-mod settings_window;
+pub(crate) mod scenario_driver;
+pub(crate) mod settings_window;
+mod shell_policy;
 pub(crate) mod shortcut_labels;
 mod sidebar_presentation;
+mod sidebar_search;
+mod sidebar_sticky;
 mod splash;
 mod state_apply;
 mod status_actions;
+pub(in crate::view) mod tab_width;
 mod terminal_alacritty;
 mod terminal_panel;
 mod terminal_preferences;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod toast_host;
-mod tooltip;
-mod tooltip_host;
+mod ui_persistence;
+mod window_gates;
+pub(crate) use gitcomet_ui_kit::{file_icons, icons, tooltip, tooltip_host};
 mod update_check;
-pub(crate) use update_check::update_checks_disabled_by_environment;
+mod workspace_picker;
+pub(crate) use update_check::{update_checks_available, update_checks_disabled_by_environment};
 mod user_survey;
 mod word_diff;
 
 use app_model::AppUiModel;
 use branch_sidebar::{BranchMenuTarget, BranchSection, BranchSidebarRow};
 use caches::{
-    HistoryBaseCache, HistoryBaseCacheRequest, HistoryBaseRowVm, HistoryBranchChipKind,
-    HistoryBranchChipVm, HistoryCache, HistoryCacheBuildRequest, HistoryDecorationCache,
-    HistoryDecorationCacheRequest, HistoryDecorationRowVm, HistoryDisplayKey, HistoryRefListItem,
-    HistoryRefListItemKind, HistoryStashIdsCache, HistoryTextVm, HistoryWorktreeSummaryCache,
+    HistoryAuthorVm, HistoryBaseCache, HistoryBaseCacheRequest, HistoryBaseRowVm,
+    HistoryBranchChipKind, HistoryBranchChipVm, HistoryCache, HistoryCacheBuildRequest,
+    HistoryDecorationCache, HistoryDecorationCacheRequest, HistoryDecorationRowVm,
+    HistoryDisplayKey, HistoryRefListItem, HistoryRefListItemKind, HistoryStashIdsCache,
+    HistoryTextVm, HistoryWorktreeSummaryCache,
 };
 use chrome::TitleBarView;
 use conflict_resolver::{ConflictPickSide, ConflictResolverViewMode};
@@ -289,6 +345,7 @@ use date_time::{DateTimeFormat, Timezone, format_datetime_into};
 use diff_preview::build_new_file_preview_from_diff;
 use patch_split::build_patch_split_rows;
 use poller::Poller;
+pub(in crate::view) use preferences::FileListDefaults;
 use preferences::{HistoryBranchNamesMode, RemoteMarkdownImagePolicy, UiPreferences};
 pub(in crate::view) use terminal_preferences::{
     ActionBarTerminalTarget, ExternalTerminalLaunchContext, ExternalTerminalMode,
@@ -313,6 +370,7 @@ use diff_utils::{
     parse_unified_hunk_header_for_display, scrollbar_markers_from_flags,
     scrollbar_markers_from_visible_ranges,
 };
+use error_notices::{ErrorAction, ErrorNotice, ErrorReport};
 use file_diff_display::{
     LARGE_DIFF_TEXT_MIN_BYTES, append_diff_display_text_slice, append_file_diff_display_text_slice,
     file_diff_display_len, file_diff_display_text, should_truncate_file_diff_display,
@@ -322,11 +380,11 @@ pub(crate) use mod_helpers::TerminalPanelResizeState;
 use mod_helpers::*;
 pub use mod_helpers::{
     FocusedMergetoolLabels, FocusedMergetoolViewConfig, GitCometView, GitCometViewConfig,
-    GitCometViewMode, InitialRepositoryLaunchMode, StartupCrashReport,
+    GitCometViewMode, InitialRepositoryLaunchMode, StartupCrashReport, WorkspaceBootstrap,
 };
 use panels::{
     ActionBarView, BottomStatusBarView, PopoverHost, PopoverHostInit, RepoTabsBarView,
-    action_bar_density, action_bar_height,
+    action_bar_density, action_bar_height, bottom_status_bar_height,
 };
 pub(crate) use panes::MainPaneView;
 use panes::{
@@ -334,7 +392,9 @@ use panes::{
     HistoryView, MainPaneInit, ReflogPaneInit, ReflogPaneView, SidebarPaneView,
     history_primary_selection,
 };
-pub(crate) use settings_window::{SettingsWindowView, open_settings_window};
+pub(crate) use settings_window::{
+    SettingsWindowView, open_settings_window, open_settings_window_to_workspace,
+};
 use toast_host::ToastHost;
 pub(crate) use tooltip::GitCometTooltipExt;
 use tooltip_host::TooltipHost;
@@ -365,8 +425,6 @@ const HISTORY_COL_DATE_MAX_PX: f32 = 240.0;
 const HISTORY_COL_SHA_MIN_PX: f32 = 60.0;
 const HISTORY_COL_SHA_MAX_PX: f32 = 160.0;
 const HISTORY_COL_MESSAGE_MIN_PX: f32 = 220.0;
-const ERROR_BANNER_OVERFLOW_HINT_MIN_LINES: usize = 8;
-const ERROR_BANNER_OVERFLOW_HINT_MIN_CHARS: usize = 240;
 
 const HISTORY_GRAPH_COL_GAP_PX: f32 = 16.0;
 /// Inset from the graph cell's left edge to column 0: 10px for a lane plus 2px
@@ -434,15 +492,42 @@ const TOAST_FADE_OUT_MS: u64 = 220;
 const TOAST_SLIDE_PX: f32 = 12.0;
 const TERMINAL_PANEL_DEFAULT_HEIGHT_PX: f32 = 220.0;
 const TERMINAL_PANEL_RESIZE_HANDLE_PX: f32 = 6.0;
-pub(crate) const WEBSITE_URL: &str = "https://gitcomet.dev";
-pub(crate) const EDITIONS_URL: &str = "https://gitcomet.dev/#editions";
-pub(crate) const RELEASES_URL: &str = "https://github.com/Auto-Explore/GitComet/releases";
-pub(crate) const DISCORD_URL: &str = "https://discord.com/invite/2ufDGP8RnA";
 
-pub(in crate::view) fn restrict_scroll_to_vertical_axis<E: Styled>(mut element: E) -> E {
-    element.style().restrict_scroll_to_axis = Some(true);
-    element
+/// Product links from the installed identity; `None` hides the entry point.
+pub(crate) fn website_url() -> Option<&'static str> {
+    gitcomet_core::identity::current()
+        .links()
+        .website
+        .as_deref()
 }
+
+pub(crate) fn editions_url() -> Option<&'static str> {
+    gitcomet_core::identity::current()
+        .links()
+        .editions
+        .as_deref()
+}
+
+pub(crate) fn releases_url() -> Option<&'static str> {
+    gitcomet_core::identity::current()
+        .links()
+        .releases
+        .as_deref()
+}
+
+pub(crate) fn community_url() -> Option<&'static str> {
+    gitcomet_core::identity::current()
+        .links()
+        .community
+        .as_deref()
+}
+
+/// The product name in window titles, menus, and messages.
+pub(crate) fn product_name() -> &'static str {
+    gitcomet_core::identity::current().display_name()
+}
+
+pub(in crate::view) use gitcomet_ui_kit::restrict_scroll_to_vertical_axis;
 
 // A cached view reuses its previous frame's layout and paint whenever the frame
 // was requested through `notify` on some other view (spinner ticks, store
@@ -511,12 +596,24 @@ fn stable_cached_fixed_height_view<V: Render>(view: Entity<V>, height: Pixels) -
 }
 
 fn stable_overlay_view<V: Render>(view: Entity<V>) -> impl IntoElement {
-    // Keep overlay hosts uncached. Their paint ranges are recorded after focused
-    // TextInput views register platform input handlers, and Wayland text-input
-    // replace_text_in_range can trigger a redraw while that handler is
-    // temporarily unavailable. Reusing the cached overlay paint range then
-    // replays a stale input-handler index and panics inside GPUI reuse_paint.
+    // Uncached: anchored popovers and hover cards would need their own
+    // invalidation checked before they could reuse a frame. The input-handler
+    // panic that once kept every host uncached is fixed in gpui (zed #50665);
+    // see `stable_cached_overlay_view`.
     div().absolute().top_0().left_0().size_full().child(view)
+}
+
+/// An overlay host behind a stable cache boundary. Overlays paint after the
+/// panes and their focused input, and replaying such a paint range panicked in
+/// gpui's `reuse_paint` until it stopped popping the frame's input handler
+/// (zed #50665, in gpui-ce since June 2026).
+fn stable_cached_overlay_view<V: Render>(view: Entity<V>) -> impl IntoElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .child(stable_cached_fill_view(view))
 }
 
 struct UiScaleScrollCapture {
@@ -613,8 +710,9 @@ impl Element for UiScaleScrollCapture {
                 return;
             }
 
+            let window_id = window.window_handle().window_id();
             cx.defer(move |cx| {
-                crate::app::set_app_ui_scale_percent(cx, next);
+                crate::app::set_window_ui_scale_percent(cx, window_id, Some(next));
             });
         });
     }
@@ -628,7 +726,7 @@ fn active_diff_target(state: &AppState) -> Option<(RepoId, DiffTarget)> {
 
 fn active_merge_view_target(state: &AppState) -> Option<(RepoId, DiffTarget)> {
     let (repo_id, target) = active_diff_target(state)?;
-    let DiffTarget::WorkingTree { path, area } = &target else {
+    let DiffTarget::WorkingTree { path, area, .. } = &target else {
         return None;
     };
     if *area != DiffArea::Unstaged {
@@ -758,7 +856,7 @@ pub(in crate::view) fn diff_split_column_widths(
     diff_split_column_widths_from_available(available, min_col_w, ratio)
 }
 
-pub(crate) const UI_MONOSPACE_FONT_FAMILY: &str = crate::bundled_fonts::LILEX_FONT_FAMILY;
+pub(crate) use crate::bundled_fonts::UI_MONOSPACE_FONT_FAMILY;
 
 mod gitcomet_view;
 mod gitcomet_view_render;

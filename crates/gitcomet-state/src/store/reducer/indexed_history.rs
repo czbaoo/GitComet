@@ -29,16 +29,15 @@ pub(super) fn reduce(state: &mut AppState, event: Event) -> Vec<Effect> {
             projection,
             ..
         } => {
-            if repo
+            let clicked = repo
                 .history_state
                 .indexed
                 .displayed_index
                 .as_ref()
-                .is_none_or(|index| !Arc::ptr_eq(index, &projection.index))
-            {
-                return Vec::new();
-            }
-            let Some(clicked) = projection.position(commit_id.as_ref()) else {
+                .is_some_and(|index| Arc::ptr_eq(index, &projection.index))
+                .then(|| projection.position(commit_id.as_ref()))
+                .flatten();
+            let Some(clicked) = clicked else {
                 return Vec::new();
             };
             let entries = if mode == crate::msg::CommitSelectMode::Range {
@@ -299,7 +298,6 @@ pub(super) fn reduce(state: &mut AppState, event: Event) -> Vec<Effect> {
                 {
                     history.lru.retain(|entry| *entry != start);
                     history.lru.push_back(start);
-                    let range = Arc::new(range);
                     history.ranges.insert(start, range.clone());
                     history.ranges_rev = history.ranges_rev.wrapping_add(1);
                     while history.ranges.len() > HISTORY_ROW_CACHE_LIMIT / HISTORY_BLOCK_SIZE {
@@ -430,7 +428,7 @@ mod tests {
             seq,
             snapshot: index.snapshot.clone(),
             start,
-            result: Ok(HistoryRange {
+            result: Ok(Arc::new(HistoryRange {
                 snapshot: index.snapshot.clone(),
                 start,
                 commits: (start..(start + 256).min(index.len()))
@@ -442,8 +440,27 @@ mod tests {
                         time: std::time::UNIX_EPOCH,
                     })
                     .collect(),
-            }),
+            })),
         }
+    }
+
+    #[test]
+    fn delivered_range_keeps_the_backend_allocation() {
+        let (mut state, index) = fixture();
+        let work = request(&mut state, &index, vec![0]).remove(0);
+        let event = loaded(work);
+        let Event::RangeLoaded {
+            result: Ok(block), ..
+        } = &event
+        else {
+            panic!()
+        };
+        let block = block.clone();
+        reduce(&mut state, event);
+        assert!(Arc::ptr_eq(
+            &block,
+            &state.repos[0].history_state.indexed.ranges[&0]
+        ));
     }
 
     #[test]
@@ -520,7 +537,7 @@ mod tests {
             result: Ok(range), ..
         } = &mut malformed
         {
-            range.commits[0].id = index.commit_id(0).unwrap();
+            Arc::make_mut(range).commits[0].id = index.commit_id(0).unwrap();
         }
         assert!(reduce(&mut state, malformed).is_empty());
         assert!(
@@ -578,7 +595,7 @@ mod tests {
             result: Ok(range), ..
         } = &mut event
         {
-            range.commits.pop();
+            Arc::make_mut(range).commits.pop();
         }
         reduce(&mut state, event);
         assert!(
@@ -683,6 +700,7 @@ mod tests {
             reduce(
                 &mut state,
                 Event::Select {
+                    request_id: None,
                     repo_id: RepoId(1),
                     projection: projection.clone(),
                     commit_id: index.commit_id(row).unwrap(),
@@ -717,6 +735,7 @@ mod tests {
         reduce(
             &mut state,
             Event::Select {
+                request_id: None,
                 repo_id: RepoId(1),
                 projection,
                 commit_id: index.commit_id(10_004).unwrap(),
@@ -748,6 +767,7 @@ mod tests {
             reduce(
                 &mut state,
                 Event::Select {
+                    request_id: None,
                     repo_id: RepoId(1),
                     projection: projection.clone(),
                     commit_id: index.commit_id(row).unwrap(),

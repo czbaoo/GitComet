@@ -12,8 +12,15 @@ pub enum RepoCommandKind {
         remote: String,
         branch: String,
     },
+    /// Exactly these refspecs from one remote.
+    FetchRefspecs {
+        remote: String,
+        refspecs: Vec<String>,
+    },
     PruneMergedBranches,
     PruneLocalTags,
+    /// `git maintenance run --auto`, started by the user.
+    RunMaintenance,
     Pull {
         mode: PullMode,
     },
@@ -82,6 +89,8 @@ pub enum RepoCommandKind {
     },
     InteractiveCherryPick {
         entries: Vec<InteractiveRebaseEntry>,
+        /// False merges every pick into the index without committing.
+        commit: bool,
     },
     CherryPick {
         commit_id: CommitId,
@@ -96,6 +105,11 @@ pub enum RepoCommandKind {
         /// Git's 1-based mainline parent for a merge commit.
         mainline: Option<usize>,
         summary: String,
+    },
+    ApplyFileChange {
+        target: gitcomet_core::domain::ApplyChangeTarget,
+        commit: bool,
+        commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
     },
     MergeAbort,
     CreateTag {
@@ -147,6 +161,9 @@ pub enum RepoCommandKind {
     AppendGitignorePatterns {
         patterns: Vec<String>,
     },
+    AppendGitattributesRule {
+        rule: String,
+    },
     ExportPatch {
         commit_id: CommitId,
         dest: PathBuf,
@@ -191,6 +208,10 @@ pub enum RepoCommandKind {
     ApplyWorktreePatch {
         reverse: bool,
     },
+    /// A Git LFS or git-annex operation.
+    LargeFile {
+        command: gitcomet_core::large_files::LargeFileCommand,
+    },
 }
 
 impl RepoCommandKind {
@@ -212,12 +233,14 @@ impl RepoCommandKind {
             | Self::InteractiveCherryPick { .. }
             | Self::CherryPick { .. }
             | Self::Revert { .. }
+            | Self::ApplyFileChange { .. }
             | Self::MergeAbort
             | Self::CheckoutConflict { .. }
             | Self::AcceptConflictDeletion { .. }
             | Self::CheckoutConflictBase { .. }
             | Self::LaunchMergetool { .. }
             | Self::AppendGitignorePatterns { .. }
+            | Self::AppendGitattributesRule { .. }
             | Self::ExportPatch { .. }
             | Self::ApplyPatch { .. }
             | Self::AddSubmodule { .. }
@@ -228,8 +251,10 @@ impl RepoCommandKind {
             | Self::ApplyWorktreePatch { .. } => true,
             Self::FetchAll
             | Self::FetchBranch { .. }
+            | Self::FetchRefspecs { .. }
             | Self::PruneMergedBranches
             | Self::PruneLocalTags
+            | Self::RunMaintenance
             | Self::Push
             | Self::PushWithTags { .. }
             | Self::PushAfterCommit { .. }
@@ -253,15 +278,34 @@ impl RepoCommandKind {
             | Self::ForceRemoveWorktree { .. }
             | Self::StageHunk
             | Self::UnstageHunk => false,
+            Self::LargeFile { command } => command.writes_worktree(),
         }
+    }
+
+    /// Commands that fetch, and so may leave new packs or run a repack.
+    pub(crate) fn fetches_objects(&self) -> bool {
+        matches!(
+            self,
+            Self::FetchAll
+                | Self::FetchBranch { .. }
+                | Self::FetchRefspecs { .. }
+                | Self::PruneMergedBranches
+                | Self::Pull { .. }
+                | Self::PullBranch { .. }
+        )
+    }
+
+    /// Commands long enough to deserve a progress card with git's meters.
+    pub(crate) fn shows_progress(&self) -> bool {
+        self.fetches_objects() || matches!(self, Self::RunMaintenance)
     }
 
     pub(crate) fn hook_activity_label(&self) -> &'static str {
         match self {
-            Self::FetchAll => "Fetch",
-            Self::FetchBranch { .. } => "Fetch",
+            Self::FetchAll | Self::FetchBranch { .. } | Self::FetchRefspecs { .. } => "Fetch",
             Self::PruneMergedBranches => "Prune branches",
             Self::PruneLocalTags => "Prune tags",
+            Self::RunMaintenance => "Maintenance",
             Self::Pull { .. } | Self::PullBranch { .. } => "Pull",
             Self::MergeRef { .. } => "Merge",
             Self::SquashRef { .. } | Self::SquashCommits { .. } => "Squash",
@@ -281,6 +325,7 @@ impl RepoCommandKind {
             | Self::InteractiveRebase { .. } => "Rebase",
             Self::InteractiveCherryPick { .. } | Self::CherryPick { .. } => "Cherry-pick",
             Self::Revert { .. } => "Revert",
+            Self::ApplyFileChange { .. } => "Apply change",
             Self::MergeAbort => "Abort merge",
             Self::CreateTag { .. } => "Create tag",
             Self::DeleteTag { .. } => "Delete tag",
@@ -295,6 +340,7 @@ impl RepoCommandKind {
             Self::LaunchMergetool { .. } => "Mergetool",
             Self::SaveWorktreeFile { .. } => "Save file",
             Self::AppendGitignorePatterns { .. } => "Update .gitignore",
+            Self::AppendGitattributesRule { .. } => "Update .gitattributes",
             Self::ExportPatch { .. } => "Export patch",
             Self::ApplyPatch { .. } => "Apply patch",
             Self::AddWorktree { .. } => "Add worktree",
@@ -307,6 +353,7 @@ impl RepoCommandKind {
             Self::StageHunk => "Stage hunk",
             Self::UnstageHunk => "Unstage hunk",
             Self::ApplyWorktreePatch { .. } => "Apply worktree patch",
+            Self::LargeFile { command } => command.label(),
         }
     }
 }

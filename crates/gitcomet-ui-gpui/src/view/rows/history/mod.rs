@@ -9,7 +9,7 @@ use palette::IntoColor;
 
 use crate::view::markdown_preview::{
     MarkdownAlertKind, MarkdownChangeHint, MarkdownInlineImage, MarkdownInlineStyle,
-    MarkdownPreviewRow, MarkdownPreviewRowKind,
+    MarkdownPreviewRow, MarkdownPreviewRowKind, MarkdownTextAlign,
 };
 use crate::view::panes::main::diff_search::DiffSearchMatcher;
 use gitcomet_state::msg::CommitSelectMode;
@@ -55,6 +55,7 @@ impl HistoryView {
         // One lane keeps full colour; the rest wash out. Resolved once here rather
         // than per row -- it is a scan of the page behind a memo.
         let selected_lane = this.history_selected_lane(plan.show_working_tree_summary_row());
+        let find_query = this.history_find_query().cloned();
 
         let Some(repo) = this.active_repo() else {
             return Vec::new();
@@ -108,6 +109,11 @@ impl HistoryView {
                     {
                         let cache = cache?;
                         let summary = worktree_dirty.as_ref()?.get(worktree_ix)?;
+                        let selected = matches!(
+                            &primary_selection,
+                            Some(super::HistoryPrimarySelection::Worktree(path))
+                                if path == &summary.path
+                        );
                         // The row shows the lanes of the commit it sits on top of,
                         // so it needs that row's paint data.
                         let graph_ix = visible_ix.checked_sub(graph_start)?;
@@ -144,11 +150,8 @@ impl HistoryView {
                             show_graph_color_marker,
                             repo.id,
                             list_ix,
-                            matches!(
-                                &primary_selection,
-                                Some(super::HistoryPrimarySelection::Worktree(path))
-                                    if path == &summary.path
-                            ),
+                            selected,
+                            find_query.is_some() && !selected,
                             (summary.added, summary.modified, summary.deleted),
                             summary,
                             cx,
@@ -178,6 +181,7 @@ impl HistoryView {
                             show_graph_color_marker,
                             repo.id,
                             selected,
+                            find_query.is_some() && !selected,
                             worktree_counts,
                             cx,
                         ));
@@ -243,6 +247,15 @@ impl HistoryView {
                     }) {
                         return None;
                     }
+                    let (find_dimmed, find_highlights) =
+                        crate::view::panes::history::find::history_find_row_marks(
+                            find_query.as_ref(),
+                            commit,
+                            selected,
+                            base_row_vm.summary.as_ref(),
+                            base_row_vm.author.as_ref(),
+                            short_sha.as_ref(),
+                        );
                     Some(history_table_row(
                         theme,
                         ui_scale,
@@ -277,7 +290,10 @@ impl HistoryView {
                         selected,
                         base_row_vm.is_head,
                         is_stash_node,
+                        find_dimmed,
+                        find_highlights,
                         this.active_context_menu_invoker.as_ref(),
+                        this.history_row_annotation(repo, commit, cx),
                         cx,
                     ))
                 })()
@@ -453,6 +469,9 @@ fn history_message_border(ui_scale: ui_scale::UiScale, color: gpui::Rgba) -> imp
         .bg(color)
 }
 
+/// Opacity of rows that miss the find bar's query.
+const HISTORY_FIND_DIMMED_OPACITY: f32 = 0.35;
+
 pub(in crate::view) fn history_row_height(ui_scale: ui_scale::UiScale) -> Pixels {
     ui_scale.row_height(HISTORY_ROW_HEIGHT_PX, 36.0)
 }
@@ -493,14 +512,18 @@ fn history_table_row(
     // Branch this commit belongs to, shown as a faded badge while the row is
     // hovered. Inherited down the lane, so unlabelled commits have one too.
     lane_branch_name: Option<SharedString>,
-    author: HistoryTextVm,
+    author: HistoryAuthorVm,
     summary: HistoryTextVm,
     when: HistoryTextVm,
     short_sha: HistoryTextVm,
     selected: bool,
     is_head: bool,
     is_stash_node: bool,
+    // A known miss while the find bar has a query.
+    find_dimmed: bool,
+    find_highlights: Option<crate::view::panes::history::find::HistoryFindHighlights>,
     active_context_menu_invoker: Option<&SharedString>,
+    annotation: gitcomet_extension_api::HistoryRowAnnotation,
     cx: &mut gpui::Context<HistoryView>,
 ) -> AnyElement {
     // Compared without formatting: this ran once per visible commit per frame
@@ -554,8 +577,10 @@ fn history_table_row(
         when,
         commit.time,
         short_sha,
+        find_highlights,
         active_context_menu_invoker.cloned(),
         row_paint.clone(),
+        annotation.clone(),
     );
 
     let commit_id = commit.id.clone();
@@ -566,7 +591,13 @@ fn history_table_row(
         .relative()
         .h(row_height)
         .w_full()
-        .map(|row| row_paint.apply(row))
+        .map(|row| row_paint.apply_with_canvas(row))
+        // A find miss fades on top of whatever the annotations asked for.
+        .opacity(if find_dimmed {
+            annotation.opacity * HISTORY_FIND_DIMMED_OPACITY
+        } else {
+            annotation.opacity
+        })
         .child(commit_row)
         // A completed click owns its press; a text-selection drag ending on
         // the row must not select the commit.
@@ -582,20 +613,8 @@ fn history_table_row(
                 } else {
                     CommitSelectMode::Single
                 };
-                if this.select_indexed_commit(repo_id, commit_id.clone(), mode) {
-                    cx.notify();
-                    return;
-                }
-                let visible_order = (mode == CommitSelectMode::Range)
-                    .then(|| this.visible_commit_ids_for_repo(repo_id))
-                    .flatten();
-                this.store.dispatch(Msg::SelectCommitMulti {
-                    repo_id,
-                    commit_id: commit_id.clone(),
-                    mode,
-                    clicked_index: Some(graph_row_ix),
-                    visible_order,
-                });
+                this.cancel_history_find_navigation();
+                this.select_history_commit(repo_id, commit_id.clone(), mode, Some(graph_row_ix));
                 cx.notify();
             }),
         );
@@ -644,6 +663,7 @@ fn worktree_uncommitted_history_row(
     repo_id: RepoId,
     list_ix: usize,
     selected: bool,
+    find_dimmed: bool,
     counts: (usize, usize, usize),
     summary: &gitcomet_core::domain::WorktreeDirtySummary,
     cx: &mut gpui::Context<HistoryView>,
@@ -773,12 +793,16 @@ fn worktree_uncommitted_history_row(
     .on_activate(
         false,
         controls::ControlActivation::Nested,
-        cx.listener(move |this, e: &ClickEvent, _w, cx| {
+        cx.listener(move |_this, e: &ClickEvent, window, cx| {
             if !e.standard_click() {
                 return;
             }
             cx.stop_propagation();
-            this.store.dispatch(Msg::OpenRepo(open_path.clone()));
+            crate::app::open_repository_from_view(
+                cx,
+                window.window_handle().window_id(),
+                open_path.clone(),
+            );
             cx.notify();
         }),
     );
@@ -789,6 +813,7 @@ fn worktree_uncommitted_history_row(
     // never move this row's graph lane away from the commit rows below it.
     let row = div()
         .id(("history_worktree_uncommitted", list_ix))
+        .when(find_dimmed, |row| row.opacity(HISTORY_FIND_DIMMED_OPACITY))
         .h(history_row_height(ui_scale))
         .flex()
         .w_full()
@@ -803,7 +828,15 @@ fn worktree_uncommitted_history_row(
                 if !e.standard_click() {
                     return;
                 }
+                this.cancel_history_find_navigation();
+                let request_id = Some(this.note_history_selection(
+                    repo_id,
+                    crate::view::panes::history::HistoryPrimarySelection::Worktree(
+                        select_path.clone(),
+                    ),
+                ));
                 this.store.dispatch(Msg::SelectWorktreeUncommitted {
+                    request_id,
                     repo_id,
                     path: select_path.clone(),
                 });
@@ -896,6 +929,7 @@ fn working_tree_summary_history_row(
     show_graph_color_marker: bool,
     repo_id: RepoId,
     selected: bool,
+    find_dimmed: bool,
     counts: (usize, usize, usize),
     cx: &mut gpui::Context<HistoryView>,
 ) -> AnyElement {
@@ -960,25 +994,7 @@ fn working_tree_summary_history_row(
         |_, _, _| (),
         move |bounds, _, window, cx| {
             let node_background = paint.background(theme.colors.surface.canvas, window);
-            use gpui::{PathBuilder, point};
             let scaled_px = ui_scale::scaler(ui_scale::UiScale::from_window(window));
-            let margin_x = scaled_px(HISTORY_GRAPH_MARGIN_X_PX);
-            let col_gap = scaled_px(HISTORY_GRAPH_COL_GAP_PX);
-            let node_x = margin_x + col_gap * 0.0;
-            let center = point(
-                bounds.left() + node_x,
-                bounds.top() + bounds.size.height / 2.0,
-            );
-
-            // Connect the working tree node into the history graph below.
-            let stroke_width = scaled_px(1.6);
-            let mut path = PathBuilder::stroke(stroke_width);
-            path.move_to(point(center.x, center.y));
-            path.line_to(point(center.x, bounds.bottom()));
-            if let Ok(p) = path.build() {
-                window.paint_path(p, node_color);
-            }
-
             if show_graph_color_marker {
                 super::history_graph_paint::paint_graph_fade(
                     node_color,
@@ -987,6 +1003,20 @@ fn working_tree_summary_history_row(
                     window,
                 );
             }
+
+            // Column 0 on the same grid as the commit rows below.
+            let grid = super::history_graph_paint::GraphGrid::new(window);
+            let (_, center_y, bottom) = grid.row_ys(bounds);
+            let center = gpui::point(grid.snap(bounds.left()) + grid.margin_x, center_y);
+
+            // Connect the working tree node into the history graph below.
+            super::history_graph_paint::paint_straight_connector(
+                center,
+                gpui::point(center.x, bottom),
+                grid.stroke_width,
+                node_color,
+                window,
+            );
 
             super::history_graph_paint::paint_ring_icon_node(
                 center.x,
@@ -1007,6 +1037,7 @@ fn working_tree_summary_history_row(
     // the flexible summary is the only cell allowed to absorb width pressure.
     let row = div()
         .id(("history_worktree_summary", repo_id.0))
+        .when(find_dimmed, |row| row.opacity(HISTORY_FIND_DIMMED_OPACITY))
         .h(history_row_height(ui_scale))
         .flex()
         .w_full()

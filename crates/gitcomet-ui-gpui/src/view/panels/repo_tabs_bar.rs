@@ -23,6 +23,8 @@ pub(in super::super) struct RepoTabsBarView {
     active_context_menu_invoker: Option<SharedString>,
     repo_tab_spinner_delay: Option<RepoTabSpinnerDelayState>,
     repo_tab_spinner_delay_seq: u64,
+    /// Show the busy spinner only once a load outlasts the delay.
+    uses_spinner_delay: bool,
     notify_fingerprint: u64,
     repo_tab_drag_visual: Option<RepoTabDragVisual>,
     tab_scroll: components::TabBarScroll,
@@ -149,7 +151,7 @@ fn repo_tab_text_width(label: SharedString, font_size: Pixels, window: &mut Wind
     let run = style.to_run(label.len());
     window
         .text_system()
-        .shape_line(label, font_size, &[run], None)
+        .shape_line(label, font_size, &[run])
         .width
 }
 
@@ -328,17 +330,30 @@ impl RepoTabsBarView {
                     err.hash(&mut hasher);
                 }
             }
-            repo.loads_in_flight.any_in_flight().hash(&mut hasher);
-            repo.local_actions_in_flight.hash(&mut hasher);
-            repo.pull_in_flight.hash(&mut hasher);
-            repo.push_in_flight.hash(&mut hasher);
         }
+        // Busy is left out: it flips on every background refresh, and only
+        // the delayed spinner shows it (see `shows_spinner`).
         hasher.finish()
+    }
+
+    fn shows_spinner(&self, repo: &RepoState) -> bool {
+        Some(repo.id) == self.active_repo_id()
+            && Self::is_repo_busy(repo)
+            && self
+                .repo_tab_spinner_delay
+                .as_ref()
+                .is_some_and(|s| s.repo_id == repo.id && s.show_spinner)
+    }
+
+    fn active_tab_shows_spinner(&self) -> bool {
+        self.state.repos.iter().any(|repo| self.shows_spinner(repo))
     }
 
     fn is_repo_busy(repo: &RepoState) -> bool {
         matches!(repo.open, Loadable::Loading)
-            || repo.loads_in_flight.any_in_flight()
+            || repo
+                .loads_in_flight
+                .is_in_flight(!gitcomet_state::model::RepoLoadsInFlight::WORKTREE_DIRTY)
             || repo.local_actions_in_flight > 0
             || repo.pull_in_flight > 0
             || repo.push_in_flight > 0
@@ -367,12 +382,9 @@ impl RepoTabsBarView {
     fn close_repo_tab(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
         self.hovered_repo_tab = None;
         self.pressed_repo_tab = None;
-        if let Ok(true) = self.root_view.update(cx, |root, cx| {
-            root.request_terminal_shutdown_action(TerminalShutdownAction::CloseRepo { repo_id }, cx)
-        }) {
-            return;
-        }
-        self.store.dispatch(Msg::CloseRepo { repo_id });
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.request_close_repos(vec![repo_id], None, cx);
+        });
         cx.notify();
     }
 
@@ -388,6 +400,7 @@ impl RepoTabsBarView {
         let subscription = cx.observe(&ui_model, |this, model, cx| {
             let next = Arc::clone(&model.read(cx).state);
             let next_fingerprint = Self::notify_fingerprint(&next);
+            let showed_spinner = this.active_tab_shows_spinner();
 
             this.state = next;
             this.update_repo_tab_spinner_delay(cx);
@@ -405,7 +418,9 @@ impl RepoTabsBarView {
                 this.pressed_repo_tab = None;
             }
 
-            if next_fingerprint != this.notify_fingerprint {
+            if next_fingerprint != this.notify_fingerprint
+                || showed_spinner != this.active_tab_shows_spinner()
+            {
                 this.notify_fingerprint = next_fingerprint;
                 cx.notify();
             }
@@ -425,6 +440,7 @@ impl RepoTabsBarView {
             active_context_menu_invoker: None,
             repo_tab_spinner_delay: None,
             repo_tab_spinner_delay_seq: 0,
+            uses_spinner_delay: crate::ui_runtime::current().uses_repo_tab_spinner_delay(),
             notify_fingerprint,
             repo_tab_drag_visual: None,
             tab_scroll: components::TabBarScroll::new(),
@@ -627,6 +643,13 @@ impl RepoTabsBarView {
         });
     }
 
+    /// The live runtime's spinner delay, for this view only: forcing the
+    /// whole runtime live would also start its background work.
+    #[cfg(test)]
+    pub(in crate::view) fn use_spinner_delay_for_tests(&mut self) {
+        self.uses_spinner_delay = true;
+    }
+
     #[cfg(test)]
     pub(in crate::view) fn tab_scroll_for_tests(&self) -> (Pixels, Pixels) {
         (self.tab_scroll.scrolled(), self.tab_scroll.max_scroll())
@@ -687,7 +710,7 @@ impl RepoTabsBarView {
 
         self.repo_tab_spinner_delay_seq = self.repo_tab_spinner_delay_seq.wrapping_add(1);
         let seq = self.repo_tab_spinner_delay_seq;
-        let uses_spinner_delay = crate::ui_runtime::current().uses_repo_tab_spinner_delay();
+        let uses_spinner_delay = self.uses_spinner_delay;
         self.repo_tab_spinner_delay = Some(RepoTabSpinnerDelayState {
             repo_id,
             show_spinner: !uses_spinner_delay,
@@ -698,9 +721,11 @@ impl RepoTabsBarView {
             return;
         }
 
+        // The app executor's timer, not smol's: it runs on the test clock.
+        let delay = cx.background_executor().timer(Duration::from_millis(100));
         cx.spawn(
             async move |view: WeakEntity<RepoTabsBarView>, cx: &mut gpui::AsyncApp| {
-                smol::Timer::after(Duration::from_millis(100)).await;
+                delay.await;
                 let _ = view.update(cx, |this, cx| {
                     if this.repo_tab_spinner_delay_seq != seq {
                         return;
@@ -746,7 +771,17 @@ impl Render for RepoTabsBarView {
         // Tabs are transparent, so a label fading out has to land on whatever
         // is actually behind it: the bar for an idle tab, the content strip
         // for the active one.
-        let strip_bg = crate::view::chrome::title_bar_background(theme, window.is_window_active());
+        let workspace_color = crate::workspaces::with_workspace_for_window(
+            cx,
+            window.window_handle().window_id(),
+            |workspace| workspace.color,
+        )
+        .flatten();
+        let strip_bg = crate::view::chrome::title_bar_background(
+            theme,
+            window.is_window_active(),
+            workspace_color,
+        );
 
         // Reveal the active tab when the repository changes, then leave the
         // offset alone so manual scrolling sticks.
@@ -788,13 +823,7 @@ impl Render for RepoTabsBarView {
             let repo_id = repo.id;
             let next_repo_id = self.state.repos.get(ix + 1).map(|r| r.id);
             let is_active = Some(repo_id) == active;
-            let is_busy = Self::is_repo_busy(repo);
-            let show_spinner = is_active
-                && is_busy
-                && self
-                    .repo_tab_spinner_delay
-                    .as_ref()
-                    .is_some_and(|s| s.repo_id == repo_id && s.show_spinner);
+            let show_spinner = self.shows_spinner(repo);
             let context_menu_invoker: SharedString = format!("repo_tab_{}", repo_id.0).into();
             let context_menu_active =
                 self.active_context_menu_invoker.as_ref() == Some(&context_menu_invoker);
@@ -1100,7 +1129,10 @@ impl Render for RepoTabsBarView {
                 .on_activate(
                     false,
                     controls::ControlActivation::Composite,
-                    cx.listener(move |this, _e: &ClickEvent, _w, _cx| {
+                    cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                        let _ = this
+                            .root_view
+                            .update(cx, |root, cx| root.show_repository_canvas(cx));
                         if let Some(msg) =
                             Self::repo_tab_click_message(this.active_repo_id(), repo_id)
                         {
@@ -1269,10 +1301,15 @@ impl Render for RepoTabsBarView {
             .can_drop(|dragged, _window, _cx| {
                 dragged
                     .downcast_ref::<gpui::ExternalPaths>()
-                    .is_some_and(|paths| matches!(paths.paths(), [_]))
+                    .is_some_and(|paths| !paths.paths().is_empty())
             })
             .on_drop(
-                cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    if let Some(transfer) = window.take_file_drop() {
+                        transfer
+                            .completion
+                            .complete(Some(gpui::FileTransferOperation::Copy));
+                    }
                     this.set_external_folder_drag_active(false, cx);
                     let paths = paths.clone();
                     let _ = this.root_view.update(cx, |root, cx| {

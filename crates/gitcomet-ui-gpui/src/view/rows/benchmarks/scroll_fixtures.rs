@@ -106,13 +106,15 @@ impl LargeFileDiffScrollFixture {
     }
 
     fn build_styled_line(&self, line_ix: usize) -> (CachedDiffStyledText, bool) {
+        let tab_width = 4;
+
         let line = self
             .lines
             .get(line_ix)
             .map(String::as_str)
             .unwrap_or_default();
         if let Some(document) = self.prepared_document {
-            return super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking_with_palette(
+            return super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking_with_palette(tab_width,
                 self.theme,
                 &self.highlight_palette,
                 super::diff_text::PreparedDiffTextBuildRequest {
@@ -137,6 +139,7 @@ impl LargeFileDiffScrollFixture {
 
         (
             super::diff_text::build_cached_diff_styled_text_with_palette(
+                tab_width,
                 self.theme,
                 &self.highlight_palette,
                 super::diff_text::DiffTextBuildRequest {
@@ -785,11 +788,9 @@ fn keyboard_focus_unique_target_count(focus_target_count: usize, cycle_events: u
 }
 
 fn keyboard_focus_wrap_count(focus_target_count: usize, cycle_events: usize) -> u64 {
-    if focus_target_count == 0 {
-        0
-    } else {
-        u64::try_from(cycle_events / focus_target_count).unwrap_or(u64::MAX)
-    }
+    cycle_events
+        .checked_div(focus_target_count)
+        .map_or(0, |wraps| u64::try_from(wraps).unwrap_or(u64::MAX))
 }
 
 fn keyboard_focus_max_scan_len(
@@ -854,10 +855,10 @@ impl KeyboardStageUnstageToggleFixture {
         let mut repo = build_synthetic_repo_state(20, 40, 2, 0, 0, 0, &commits);
         seed_repo_status_entries(&mut repo, entries.clone(), entries);
         repo.open = Loadable::Ready(());
-        repo.diff_state.diff_target = Some(DiffTarget::WorkingTree {
-            path: paths[0].clone(),
-            area: DiffArea::Unstaged,
-        });
+        repo.diff_state.diff_target = Some(DiffTarget::working_tree(
+            paths[0].clone(),
+            DiffArea::Unstaged,
+        ));
         repo.diff_state.diff_state_rev = 1;
 
         Self {
@@ -1014,10 +1015,7 @@ impl KeyboardStageUnstageToggleFixture {
         with_select_diff_sync(
             state,
             repo_id,
-            DiffTarget::WorkingTree {
-                path: path.to_path_buf(),
-                area: next_area,
-            },
+            DiffTarget::working_tree(path.to_path_buf(), next_area),
             |_state, effects| {
                 record_keyboard_stage_unstage_select_effects(
                     effects,

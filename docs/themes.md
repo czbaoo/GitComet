@@ -6,6 +6,34 @@ Built-in themes are embedded in the GitComet binary.
 
 GitComet loads custom themes from JSON bundle files in your per-user themes directory.
 
+## Built-in Themes
+
+Pick a theme in **Settings → Appearance**. Each workspace can also override it
+in **Settings → Workspaces**, so windows of different workspaces are easy to
+tell apart. **Automatic** follows the system appearance with GitComet Light and
+GitComet Dark.
+
+| Dark | Light | Source |
+| --- | --- | --- |
+| GitComet Dark, Amber Dark | GitComet Light, Sunset Veil | GitComet |
+| Grove Dark, Ocean Dark, Ember Dark, Iris Dark, Rose Dark | Grove Light, Ocean Light, Ember Light, Iris Light, Rose Light | GitComet, palettes adapted from [t3code](https://github.com/pingdotgg/t3code) |
+| Tokyo Night, Tokyo Night Storm | Tokyo Night Light | [Tokyo Night](https://github.com/tokyo-night/tokyo-night-vscode-theme) |
+| GitHub Dark | GitHub Light | [GitHub VS Code Theme](https://github.com/primer/github-vscode-theme) |
+| One Dark Pro | | [One Dark Pro](https://github.com/Binaryify/OneDark-Pro) |
+| Solarized Dark | Solarized Light | [Solarized](https://ethanschoonover.com/solarized/) |
+| Gruvbox Dark | Gruvbox Light | [Gruvbox Theme](https://github.com/jdinhify/vscode-theme-gruvbox) |
+| Nord | | [Nord](https://github.com/nordtheme/visual-studio-code) |
+| Monokai | | Visual Studio Code's built-in Monokai |
+| Catppuccin Frappé, Catppuccin Mocha | Catppuccin Latte | [Catppuccin](https://github.com/catppuccin/vscode) |
+| Night Owl | Night Owl Light | [Night Owl](https://github.com/sdras/night-owl-vscode-theme) |
+
+Ported themes keep their upstream backgrounds and hues. Every bundled theme
+meets WCAG AA: 4.5:1 for all text (including placeholders, line numbers and
+text on selected or hovered rows), and 3:1 for the focus ring, the selection
+indicator and syntax on diff, selection and search highlights. Where a colour
+falls short, GitComet shifts its lightness, or fades a highlight, until it
+reaches that ratio.
+
 ## Theme File Location
 
 GitComet creates the user themes directory on startup and only loads custom `.json` files from that location:
@@ -103,6 +131,28 @@ Each theme file is a bundle with a bundle name and one or more themes. The examp
           "border": { "hex": "#ffc06aff", "alpha": 0.30 },
           "foreground": "#edf1f7ff",
           "secondary": "#9ea7b8ff"
+        },
+        "interstitial": {
+          "text": "#f6f7fbff",
+          "muted": "#a8b1c6ff",
+          "primary": {
+            "text": "#04172bff",
+            "background": "#5ac1feff",
+            "background_hover": "#72c7ffff",
+            "background_active": "#48b6eeff",
+            "border": "#5ac1feff",
+            "border_hover": "#72c7ffff",
+            "border_active": "#48b6eeff"
+          },
+          "secondary": {
+            "text": "#f6f7fbff",
+            "background": "#ffffff26",
+            "background_hover": "#ffffff33",
+            "background_active": "#ffffff40",
+            "border": "#ffffff47",
+            "border_hover": "#ffffff66",
+            "border_active": "#ffffff80"
+          }
         },
         "shadow": "#000000ff",
         "graph_lane_palette": [                         // Optional
@@ -224,10 +274,15 @@ you misspell is still an error — the file is rejected rather than half-applied
 - `diff`: `added`, `removed`, `modified`; each contains `foreground`,
   `background`, `word_background`, and `focused_background`
 - `tooltip`: `background`, `foreground`
-- `scrollbar`: `thumb`, `thumb_hover`, `thumb_pressed`
+- `scrollbar`: `thumb`, `thumb_hover`, `thumb_pressed` (accepted for compatibility;
+  dragged thumbs use `accent.foreground`)
 - `notice`: `background`, `border`, `foreground`, `secondary` — inline notices
   that ask for a decision, such as "File changed on disk". `foreground` colors
   the title and `secondary` the explanation beside it
+- `interstitial`: `text`, `muted`, and the `primary` and `secondary`
+  call-to-action buttons (`text`, `background`, `background_hover`,
+  `background_active`, `border`, `border_hover`, `border_active`) drawn over
+  the loading, Home, and Git-unavailable backdrops
 - `shadow`
 - `graph_lane_palette` and `graph_lane_hues` are optional
 
@@ -279,9 +334,9 @@ These values are numeric and control the corner radius used by major UI elements
 ## Overrides And Validation Behavior
 
 - Built-in system themes stay embedded in the GitComet binary and are not loaded from the custom themes directory.
-- GitComet loads custom `.json` files from the themes directory, but ignores files whose basename matches a bundled system theme file such as `gitcomet.json`.
+- GitComet loads custom `.json` files from the themes directory, but ignores files whose basename matches a bundled system theme file such as `gitcomet.json`. Every bundled file name is reserved this way, including `github.json`, `nord.json` and `catppuccin.json`.
 - Custom themes can add new theme keys, but they cannot override built-in system theme keys. Any runtime theme entry that reuses a built-in key is ignored.
-- A file that cannot be read or parsed is ignored and reported with its path and reason.
+- A file that cannot be read or parsed is ignored and reported with its path and reason. So are files skipped for a reserved file name and themes skipped for a built-in key: **Settings → Appearance** lists each one under the theme tiles.
 - GitComet validates the structure and types of custom themes, but does not
   measure, warn about, reject, or alter their colors based on contrast.
 - GitComet does not expose a separate machine-readable JSON Schema file today; the implementation in [`crates/gitcomet-ui-gpui/src/theme.rs`](crates/gitcomet-ui-gpui/src/theme.rs) is the source of truth.

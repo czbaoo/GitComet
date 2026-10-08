@@ -72,7 +72,7 @@ pub(super) fn panel(
                 .max_w(scaled_px(460.0))
                 .text_size(theme.ui_text(14.0))
                 .text_color(theme.colors.foreground.secondary)
-                .child("Git blocks local file transport for submodules by default. Trusting these sources will allow GitComet to enable file transport only for this repo/source pair."),
+                .child(format!("Git blocks local file transport for submodules by default. Trusting these sources will allow {} to enable file transport only for this repo/source pair.", crate::view::product_name())),
         )
         .section(
             div().px_2().pb_1().child(
@@ -86,7 +86,7 @@ pub(super) fn panel(
                         scaled_px(14.0),
                     ))
                     .on_click(theme, cx, |_this, _e, _window, cx| {
-                        cx.open_url(SUBMODULE_TRUST_CVE_URL);
+                        crate::view::platform_open::open_url_later(SUBMODULE_TRUST_CVE_URL, cx);
                     }),
             ),
         );

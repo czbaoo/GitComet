@@ -98,12 +98,27 @@ pub(in crate::view) fn head_branch_has_live_upstream(repo: &RepoState) -> bool {
         .any(|candidate| candidate.remote == upstream.remote && candidate.name == upstream.branch)
 }
 
+/// The toolbar and menu can pull through annex on adjusted branches, or
+/// through Git when the current branch has a live remote-tracking upstream.
+pub(in crate::view) fn pull_enabled(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> bool {
+    repo.annex_takes_over_pull_push(settings) || head_branch_has_live_upstream(repo)
+}
+
 /// Decide whether Pull can run. A configured upstream is actionable only when
 /// its exact remote-tracking ref exists; a future upstream configured by
 /// "Create new" must be pushed before Pull is offered. For a branch with no
 /// configured upstream, the backend can still use the preferred remote, while
 /// detached HEAD falls back to Git's own diagnostics.
-pub(in crate::view) fn pull_request(repo: &RepoState) -> PullRequest {
+pub(in crate::view) fn pull_request(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> PullRequest {
+    if pull_enabled(repo, settings) {
+        return PullRequest::Pull;
+    }
     let Loadable::Ready(head) = &repo.head_branch else {
         return PullRequest::NotReady;
     };
@@ -118,11 +133,7 @@ pub(in crate::view) fn pull_request(repo: &RepoState) -> PullRequest {
         .find(|branch| branch.name == *head)
         .is_some_and(|branch| branch.upstream.is_some())
     {
-        return if head_branch_has_live_upstream(repo) {
-            PullRequest::Pull
-        } else {
-            PullRequest::NotReady
-        };
+        return PullRequest::NotReady;
     }
 
     let Loadable::Ready(remotes) = &repo.remotes else {
@@ -156,7 +167,10 @@ pub(in crate::view) fn active_sequencer_state(
 /// Decide whether an interactive Push can run immediately or first needs the
 /// existing set-upstream prompt. A configured upstream can name a branch that
 /// has not been pushed yet; that still gives Push an exact destination.
-pub(in crate::view) fn push_request(repo: &RepoState) -> PushRequest {
+pub(in crate::view) fn push_request(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> PushRequest {
     let Loadable::Ready(head) = &repo.head_branch else {
         return PushRequest::NotReady;
     };
@@ -171,7 +185,9 @@ pub(in crate::view) fn push_request(repo: &RepoState) -> PushRequest {
     let Some(branch) = branches.iter().find(|branch| branch.name == *head) else {
         return PushRequest::NotReady;
     };
-    if branch.upstream.is_some() {
+    // When the annex integration handles Push it does not need an upstream
+    // on the adjusted branch. Plain Git still needs the upstream prompt.
+    if branch.upstream.is_some() || repo.annex_takes_over_pull_push(settings) {
         return PushRequest::Push;
     }
 
@@ -542,9 +558,7 @@ pub(super) fn diff_target_rendered_preview_kind(
 ) -> Option<RenderedPreviewKind> {
     let path = match target? {
         DiffTarget::WorkingTree { path, .. } => path.as_path(),
-        DiffTarget::Commit {
-            path: Some(path), ..
-        } => path.as_path(),
+        DiffTarget::Commit { path, .. } => path.as_path(),
         _ => return None,
     };
     preview_path_rendered_kind(path)
@@ -880,6 +894,8 @@ impl DiffTextPairMatch {
 }
 
 pub(super) struct DiffTextHitbox {
+    /// A picture represents its entire logical text range as one selectable item.
+    pub(super) atomic: bool,
     pub(super) bounds: Bounds<Pixels>,
     pub(super) layout_key: u64,
     pub(super) source_visible_ix: usize,
@@ -932,6 +948,7 @@ pub(super) struct ConflictTextHitbox {
 /// The wrapped layout a row painted, plus what it takes to read offsets back
 /// in row coordinates.
 pub(super) struct DiffTextWrappedHit {
+    pub(super) tab_width: usize,
     pub(super) layout: gpui::TextLayout,
     /// The row's raw text, when tabs were expanded for painting.
     pub(super) untabbed: Option<SharedString>,
@@ -940,8 +957,12 @@ pub(super) struct DiffTextWrappedHit {
 impl DiffTextWrappedHit {
     /// Offset in row coordinates for an offset in the painted text.
     pub(super) fn row_offset(&self, painted_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_row_offset(raw, painted_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_row_offset(tab_width, raw, painted_offset)
+            }
             None => painted_offset,
         }
     }
@@ -949,8 +970,12 @@ impl DiffTextWrappedHit {
     /// Offset in the painted text for an offset in row coordinates — the
     /// inverse of [`Self::row_offset`].
     pub(super) fn painted_offset(&self, row_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_painted_offset(raw, row_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_painted_offset(tab_width, raw, row_offset)
+            }
             None => row_offset,
         }
     }
@@ -994,13 +1019,26 @@ pub struct GitCometView {
     pub(super) _poller: Poller,
     pub(super) _ui_model_subscription: gpui::Subscription,
     pub(super) _activation_subscription: gpui::Subscription,
+    pub(super) _window_bounds_subscription: gpui::Subscription,
     pub(super) _appearance_subscription: gpui::Subscription,
     pub(super) _terminal_keystroke_interceptor: gpui::Subscription,
     pub(super) _auth_prompt_username_input_subscription: gpui::Subscription,
     pub(super) _auth_prompt_secret_input_subscription: gpui::Subscription,
+    pub(super) _toast_errors_subscription: gpui::Subscription,
     pub(super) _open_repo_input_subscription: gpui::Subscription,
+    pub(super) _home_search_input_subscription: gpui::Subscription,
     pub(super) view_mode: GitCometViewMode,
+    pub(super) workspace_id: Option<gitcomet_state::session::WorkspaceId>,
+    pub(super) persisted_workspace_repo_paths: Vec<std::path::PathBuf>,
+    pub(super) persisted_workspace_active_repository: Option<std::path::PathBuf>,
+    pub(super) window_placement: Option<gitcomet_state::session::PortableWindowPlacement>,
+    pub(super) native_window_title: String,
+    /// Always the global preference; the override lives beside it.
     pub(super) theme_mode: ThemeMode,
+    /// The window's workspace theme, winning over `theme_mode` when set.
+    pub(super) workspace_theme_mode: Option<ThemeMode>,
+    /// Cached so the theme can be re-resolved from snapshot paths with no `Window`.
+    pub(super) window_appearance: gpui::WindowAppearance,
     pub(super) theme: AppTheme,
     pub(super) title_bar: Entity<TitleBarView>,
     pub(super) sidebar_pane: Entity<SidebarPaneView>,
@@ -1009,6 +1047,17 @@ pub struct GitCometView {
     pub(super) repo_tabs_bar: Entity<RepoTabsBarView>,
     pub(super) action_bar: Entity<ActionBarView>,
     pub(super) bottom_status_bar: Entity<BottomStatusBarView>,
+    /// Present only when an extension is registered.
+    pub(super) window_gates: Option<super::window_gates::WindowGates>,
+    pub(super) window_gated: bool,
+    pub(super) extension_window: Option<super::extension_host::ExtensionWindow>,
+    /// Present only when an extension registers a repository view.
+    pub(super) repository_views: Option<super::repository_views::RepositoryViewRouter>,
+    /// Present only when an extension registers a details tab.
+    pub(super) details_tabs:
+        Option<super::repository_views::ViewRouter<gitcomet_extension_api::DetailsTabDescriptor>>,
+    /// Present only when an extension registers a sidebar section.
+    pub(super) sidebar_sections: Option<super::repository_views::SidebarSections>,
     pub(super) tooltip_host: Entity<TooltipHost>,
     pub(super) toast_host: Entity<ToastHost>,
     pub(super) history_refs_hover_host: Entity<HistoryRefsHoverHost>,
@@ -1021,9 +1070,12 @@ pub struct GitCometView {
     /// Focus to hand back when an overlay opened from a background window
     /// closes. Shared by the command palette and the Reveal Commit dialog.
     pub(super) pre_palette_focus: Option<FocusHandle>,
+    pub(super) focused_diff_pane: Option<gitcomet_extension_api::DiffPane>,
     pub(super) focused_mergetool_bootstrap: Option<FocusedMergetoolBootstrap>,
     pub(super) submodule_diff_bootstrap: Option<SubmoduleDiffBootstrap>,
     pub(super) deferred_repo_bootstrap: Option<DeferredRepoBootstrap>,
+    pub(super) pending_repo_open_reservations: FxHashMap<std::path::PathBuf, PendingRepoOpen>,
+    pub(super) pending_repo_open_active: Option<std::path::PathBuf>,
     pub(super) startup_repo_bootstrap_pending: bool,
     pub(super) splash_backdrop_image: Arc<gpui::Image>,
 
@@ -1033,6 +1085,9 @@ pub struct GitCometView {
     /// repo list changes rather than collected on every store snapshot.
     pub(super) synced_repo_paths: std::sync::Arc<[std::path::PathBuf]>,
     pub(super) ui_settings_persist_seq: u64,
+    pub(super) workspace_persist_seq: u64,
+    #[cfg(test)]
+    pub(super) ui_settings_persist_requests_for_test: u64,
     pub(super) last_repo_activation_dispatch_at: FxHashMap<RepoId, Instant>,
     /// Set when a deactivation was caused by a move/resize grab we requested, so
     /// the matching re-activation does not trigger a repo refresh.
@@ -1041,12 +1096,15 @@ pub struct GitCometView {
     pub(super) signing_tools_probe_seq: u64,
     pub(super) signing_tools_probe_in_flight: bool,
     pub(super) signing_tools_probe_cancellation: gitcomet_core::services::CancellationToken,
+    /// Background `git lfs` / `git annex` detection; rerun after a Git change.
+    pub(super) large_file_tools_probe_in_flight: bool,
 
     pub(super) date_time_format: DateTimeFormat,
     pub(super) timezone: Timezone,
     pub(super) show_timezone: bool,
     pub(super) change_tracking_view: ChangeTrackingView,
     pub(super) file_list_layout: FileListLayout,
+    pub(super) file_list_sort: crate::view::rows::CommitFileSort,
     pub(super) terminal_preferences: TerminalPreferences,
     pub(super) terminal_sessions: FxHashMap<RepoId, RepoTerminalSession>,
     pub(super) terminal_panel_height: Pixels,
@@ -1064,6 +1122,7 @@ pub struct GitCometView {
     /// Which of the bottom panel's contents is currently visible for a repo,
     /// when more than one is open. Absent (and single-panel repos) fall back
     /// to whichever panel is actually open.
+    pub(super) bottom_panel_providers: super::bottom_panel_providers::Providers,
     pub(super) active_bottom_panel: FxHashMap<RepoId, BottomPanelTab>,
     pub(super) commit_push_after_enabled: bool,
     pub(super) diff_scroll_sync: DiffScrollSync,
@@ -1073,6 +1132,7 @@ pub struct GitCometView {
     pub(super) annotate_enabled: bool,
     pub(super) diff_reveal_whitespace_chars: bool,
     pub(super) diff_word_wrap: bool,
+    pub(super) diff_tab_size: u8,
     pub(super) diff_show_line_numbers: bool,
     pub(super) auto_save_file_edits: bool,
     pub(super) remote_markdown_image_policy: RemoteMarkdownImagePolicy,
@@ -1084,12 +1144,28 @@ pub struct GitCometView {
 
     pub(super) open_repo_panel: bool,
     pub(super) open_repo_input: Entity<components::TextInput>,
+    pub(super) home_search_input: Entity<components::TextInput>,
+    pub(super) home_search_query: String,
+    pub(super) home_rows: super::home::HomeRows,
+    /// Index into `home_rows` in keyboard order (workspaces, then repositories).
+    pub(super) home_selected: Option<usize>,
+    pub(super) home_workspaces_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_repositories_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_pinned_repos: Vec<std::path::PathBuf>,
+    pub(super) home_recent_repos: Vec<std::path::PathBuf>,
     pub(super) external_drag_paths: Option<gpui::ExternalPaths>,
+    pub(super) file_operations: file_operations::FileOperationsUi,
+    pub(super) documents: Entity<documents::DocumentsView>,
+    pub(super) document_picker: Entity<documents::DocumentPicker>,
+    pub(super) documents_active: bool,
+    pub(super) document_routing: documents::Routing,
     pub(super) external_drag_payload: Option<external_drag::ClassifiedExternalPaths>,
     pub(super) external_drag_classification_seq: u64,
     pub(super) external_drag_drop_pending: bool,
 
     pub(super) hover_resize_edge: Option<ResizeEdge>,
+    /// The decorations the last render saw; see `sync_frame_decorations`.
+    pub(super) frame_decorations: Option<gpui::Decorations>,
 
     pub(super) sidebar_collapsed: bool,
     /// Which sidebar section is currently shown in the collapsed-rail popover, if
@@ -1117,10 +1193,12 @@ pub struct GitCometView {
 
     pub(super) last_mouse_pos: Point<Pixels>,
     pub(super) pending_terminal_shutdown_prompt: Option<TerminalShutdownPrompt>,
+    pub(super) pending_close_guard_prompt: Option<CloseGuardPrompt>,
     pub(super) pending_unsaved_file_edits_prompt: Option<UnsavedFileEditsPrompt>,
     /// Waits for the dispatched writes to drain before the close/quit it was
     /// asked to retry.
     pub(super) pending_unsaved_file_edits_flush: Option<gpui::Task<()>>,
+    pub(super) pending_file_edits_action: Option<UnsavedFileEditsAction>,
     pub(super) pending_quit_other_views: Vec<gpui::WeakEntity<GitCometView>>,
     pub(super) pending_pull_reconcile_prompt: Option<RepoId>,
     pub(super) pending_branch_exists_prompt: Option<BranchExistsPromptState>,
@@ -1149,7 +1227,6 @@ pub struct GitCometView {
     #[cfg(target_os = "macos")]
     pub(super) recent_repos_menu_fingerprint: Vec<std::path::PathBuf>,
 
-    pub(super) error_banner_input: Entity<components::TextInput>,
     pub(super) auth_prompt_username_input: Entity<components::TextInput>,
     pub(super) auth_prompt_secret_input: Entity<components::TextInput>,
     pub(super) auth_prompt_key: Option<String>,

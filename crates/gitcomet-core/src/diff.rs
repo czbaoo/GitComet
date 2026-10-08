@@ -136,9 +136,13 @@ pub fn unified_diff_file_path<'a>(
             }
         } else if line.starts_with("--- ") {
             old_path = old_path.or_else(|| parse_unified_path_header(line));
-        } else if let Some(rest) = line.strip_prefix("rename to ") {
-            // A rename with no content change has no `---`/`+++` pair at all.
-            // Unlike those, this name is written bare, with no `a/` or `b/`.
+        } else if let Some(rest) = line
+            .strip_prefix("rename to ")
+            .or_else(|| line.strip_prefix("copy to "))
+        {
+            // A rename or copy with no content change has no `---`/`+++` pair
+            // at all. Unlike those, this name is written bare, with no `a/` or
+            // `b/`.
             rename_to = rename_to.or_else(|| Some(unquote_git_path(rest)));
         }
     }
@@ -236,57 +240,14 @@ fn unquote_git_path(name: &str) -> String {
 /// Decodes a leading C-quoted name as written by git's `quote_c_style`, and
 /// returns it together with whatever follows the closing quote.
 fn split_quoted_git_path(text: &str) -> Option<(String, &str)> {
-    let bytes = text.as_bytes();
-    if bytes.first() != Some(&b'"') {
+    if !text.starts_with('"') {
         return None;
     }
-
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut ix = 1usize;
-    while ix < bytes.len() {
-        match bytes[ix] {
-            b'"' => {
-                let rest = text.get(ix + 1..)?;
-                return Some((String::from_utf8_lossy(&out).into_owned(), rest));
-            }
-            b'\\' => {
-                ix += 1;
-                let escape = *bytes.get(ix)?;
-                match escape {
-                    b'a' => out.push(0x07),
-                    b'b' => out.push(0x08),
-                    b'f' => out.push(0x0c),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
-                    b'v' => out.push(0x0b),
-                    b'0'..=b'7' => {
-                        // Up to three octal digits, as git emits them.
-                        let mut value = u32::from(escape - b'0');
-                        let mut digits = 1;
-                        while digits < 3
-                            && let Some(next) = bytes.get(ix + 1)
-                            && (b'0'..=b'7').contains(next)
-                        {
-                            value = value * 8 + u32::from(next - b'0');
-                            ix += 1;
-                            digits += 1;
-                        }
-                        out.push(u8::try_from(value).ok()?);
-                    }
-                    other => out.push(other),
-                }
-                ix += 1;
-            }
-            other => {
-                out.push(other);
-                ix += 1;
-            }
-        }
-    }
-
-    // Unterminated quote: not something git produces.
-    None
+    let (decoded, consumed) = gix_quote::ansi_c::undo(text.as_bytes().into()).ok()?;
+    Some((
+        String::from_utf8_lossy(&decoded).into_owned(),
+        text.get(consumed..)?,
+    ))
 }
 
 #[cfg(test)]
@@ -296,12 +257,25 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn git_quoted_paths_decode_controls_and_keep_the_remaining_header() {
+        assert_eq!(
+            split_quoted_git_path(r#""a/\303\244\t\n\"\\\377" b/other"#),
+            Some(("a/ä\t\n\"\\\u{fffd}".into(), " b/other"))
+        );
+        assert_eq!(
+            split_quoted_git_path(r#""" suffix"#),
+            Some((String::new(), " suffix"))
+        );
+        for malformed in [r#""unterminated"#, r#""bad\q""#, r#""bad\40""#] {
+            assert!(split_quoted_git_path(malformed).is_none());
+            assert_eq!(unquote_git_path(malformed), malformed);
+        }
+    }
+
+    #[test]
     fn annotate_tracks_line_numbers_through_hunks() {
         let diff = Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs
 index 1111111..2222222 100644
@@ -452,6 +426,23 @@ index 1e0101a..313043d 100644
 ",
             ),
             Some("src/rules - Copy.rs".to_string())
+        );
+    }
+
+    /// Copy detection (`-C`) writes `copy from`/`copy to` where a rename
+    /// writes `rename from`/`rename to`.
+    #[test]
+    fn file_path_reads_a_pure_copy() {
+        assert_eq!(
+            file_path_of(
+                "\
+diff --git a/old name.txt b/new name.txt
+similarity index 100%
+copy from old name.txt
+copy to new name.txt
+",
+            ),
+            Some("new name.txt".to_string())
         );
     }
 

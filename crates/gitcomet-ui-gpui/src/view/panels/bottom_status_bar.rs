@@ -3,8 +3,8 @@ use crate::kit::interaction as controls;
 use crate::view::components::{ControlInteractionExt, InteractionState, InteractionStyle};
 
 /// Slimmer than the tab-bar slot the bottom bar used to borrow; it hosts the
-/// pane collapse toggles, the zoom control and the branding strip on one shared
-/// centerline, so every saved pixel goes to the content area.
+/// pane collapse toggles, the window's zoom control and the branding strip on
+/// one shared centerline, so every saved pixel goes to the content area.
 const BOTTOM_STATUS_BAR_HEIGHT_PX: f32 = 26.0;
 /// The bar and its chips are chrome like the title bar, so they take the
 /// density ramp.
@@ -13,8 +13,20 @@ const BOTTOM_STATUS_BAR_ITEM_HEIGHT_PX: f32 = 18.0;
 const BOTTOM_STATUS_BAR_ITEM_COMFORTABLE_HEIGHT_PX: f32 = 26.0;
 const PANE_TOGGLE_ICON_SIZE_PX: f32 = 16.0;
 
+/// The bar's height. It is mounted behind a stable cache boundary, which needs
+/// the height before the bar renders; the bar draws itself at the same height.
+pub(in super::super) fn bottom_status_bar_height<C>(cx: &mut C) -> Pixels
+where
+    C: std::borrow::BorrowMut<gpui::App>,
+{
+    crate::ui_scale::UiScale::current(cx).row_height(
+        BOTTOM_STATUS_BAR_HEIGHT_PX,
+        BOTTOM_STATUS_BAR_COMFORTABLE_HEIGHT_PX,
+    )
+}
+
 fn pro_launch_label(today: jiff::civil::Date) -> SharedString {
-    let launch_date = jiff::civil::date(2026, 10, 7);
+    let launch_date = jiff::civil::date(2026, 11, 9);
     let days = today.duration_until(launch_date).as_secs() / 86_400;
     match days {
         1 => "Pro launches in 1 day".into(),
@@ -82,6 +94,13 @@ pub(in super::super) struct BottomStatusBarView {
     active_context_menu_invoker: Option<SharedString>,
     minimized_hook_activity_repos: rustc_hash::FxHashSet<RepoId>,
     pro_launch_label: SharedString,
+    /// Extension status items in registration order, built once the window
+    /// has opened. Empty without extensions.
+    extension_items: Vec<(Option<gitcomet_extension_api::ViewTarget>, gpui::AnyView)>,
+    active_view: gitcomet_extension_api::ViewTarget,
+    edition_strip: Option<gpui::AnyView>,
+    #[cfg(any(test, feature = "benchmarks"))]
+    pub(in crate::view) render_count: usize,
 }
 
 impl BottomStatusBarView {
@@ -96,8 +115,11 @@ impl BottomStatusBarView {
             let previous_summary = Self::hook_activity_summary(&this.state);
             let next = Arc::clone(&model.read(cx).state);
             let next_summary = Self::hook_activity_summary(&next);
+            let filesystem_changed = next.filesystem.pending.len()
+                != this.state.filesystem.pending.len()
+                || next.filesystem.progress != this.state.filesystem.progress;
             this.state = next;
-            if next_summary != previous_summary {
+            if next_summary != previous_summary || filesystem_changed {
                 cx.notify();
             }
         });
@@ -110,7 +132,46 @@ impl BottomStatusBarView {
             minimized_hook_activity_repos: Default::default(),
             // Use local calendar days and keep the startup label for this window.
             pro_launch_label: pro_launch_label(jiff::Zoned::now().date()),
+            extension_items: Vec::new(),
+            active_view: gitcomet_extension_api::ViewTarget::History,
+            edition_strip: None,
+            #[cfg(any(test, feature = "benchmarks"))]
+            render_count: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn extension_item_count(&self) -> usize {
+        self.extension_items.len()
+    }
+
+    pub(in super::super) fn set_extension_items(
+        &mut self,
+        items: Vec<(Option<gitcomet_extension_api::ViewTarget>, gpui::AnyView)>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.extension_items = items;
+        cx.notify();
+    }
+
+    pub(in crate::view) fn set_active_view(
+        &mut self,
+        view: gitcomet_extension_api::ViewTarget,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.active_view != view {
+            self.active_view = view;
+            cx.notify();
+        }
+    }
+
+    pub(in crate::view) fn set_edition_strip(
+        &mut self,
+        view: Option<gpui::AnyView>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.edition_strip = view;
+        cx.notify();
     }
 
     fn hook_activity_summary(state: &AppState) -> (Option<RepoId>, usize, bool) {
@@ -122,7 +183,9 @@ impl BottomStatusBarView {
                     repo.feedback
                         .hook_activity
                         .iter()
-                        .filter(|operation| operation.has_hooks() && operation.status.is_active())
+                        .filter(|operation| {
+                            operation.is_reportable() && operation.status.is_active()
+                        })
                         .count(),
                     repo.feedback.hook_activity.iter().rev().any(|operation| {
                         matches!(
@@ -195,21 +258,27 @@ impl BottomStatusBarView {
 
 impl Render for BottomStatusBarView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        #[cfg(any(test, feature = "benchmarks"))]
+        {
+            self.render_count += 1;
+        }
         let theme = self.theme;
+        let filesystem_pending = self
+            .root_view
+            .upgrade()
+            .is_some_and(|root| root.read(cx).file_operations.has_pending());
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
         let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
+
+        // Zoom is per window, so it lives in the window's own footer. It shows
+        // the percent only once this window is zoomed away from the default.
         let zoom_picker_invoker: SharedString = "ui_scale_picker".into();
         let zoom_picker_active = self
             .active_context_menu_invoker
             .as_ref()
             .is_some_and(|id| id.as_ref() == zoom_picker_invoker.as_ref());
-        let zoom_button_bg = components::control_open_background(theme);
-        let zoom_label = if ui_scale_percent == crate::ui_scale::DEFAULT_UI_SCALE_PERCENT {
-            String::new()
-        } else {
-            crate::ui_scale::label(ui_scale_percent)
-        };
-
+        let zoomed = crate::ui_scale::window_override(cx, window.window_handle().window_id());
+        let zoom_label = zoomed.map(crate::ui_scale::label).unwrap_or_default();
         let zoom_icon_color = if zoom_picker_active {
             theme.colors.accent.foreground
         } else {
@@ -232,7 +301,7 @@ impl Render for BottomStatusBarView {
             .borderless()
             .no_hover_border()
             .open(zoom_picker_active)
-            .selected_bg(zoom_button_bg)
+            .selected_bg(components::control_open_background(theme))
             .on_click_with_bounds(theme, cx, move |this, _e, bounds, window, cx| {
                 this.open_popover_for_bounds(
                     PopoverKind::UiScalePicker.invoked_by(zoom_picker_invoker.clone()),
@@ -241,7 +310,7 @@ impl Render for BottomStatusBarView {
                     cx,
                 );
             })
-            .gitcomet_tooltip(theme, "Adjust zoom".into())
+            .gitcomet_tooltip(theme, "Zoom this window".into())
             .debug_selector(|| "bottom_status_bar_zoom".to_string());
 
         // Pane collapse toggles live here (not floating inside the panes) so
@@ -378,76 +447,84 @@ impl Render for BottomStatusBarView {
 
         // Branding strip: the edition badge moved down here from the title bar,
         // where it crowded the repository tabs.
-        let discord_badge = status_bar_chip(
-            "bottom_status_bar_discord",
-            theme.colors.accent.foreground,
-            ui_scale_percent,
-            theme,
-        )
-        .child(
-            gpui::svg()
-                .path("icons/discord.svg")
-                .w(scaled_px(12.0))
-                .h(scaled_px(12.0))
-                .flex_shrink_0()
-                .text_color(theme.colors.foreground.secondary)
-                .group_hover("bottom_status_bar_discord", move |s| {
-                    s.text_color(theme.colors.accent.foreground)
+        let name = crate::view::product_name();
+        let discord_badge = crate::view::community_url().map(|url| {
+            status_bar_chip(
+                "bottom_status_bar_discord",
+                theme.colors.accent.foreground,
+                ui_scale_percent,
+                theme,
+            )
+            .child(
+                gpui::svg()
+                    .path("icons/discord.svg")
+                    .w(scaled_px(12.0))
+                    .h(scaled_px(12.0))
+                    .flex_shrink_0()
+                    .text_color(theme.colors.foreground.secondary)
+                    .group_hover("bottom_status_bar_discord", move |s| {
+                        s.text_color(theme.colors.accent.foreground)
+                    }),
+            )
+            .on_activate(
+                false,
+                controls::ControlActivation::Action,
+                cx.listener(move |_this, _e: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    crate::view::platform_open::open_url_later(url, cx);
                 }),
-        )
-        .on_activate(
-            false,
-            controls::ControlActivation::Action,
-            cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                cx.open_url(DISCORD_URL);
-            }),
-        )
-        .gitcomet_tooltip(theme, "Join the GitComet Discord".into());
+            )
+            .gitcomet_tooltip(theme, format!("Join the {name} Discord").into())
+        });
 
-        let free_badge = status_bar_chip(
-            "bottom_status_bar_free_badge",
-            theme.colors.accent.foreground,
-            ui_scale_percent,
-            theme,
-        )
-        .text_size(theme.ui_text(11.0))
-        .line_height(scaled_px(theme.metrics.ui_text(12.0)))
-        .font_weight(FontWeight::NORMAL)
-        .text_color(with_alpha(
-            theme.colors.foreground.primary,
-            if theme.is_dark { 0.72 } else { 0.62 },
-        ))
-        .on_activate(
-            false,
-            controls::ControlActivation::Action,
-            cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                cx.open_url(EDITIONS_URL);
-            }),
-        )
-        .gitcomet_tooltip(theme, "See GitComet editions".into())
-        .child("FREE");
+        let editions = crate::view::editions_url();
+        let free_badge = editions.map(|url| {
+            status_bar_chip(
+                "bottom_status_bar_free_badge",
+                theme.colors.accent.foreground,
+                ui_scale_percent,
+                theme,
+            )
+            .text_size(theme.ui_text(11.0))
+            .line_height(scaled_px(theme.metrics.ui_text(12.0)))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(with_alpha(
+                theme.colors.foreground.primary,
+                if theme.is_dark { 0.72 } else { 0.62 },
+            ))
+            .on_activate(
+                false,
+                controls::ControlActivation::Action,
+                cx.listener(move |_this, _e: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    crate::view::platform_open::open_url_later(url, cx);
+                }),
+            )
+            .gitcomet_tooltip(theme, format!("See {name} editions").into())
+            .child("FREE")
+        });
 
-        let pro_link = status_bar_chip(
-            "bottom_status_bar_pro_link",
-            theme.colors.accent.foreground,
-            ui_scale_percent,
-            theme,
-        )
-        .text_size(theme.ui_text(11.0))
-        .line_height(scaled_px(theme.metrics.ui_text(12.0)))
-        .text_color(theme.colors.foreground.secondary)
-        .on_activate(
-            false,
-            controls::ControlActivation::Action,
-            cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                cx.open_url(EDITIONS_URL);
-            }),
-        )
-        .gitcomet_tooltip(theme, "See GitComet Pro".into())
-        .child(self.pro_launch_label.clone());
+        let pro_link = editions.map(|url| {
+            status_bar_chip(
+                "bottom_status_bar_pro_link",
+                theme.colors.accent.foreground,
+                ui_scale_percent,
+                theme,
+            )
+            .text_size(theme.ui_text(11.0))
+            .line_height(scaled_px(theme.metrics.ui_text(12.0)))
+            .text_color(theme.colors.foreground.secondary)
+            .on_activate(
+                false,
+                controls::ControlActivation::Action,
+                cx.listener(move |_this, _e: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    crate::view::platform_open::open_url_later(url, cx);
+                }),
+            )
+            .gitcomet_tooltip(theme, format!("See {name} Pro").into())
+            .child(self.pro_launch_label.clone())
+        });
 
         // GPUI paints an SVG as a mask tinted by the text color, so the mark's
         // own brand blue never reaches the screen. Apply that blue explicitly
@@ -468,29 +545,32 @@ impl Render for BottomStatusBarView {
             .text_color(theme.colors.foreground.secondary)
             .tab_index(0)
             .control_interaction(InteractionStyle::link(theme), InteractionState::default())
-            .child(svg_icon(
-                "icons/gitcomet_mark.svg",
-                gpui::rgb(0x5ac1fe),
-                scaled_px(13.0),
-            ))
+            .child(brand_mark(scaled_px(13.0)))
             .child(
                 div()
                     .debug_selector(|| "bottom_status_bar_brand".to_string())
                     .text_size(theme.ui_text(11.0))
                     .line_height(scaled_px(theme.metrics.ui_text(12.0)))
-                    .child("GitComet"),
+                    .child(name),
             )
-            .on_activate(
-                false,
-                controls::ControlActivation::Action,
-                cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    cx.open_url(WEBSITE_URL);
-                }),
-            )
-            .gitcomet_tooltip(theme, "Open gitcomet.dev".into());
+            .when_some(crate::view::website_url(), |brand, url| {
+                brand
+                    .on_activate(
+                        false,
+                        controls::ControlActivation::Action,
+                        cx.listener(move |_this, _e: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            crate::view::platform_open::open_url_later(url, cx);
+                        }),
+                    )
+                    .gitcomet_tooltip(
+                        theme,
+                        format!("Open {}", url.trim_start_matches("https://")).into(),
+                    )
+            });
 
-        let version_label: SharedString = format!("v{}", env!("CARGO_PKG_VERSION")).into();
+        let version_label: SharedString =
+            format!("v{}", gitcomet_core::identity::current().version()).into();
         let version_link = div()
             .id("bottom_status_bar_version")
             .debug_selector(|| "bottom_status_bar_version".to_string())
@@ -502,24 +582,23 @@ impl Render for BottomStatusBarView {
             .text_color(theme.colors.foreground.secondary)
             .tab_index(0)
             .control_interaction(InteractionStyle::link(theme), InteractionState::default())
-            .on_activate(
-                false,
-                controls::ControlActivation::Action,
-                cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    cx.open_url(RELEASES_URL);
-                }),
-            )
-            .gitcomet_tooltip(theme, "View GitComet releases".into())
+            .when_some(crate::view::releases_url(), |link, url| {
+                link.on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |_this, _e: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        crate::view::platform_open::open_url_later(url, cx);
+                    }),
+                )
+                .gitcomet_tooltip(theme, format!("View {name} releases").into())
+            })
             .child(version_label);
 
         div()
             .id("bottom_status_bar")
             .w_full()
-            .h(scaled_px(theme.metrics.row_height(
-                BOTTOM_STATUS_BAR_HEIGHT_PX,
-                BOTTOM_STATUS_BAR_COMFORTABLE_HEIGHT_PX,
-            )))
+            .h(bottom_status_bar_height(cx))
             .flex_none()
             .flex()
             .items_center()
@@ -538,31 +617,121 @@ impl Render for BottomStatusBarView {
                     .flex()
                     .items_center()
                     .gap(scaled_px(2.0))
-                    .child(sidebar_toggle),
+                    .child(sidebar_toggle)
+                    .when(filesystem_pending, |d| {
+                        d.child(
+                            components::Button::new(
+                                "filesystem_progress",
+                                self.state
+                                    .filesystem
+                                    .progress
+                                    .as_ref()
+                                    .map(|p| {
+                                        format!(
+                                            "Files: {}/{} · Cancel",
+                                            p.completed_items, p.total_items
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "Files: waiting · Cancel".into()),
+                            )
+                            .borderless()
+                            .style(components::ButtonStyle::Subtle)
+                            .on_click(theme, cx, |this, _, _, cx| {
+                                let _ = this
+                                    .root_view
+                                    .update(cx, |root, cx| root.cancel_filesystem_operations(cx));
+                            }),
+                        )
+                    }),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(scaled_px(2.0))
+                    // Extension indicators sit with the host's own status
+                    // controls, never between the branding chips.
+                    .children(
+                        self.extension_items
+                            .iter()
+                            .filter(|(view, _)| {
+                                view.as_ref().is_none_or(|view| view == &self.active_view)
+                            })
+                            .map(|(_, view)| view.clone()),
+                    )
                     .child(details_toggle)
                     .child(hook_activity_button)
+                    .child({
+                        let (documents_shown, picker_open) = self
+                            .root_view
+                            .upgrade()
+                            .map(|root| {
+                                let root = root.read(cx);
+                                (root.documents_active, root.document_picker_open(cx))
+                            })
+                            .unwrap_or_default();
+                        components::Button::new("bottom_documents", "")
+                            .start_slot(svg_icon(
+                                "icons/file.svg",
+                                theme.colors.foreground.secondary,
+                                scaled_px(16.),
+                            ))
+                            .selected(documents_shown)
+                            .open(picker_open)
+                            .style(components::ButtonStyle::Subtle)
+                            .borderless()
+                            .on_click_with_bounds(theme, cx, |this, _, bounds, window, cx| {
+                                let _ = this.root_view.update(cx, |root, cx| {
+                                    root.toggle_document_picker(bounds, window, cx)
+                                });
+                            })
+                            .gitcomet_tooltip(theme, "Open a file…".into())
+                            .debug_selector(|| "bottom_documents".into())
+                    })
                     .child(zoom_button)
-                    .child(
-                        // Branding chips want more air between them than the
-                        // toggles, which read as one control group.
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(scaled_px(6.0))
-                            .pl(scaled_px(6.0))
-                            .child(discord_badge)
-                            .child(free_badge)
-                            .child(pro_link)
-                            .child(brand)
-                            .child(version_link),
-                    ),
+                    .children(self.edition_strip.clone())
+                    .when(self.edition_strip.is_none(), |row| {
+                        row.child(
+                            // Branding chips want more air between them than the
+                            // toggles, which read as one control group.
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(scaled_px(6.0))
+                                .pl(scaled_px(6.0))
+                                .children(discord_badge)
+                                .children(free_badge)
+                                .children(pro_link)
+                                .child(brand)
+                                .child(version_link)
+                                .when(cfg!(debug_assertions), |row| {
+                                    row.child(
+                                        div()
+                                            .id("build_dev_badge")
+                                            .text_size(theme.ui_text(10.0))
+                                            .child("DEV"),
+                                    )
+                                }),
+                        )
+                    }),
             )
+    }
+}
+
+/// The product's mark beside its name: a branded mark keeps its own colours;
+/// GitComet's is a tinted mask.
+fn brand_mark(size: Pixels) -> AnyElement {
+    if gitcomet_core::identity::current()
+        .branding()
+        .mark_svg
+        .is_some()
+    {
+        gpui::img("brand/mark.svg")
+            .size(size)
+            .flex_none()
+            .into_any_element()
+    } else {
+        svg_icon("brand/mark.svg", gpui::rgb(0x5ac1fe), size).into_any_element()
     }
 }
 
@@ -575,14 +744,15 @@ mod tests {
         use jiff::civil::date;
 
         for (today, expected) in [
-            (date(2026, 9, 7), "Pro launches in 30 days"),
-            (date(2026, 9, 8), "Pro launches in 29 days"),
-            (date(2026, 10, 6), "Pro launches in 1 day"),
-            (date(2026, 10, 7), "Get Pro!"),
-            (date(2026, 10, 8), "Get Pro!"),
-            (date(2026, 6, 29), "Pro launches in 100 days"),
-            (date(2026, 6, 28), "Get Pro!"),
-            (date(2025, 10, 7), "Get Pro!"),
+            (date(2026, 10, 7), "Pro launches in 33 days"),
+            (date(2026, 10, 10), "Pro launches in 30 days"),
+            (date(2026, 10, 11), "Pro launches in 29 days"),
+            (date(2026, 11, 8), "Pro launches in 1 day"),
+            (date(2026, 11, 9), "Get Pro!"),
+            (date(2026, 11, 10), "Get Pro!"),
+            (date(2026, 8, 1), "Pro launches in 100 days"),
+            (date(2026, 7, 31), "Get Pro!"),
+            (date(2025, 11, 9), "Get Pro!"),
         ] {
             assert_eq!(pro_launch_label(today).as_ref(), expected, "{today}");
         }

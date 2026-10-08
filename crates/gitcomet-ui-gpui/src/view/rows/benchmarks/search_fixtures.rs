@@ -406,10 +406,8 @@ pub struct InDiffTextSearchFixture {
 impl InDiffTextSearchFixture {
     pub fn new(lines: usize) -> Self {
         let total_lines = lines.max(1);
-        let target = DiffTarget::WorkingTree {
-            path: std::path::PathBuf::from("src/lib.rs"),
-            area: DiffArea::Unstaged,
-        };
+        let target =
+            DiffTarget::working_tree(std::path::PathBuf::from("src/lib.rs"), DiffArea::Unstaged);
         let text = build_synthetic_diff_search_unified_patch(total_lines);
         let diff = Arc::new(Diff::from_unified(target, text.as_str()));
         let visible_line_indices = diff
@@ -943,9 +941,9 @@ fn lowercase_subsequence_match_end(haystack: &[u8], needle: &[u8]) -> Option<usi
     let mut offset = 0usize;
     for &needle_byte in needle {
         let remaining = &haystack[offset..];
-        match memchr::memchr(needle_byte, remaining) {
-            Some(pos) => offset += pos + 1,
-            None => return None,
+        {
+            let pos = memchr::memchr(needle_byte, remaining)?;
+            offset += pos + 1
         }
     }
 

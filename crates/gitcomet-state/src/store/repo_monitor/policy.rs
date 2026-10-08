@@ -11,7 +11,13 @@ pub(super) enum PathClass {
     Control,
     ControlEntry,
     Index,
-    Git { tags: bool },
+    Git {
+        tags: bool,
+    },
+    /// git-annex support metadata, or a directory that holds it.
+    AnnexSupport {
+        directory: bool,
+    },
     Excluded,
     Worktree,
     Outside,
@@ -47,6 +53,7 @@ impl PolicySnapshot {
         for root in &policy.git_roots {
             policy.cache_roots.insert(root.join("index.lock"));
             policy.tag_roots.insert(root.join("refs/tags"));
+            policy.tag_roots.insert(root.join("reftable"));
             policy.packed_refs.insert(root.join("packed-refs"));
         }
         for path in &inputs.inputs {
@@ -68,6 +75,11 @@ impl PolicySnapshot {
     /// One allocation-free ancestors walk, with cache precedence even for
     /// explicitly configured inputs inside private Git/LFS storage.
     pub fn classify(&self, path: &Path) -> PathClass {
+        // Filesystem service staging (save temp files, undo areas) is not a change;
+        // the final rename onto the target still arrives under its own path.
+        if gitcomet_core::path_utils::has_service_owned_component(path) {
+            return PathClass::Cache;
+        }
         let mut git = false;
         let mut tags = self.packed_refs.contains(path);
         let mut excluded = false;
@@ -93,6 +105,19 @@ impl PolicySnapshot {
                 .is_some_and(|name| name.as_encoded_bytes().starts_with(b".watchman-cookie-"))
         {
             return PathClass::Cache;
+        }
+        if git
+            && let Some(class) = self
+                .git_roots
+                .iter()
+                .find_map(|root| gitcomet_core::annex::watch_path(path.strip_prefix(root).ok()?))
+        {
+            use gitcomet_core::annex::WatchPath;
+            return match class {
+                WatchPath::Private => PathClass::Cache,
+                WatchPath::Directory => PathClass::AnnexSupport { directory: true },
+                WatchPath::Support => PathClass::AnnexSupport { directory: false },
+            };
         }
         if self.control_files.contains(path) {
             PathClass::Control
@@ -275,8 +300,12 @@ impl WatchInputs {
         let info = backend.repository_watch_info(workdir)?.unwrap_or_else(|| {
             let mut info = RepositoryWatchInfo::default();
             if let Some(root) = root_git {
-                info.cache_dirs
-                    .extend([root.join("objects"), root.join("lfs")]);
+                info.cache_dirs.extend(
+                    ["objects", "lfs"]
+                        .into_iter()
+                        .chain(gitcomet_core::annex::WATCH_PRIVATE_DIRS)
+                        .map(|name| root.join(name)),
+                );
                 info.ignore_inputs
                     .extend([root.join("config"), root.join("info/exclude")]);
                 info.git_dirs.push(root);
@@ -477,10 +506,9 @@ mod tests {
         let destination = root.join("destination");
         fs::create_dir_all(destination.join("child")).unwrap();
         let link = root.join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(destination.join("child"), &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(destination.join("child"), &link).unwrap();
+        if !gitcomet_core::test_support::symlink::directory(destination.join("child"), &link) {
+            return;
+        }
         let direct = root.join("ignore");
         let mut links = Vec::new();
         let mut incomplete = false;

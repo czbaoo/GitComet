@@ -151,10 +151,7 @@ fn selecting_the_working_tree_preserves_a_file_preview_when_following(
     ] {
         let repo_id = RepoId(1);
         let commit_id = CommitId("tip".into());
-        let target = DiffTarget::Commit {
-            commit_id: commit_id.clone(),
-            path: Some(PathBuf::from("src/lib.rs")),
-        };
+        let target = DiffTarget::commit(commit_id.clone(), PathBuf::from("src/lib.rs"));
         let mut repo = RepoState::new_opening(
             repo_id,
             RepoSpec {
@@ -1082,11 +1079,14 @@ fn history_refs_hover_lists_refs_and_opens_item_menus_in_mode(
         gpui::MouseButton::Right,
         gpui::Modifiers::default(),
     );
-    cx.simulate_mouse_up(
-        combined_chip_point,
-        gpui::MouseButton::Right,
+    let moved = combined_chip_point + point(px(1.0), px(1.0));
+    cx.simulate_mouse_move(
+        moved,
+        Some(gpui::MouseButton::Right),
         gpui::Modifiers::default(),
     );
+    redraw(cx);
+    cx.simulate_mouse_up(moved, gpui::MouseButton::Right, gpui::Modifiers::default());
     cx.run_until_parked();
     redraw(cx);
     cx.update(|_window, app| {
@@ -1508,6 +1508,15 @@ fn history_refs_hover_lists_refs_and_opens_item_menus_in_mode(
 
 #[gpui::test]
 fn history_row_selection_requires_a_completed_click(cx: &mut gpui::TestAppContext) {
+    history_row_click_and_drag(cx, false);
+}
+
+#[gpui::test]
+fn cached_history_row_selection_requires_a_completed_click(cx: &mut gpui::TestAppContext) {
+    history_row_click_and_drag(cx, true);
+}
+
+fn history_row_click_and_drag(cx: &mut gpui::TestAppContext, cached: bool) {
     let _visual_guard = crate::test_support::lock_visual_test();
     let (store, events) = AppStore::new_test(Arc::new(BlockingBackend));
     let store_for_assert = store.clone();
@@ -1595,6 +1604,16 @@ fn history_row_selection_requires_a_completed_click(cx: &mut gpui::TestAppContex
     // Positive control: an ordinary click selects, and the dispatch really
     // does reach the store, so the assertions below are not vacuous.
     let row_3 = row(cx, "history_row_3");
+    // Cache replays omit test-only debug bounds, so retain the initial geometry.
+    let row_1 = row(cx, "history_row_1");
+    let row_5 = row(cx, "history_row_5");
+    let _cache_guard = cached.then(crate::view::enable_stable_cached_views_for_test);
+    cx.update(|_, app| view.update(app, |_, cx| cx.notify()));
+    for _ in 0..3 {
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+    }
     cx.simulate_mouse_move(row_3, None, gpui::Modifiers::default());
     cx.simulate_click(row_3, gpui::Modifiers::default());
     wait_until(cx, "row 3 selected by a click", |_cx| {
@@ -1602,8 +1621,6 @@ fn history_row_selection_requires_a_completed_click(cx: &mut gpui::TestAppContex
     });
 
     // Press on one row, release on another: neither row receives a click.
-    let row_1 = row(cx, "history_row_1");
-    let row_5 = row(cx, "history_row_5");
     cx.simulate_mouse_move(row_1, None, gpui::Modifiers::default());
     cx.simulate_mouse_down(row_1, gpui::MouseButton::Left, gpui::Modifiers::default());
     cx.simulate_mouse_move(row_5, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -1631,6 +1648,15 @@ fn history_row_selection_requires_a_completed_click(cx: &mut gpui::TestAppContex
 fn history_rows_ignore_clicks_that_landed_on_the_collapsed_sidebar_popover(
     cx: &mut gpui::TestAppContext,
 ) {
+    history_rows_ignore_overlay_clicks(cx, false);
+}
+
+#[gpui::test]
+fn cached_history_rows_ignore_overlay_clicks(cx: &mut gpui::TestAppContext) {
+    history_rows_ignore_overlay_clicks(cx, true);
+}
+
+fn history_rows_ignore_overlay_clicks(cx: &mut gpui::TestAppContext, cached: bool) {
     let _visual_guard = crate::test_support::lock_visual_test();
     let (store, events) = AppStore::new_test(Arc::new(BlockingBackend));
     let (view, cx) =
@@ -1688,6 +1714,9 @@ fn history_rows_ignore_clicks_that_landed_on_the_collapsed_sidebar_popover(
     wait_until(cx, "history rows", |cx| {
         cx.debug_bounds("history_row_3").is_some()
     });
+    let row = cx.debug_bounds("history_row_3").expect("history row");
+    let _cache_guard = cached.then(crate::view::enable_stable_cached_views_for_test);
+    cx.update(|_, app| view.update(app, |_, cx| cx.notify()));
 
     // Draw only: every step here is synchronous, and pumping the executor
     // (or advancing the clock) would let store background work race the
@@ -1719,9 +1748,6 @@ fn history_rows_ignore_clicks_that_landed_on_the_collapsed_sidebar_popover(
     let panel = cx
         .debug_bounds("collapsed_sidebar_popover")
         .expect("expected the collapsed sidebar popover");
-    let row = cx
-        .debug_bounds("history_row_3")
-        .expect("history row should be rendered");
 
     // Right of the popover, over the dismiss scrim, on a commit row: the
     // click dismisses the popover and stops there. That it dismisses at all
@@ -3423,4 +3449,72 @@ fn a_date_cell_tooltip_is_retracted_when_the_pointer_leaves_the_cell(
         "leaving the history list must retract the tooltip, or every later \
          pointer event respawns the tooltip delay timer"
     );
+}
+
+#[gpui::test]
+fn history_bounds_belong_to_the_active_repository(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(BlockingBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+
+    let page = Arc::new(log_page(vec![commit("tip", &[], "tip")], None));
+    let make_repo = |repo_id: RepoId, path: &str| {
+        let mut repo = RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: PathBuf::from(path),
+            },
+        );
+        repo.head_branch = Loadable::Ready("main".to_string());
+        repo.head_branch_rev = 1;
+        repo.branches = Loadable::Ready(Arc::new(vec![branch("main", "tip")]));
+        repo.branches_rev = 1;
+        repo.remote_branches = Loadable::Ready(Arc::new(Vec::new()));
+        repo.remote_branches_rev = 1;
+        repo.log = Loadable::Ready(Arc::clone(&page));
+        repo.log_rev = 1;
+        repo.history_state.log = Loadable::Ready(Arc::clone(&page));
+        repo.history_state.log_rev = 1;
+        repo
+    };
+    let first = make_repo(RepoId(1), "/tmp/history-bounds-first");
+    let second = make_repo(RepoId(2), "/tmp/history-bounds-second");
+    let state_for = |active_repo| {
+        Arc::new(AppState {
+            repos: vec![first.clone(), second.clone()],
+            active_repo: Some(active_repo),
+            ..AppState::test_default()
+        })
+    };
+    let bounds = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let history = view.read(app).main_pane.read(app).history_view.clone();
+            history.read(app).history_viewport_bounds()
+        })
+    };
+
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+    ensure_history_cache_for_tests(cx, &view, state_for(RepoId(1)));
+    assert!(
+        bounds(cx).is_some(),
+        "the first repository's list is laid out"
+    );
+
+    // The second repository's log is ready, but its list was never drawn.
+    cx.update(|_window, app| {
+        let ui_model = view.read(app).ui_model.clone();
+        ui_model.update(app, |model, cx| model.set_state(state_for(RepoId(2)), cx));
+    });
+    assert!(
+        bounds(cx).is_none(),
+        "bounds painted for the previous repository must not count"
+    );
+
+    ensure_history_cache_for_tests(cx, &view, state_for(RepoId(2)));
+    wait_until(cx, "the second repository's list laid out", |cx| {
+        bounds(cx).is_some()
+    });
 }

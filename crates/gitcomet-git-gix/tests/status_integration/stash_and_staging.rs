@@ -814,10 +814,10 @@ fn stage_hunk_applies_only_part_of_a_file_to_index() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged_before = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     let hunk_count_before = unstaged_before
         .lines()
@@ -849,14 +849,14 @@ fn stage_hunk_applies_only_part_of_a_file_to_index() {
         .join("\n")
         + "\n";
     opened
-        .apply_unified_patch_to_index_with_output(&patch, false)
+        .apply_unified_patch_to_index_with_output(patch.as_bytes(), false)
         .unwrap();
 
     let staged_after = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert_eq!(
         staged_after.lines().filter(|l| l.starts_with("@@")).count(),
@@ -868,10 +868,10 @@ fn stage_hunk_applies_only_part_of_a_file_to_index() {
     assert!(!staged_after.contains("L25-mod"));
 
     let unstaged_after = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert_eq!(
         unstaged_after
@@ -917,10 +917,10 @@ fn unstage_hunk_reverts_only_that_part_in_index() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged_before = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert_eq!(
         unstaged_before
@@ -953,14 +953,14 @@ fn unstage_hunk_reverts_only_that_part_in_index() {
         + "\n";
 
     opened
-        .apply_unified_patch_to_index_with_output(&patch, false)
+        .apply_unified_patch_to_index_with_output(patch.as_bytes(), false)
         .unwrap();
 
     let staged_after_stage = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert_eq!(
         staged_after_stage
@@ -972,14 +972,14 @@ fn unstage_hunk_reverts_only_that_part_in_index() {
     );
 
     opened
-        .apply_unified_patch_to_index_with_output(&patch, true)
+        .apply_unified_patch_to_index_with_output(patch.as_bytes(), true)
         .unwrap();
 
     let staged_after_unstage = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert!(
         staged_after_unstage.trim().is_empty(),
@@ -987,10 +987,10 @@ fn unstage_hunk_reverts_only_that_part_in_index() {
     );
 
     let unstaged_after_unstage = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert_eq!(
         unstaged_after_unstage
@@ -1216,7 +1216,7 @@ fn unstage_line_patch_must_describe_the_index_side() {
     );
     assert!(
         opened
-            .apply_unified_patch_to_index_with_output(staging_shaped, true)
+            .apply_unified_patch_to_index_with_output(staging_shaped.as_bytes(), true)
             .is_err(),
         "a patch describing the HEAD side cannot be reverse-applied to the index"
     );
@@ -1232,14 +1232,14 @@ fn unstage_line_patch_must_describe_the_index_side() {
         " context two\n",
     );
     opened
-        .apply_unified_patch_to_index_with_output(unstage_shaped, true)
+        .apply_unified_patch_to_index_with_output(unstage_shaped.as_bytes(), true)
         .expect("a patch describing the index side reverse-applies");
 
     let staged_after = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert!(
         staged_after.contains("+new two") && !staged_after.contains("+new one"),
@@ -1275,10 +1275,10 @@ fn line_level_staging_round_trips_a_path_containing_spaces() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from(rel),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from(rel),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert!(
         unstaged.contains(&format!("+++ b/{rel}\t")),
@@ -1299,14 +1299,14 @@ fn line_level_staging_round_trips_a_path_containing_spaces() {
          \x20context two\n"
     );
     opened
-        .apply_unified_patch_to_index_with_output(&one_line, false)
+        .apply_unified_patch_to_index_with_output(one_line.as_bytes(), false)
         .expect("a per-line patch for a spaced path must apply to the index");
 
     let staged_after = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from(rel),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from(rel),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert!(
         staged_after.contains("+new one") && !staged_after.contains("+new two"),
@@ -1794,6 +1794,38 @@ fn conflict_session_both_deleted_restore_from_base_resolves_conflict() {
         !repo.join("removed.txt").exists(),
         "file should be deleted after accepting deletion"
     );
+}
+
+#[test]
+fn both_deleted_decoded_base_keeps_original_stage_bytes() {
+    let _ = ensure_isolated_git_test_env();
+    for (encoding, bytes, text) in [
+        ("windows-1252", b"caf\xe9\n".as_slice(), "café\n"),
+        ("UTF-16LE", b"\xff\xfea\0\n\0".as_slice(), "a\n"),
+        ("shift_jis", b"\x87\x90\n".as_slice(), "≒\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_conflict_fixture(repo);
+        write(
+            repo,
+            ".gitattributes",
+            format!("removed.txt encoding={encoding}\n"),
+        );
+        let blob = hash_blob(repo, bytes);
+        set_unmerged_stages(repo, "removed.txt", Some(&blob), None, None);
+        let opened = GixBackend.open(repo).unwrap();
+        let session = opened
+            .conflict_session(Path::new("removed.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.conflict_kind, FileConflictKind::BothDeleted);
+        assert_eq!(session.strategy, ConflictResolverStrategy::DecisionOnly);
+        assert!(session.current_format.is_none());
+        assert_eq!(session.base.as_text(), Some(text));
+        assert_eq!(session.base_bytes(), Some(bytes));
+        assert_eq!(session.base.into_stage_parts().0.as_deref(), Some(bytes));
+    }
 }
 
 /// End-to-end test: AddedByUs conflict session uses TwoWayKeepDelete

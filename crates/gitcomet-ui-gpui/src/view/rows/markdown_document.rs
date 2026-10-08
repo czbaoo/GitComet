@@ -26,8 +26,8 @@ use crate::kit::click::PointerClickExt as _;
 use crate::kit::interaction::ControlInteractionExt as _;
 use crate::view::markdown_preview::{
     MarkdownBlock, MarkdownInlineImage, MarkdownInlineStyle, MarkdownPreviewDiff,
-    MarkdownPreviewDocument, MarkdownPreviewRow, MarkdownPreviewRowKind, MarkdownTableAlign,
-    MarkdownTaskMarker, markdown_document_blocks,
+    MarkdownPreviewDocument, MarkdownPreviewRow, MarkdownPreviewRowKind, MarkdownTableCell,
+    MarkdownTableCellPart, MarkdownTaskMarker, MarkdownTextAlign, markdown_document_blocks,
 };
 use crate::view::perf::{self, ViewPerfRenderLane};
 use rustc_hash::FxHashMap;
@@ -754,22 +754,24 @@ fn document_pointer_listeners(column: gpui::Div, context: &MarkdownDocumentConte
 
 /// Render a whole document as one flowing element tree.
 pub(in crate::view) fn render_markdown_document(
+    tab_width: usize,
     document: &Arc<MarkdownPreviewDocument>,
     context: &MarkdownDocumentContext,
 ) -> AnyElement {
     let blocks = context.blocks.blocks(document);
-    render_markdown_document_with_blocks(document, &blocks, context)
+    render_markdown_document_with_blocks(tab_width, document, &blocks, context)
 }
 
 /// As [`render_markdown_document`], for a document whose blocks are already
 /// grouped — the inline diff keeps them with the document.
 pub(in crate::view) fn render_markdown_document_with_blocks(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     blocks: &[MarkdownBlock],
     context: &MarkdownDocumentContext,
 ) -> AnyElement {
     let column = document_pointer_listeners(
-        render_windowed_block_column(document, blocks, context),
+        render_windowed_block_column(tab_width, document, blocks, context),
         context,
     );
 
@@ -809,6 +811,7 @@ pub(in crate::view) fn render_markdown_document_with_blocks(
 /// the shorter side of a band is left blank and the two stay lined up. The old
 /// side takes `split_ratio` of the width.
 pub(in crate::view) fn render_markdown_diff_split(
+    tab_width: usize,
     diff: &MarkdownPreviewDiff,
     left: &MarkdownDocumentContext,
     right: &MarkdownDocumentContext,
@@ -937,6 +940,7 @@ pub(in crate::view) fn render_markdown_diff_split(
                 return side.child(empty_split_side(notice, context));
             }
             side.child(render_block_column(
+                tab_width,
                 document,
                 blocks,
                 band.rows.start,
@@ -1050,6 +1054,7 @@ fn split_side(context: &MarkdownDocumentContext, split_ratio: f32) -> gpui::Stat
 /// A document's top-level blocks as a windowed column: the blocks near the
 /// viewport, each with the gap above it, between spacers for the rest.
 fn render_windowed_block_column(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     blocks: &[MarkdownBlock],
     context: &MarkdownDocumentContext,
@@ -1121,6 +1126,7 @@ fn render_windowed_block_column(
             item = item.child(render_column_gap(blocks, ix, context, false));
         }
         item.child(render_column_block(
+            tab_width,
             document,
             &blocks[ix],
             rows_from,
@@ -1144,12 +1150,14 @@ struct BlockNesting {
 /// Blocks stacked with the gaps between them. `first_row` is where the rows
 /// this column shows begin.
 fn render_block_column(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     blocks: &[MarkdownBlock],
     first_row: usize,
     context: &MarkdownDocumentContext,
 ) -> gpui::Div {
     render_nested_block_column(
+        tab_width,
         document,
         blocks,
         first_row,
@@ -1165,6 +1173,7 @@ fn render_block_column(
 /// a quote's contents inside its bar. Change marks belong to the top-level
 /// blocks only.
 fn render_nested_block_column(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     blocks: &[MarkdownBlock],
     first_row: usize,
@@ -1181,7 +1190,7 @@ fn render_nested_block_column(
             .checked_sub(1)
             .map_or(first_row, |previous| blocks[previous].row_range().end);
         column = column.child(render_column_block(
-            document, block, rows_from, context, nesting,
+            tab_width, document, block, rows_from, context, nesting,
         ));
     }
     column
@@ -1219,6 +1228,7 @@ fn render_column_gap(
 /// removed. `rows_from` is where the rows it answers for begin: alignment
 /// padding before it belongs to it.
 fn render_column_block(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     block: &MarkdownBlock,
     rows_from: usize,
@@ -1226,7 +1236,7 @@ fn render_column_block(
     nesting: BlockNesting,
 ) -> AnyElement {
     let range = block.row_range();
-    let mut rendered = render_block(document, block, context, nesting);
+    let mut rendered = render_block(tab_width, document, block, context, nesting);
     // A row with no text box of its own — a picture, a rule, a gap — is
     // revealed by bringing its block into view. Alignment padding is left to
     // the other column, which draws the row it stands in for.
@@ -1324,6 +1334,7 @@ fn render_block_gap(
 }
 
 fn render_block(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     block: &MarkdownBlock,
     context: &MarkdownDocumentContext,
@@ -1344,7 +1355,9 @@ fn render_block(
 
     match block {
         MarkdownBlock::Heading { level, row_ix } => wrapper
-            .child(render_heading(*level, *row_ix, document, context))
+            .child(render_heading(
+                tab_width, *level, *row_ix, document, context,
+            ))
             .into_any_element(),
         MarkdownBlock::Paragraph(row_ix) => match document.rows.get(*row_ix) {
             // A footnote definition reads as its label and then its text, like
@@ -1353,6 +1366,7 @@ fn render_block(
                 .w_full()
                 .min_w(px(0.0))
                 .child(render_marked_row(
+                    tab_width,
                     *row_ix,
                     row,
                     indent.saturating_sub(1),
@@ -1361,7 +1375,8 @@ fn render_block(
                 .into_any_element(),
             Some(row) => wrapper
                 .child(recorded(
-                    row_shell(*row_ix, row, context).child(render_row_line(*row_ix, row, context)),
+                    row_shell(*row_ix, row, context)
+                        .child(render_row_line(tab_width, *row_ix, row, context)),
                     MarkdownBoxKind::Row(*row_ix),
                     context,
                 ))
@@ -1369,14 +1384,22 @@ fn render_block(
             None => wrapper.into_any_element(),
         },
         MarkdownBlock::List(_) => wrapper
-            .child(render_list(rows, context, nesting.indent_base))
+            .child(render_list(tab_width, rows, context, nesting.indent_base))
             .into_any_element(),
         MarkdownBlock::Blockquote(range) => wrapper
-            .child(render_blockquote(document, range.clone(), context, nesting))
+            .child(render_blockquote(
+                tab_width,
+                document,
+                range.clone(),
+                context,
+                nesting,
+            ))
             .into_any_element(),
-        MarkdownBlock::Code(_) => wrapper.child(render_code(rows, context)).into_any_element(),
+        MarkdownBlock::Code(_) => wrapper
+            .child(render_code(tab_width, rows, context))
+            .into_any_element(),
         MarkdownBlock::Table(_) => wrapper
-            .child(render_table(rows, context))
+            .child(render_table(tab_width, rows, context))
             .into_any_element(),
         MarkdownBlock::Image(_) => non_text_block_shell(document, block.row_range(), context)
             .when_some(rows.first(), |wrapper, (row_ix, row)| {
@@ -1596,12 +1619,13 @@ fn row_cursor(shell: gpui::Div, row_ix: usize, context: &MarkdownDocumentContext
 /// text rather than between its words. Every other arrangement — badges alone,
 /// a logo before a heading, an icon after a label — comes out in order.
 fn render_row_line(
+    tab_width: usize,
     row_ix: usize,
     row: &MarkdownPreviewRow,
     context: &MarkdownDocumentContext,
 ) -> AnyElement {
     if row.inline_images.is_empty() {
-        return render_row_text(row_ix, row, context);
+        return render_row_text(tab_width, row_ix, row, context);
     }
 
     // A picture written at offset 0 comes before the text; everything else
@@ -1610,24 +1634,59 @@ fn render_row_line(
     let leading = || row.inline_images.iter().filter(|i| i.byte_offset == 0);
     let trailing = || row.inline_images.iter().filter(|i| i.byte_offset != 0);
 
+    let aligned = gpui_text_align(row.align).is_some();
+    let alone = row.text.is_empty();
+    // A logo of a declared size beside aligned text stays on one line with
+    // it, the two moving as a group and the text wrapping beside it.
+    // Anything else wraps like words, so a row of badges stays in the column.
+    let beside_logo = aligned && !alone && trailing().next().is_none() && {
+        let mut pictures = leading();
+        matches!(
+            (pictures.next(), pictures.next()),
+            (Some(logo), None) if logo.image.width_px.is_some()
+        )
+    };
     let mut line = div()
         .flex()
-        .flex_wrap()
+        .when(!beside_logo, |line| line.flex_wrap())
         .items_center()
         .gap(scaled(MARKDOWN_PREVIEW_INLINE_IMAGE_GAP_PX, context))
         .flex_1()
         .min_w(px(0.0));
+    line = markdown_preview_justify(line, row.align);
+    // Only a picture inside a sentence is held to the line's height; one
+    // before or after the words is drawn at its own size.
+    let own_size = |inline: &MarkdownInlineImage| {
+        inline.byte_offset == 0 || inline.byte_offset >= row.text.len()
+    };
     for inline in leading() {
-        line = line.child(render_inline_image(row_ix, inline, context));
+        line = line.child(render_inline_image(
+            row_ix,
+            inline,
+            own_size(inline),
+            context,
+        ));
     }
     // A row of nothing but pictures still has to paint its (empty) text: that
     // element is what registers the row's hit-test box, and without one a drag
-    // across the row finds no target and the selection skips over it.
-    if !row.text.is_empty() || context.view.is_some() {
-        line = line.child(render_row_text(row_ix, row, context));
+    // across the row finds no target and the selection skips over it. In an
+    // aligned row it stays out of the flow, where its slot and gap would push
+    // the pictures off centre.
+    if !alone || context.view.is_some() {
+        let text = render_row_text(tab_width, row_ix, row, context);
+        line = if alone && aligned {
+            line.child(div().absolute().child(text))
+        } else {
+            line.child(text)
+        };
     }
     for inline in trailing() {
-        line = line.child(render_inline_image(row_ix, inline, context));
+        line = line.child(render_inline_image(
+            row_ix,
+            inline,
+            own_size(inline),
+            context,
+        ));
     }
     line.into_any_element()
 }
@@ -1635,16 +1694,22 @@ fn render_row_line(
 fn render_inline_image(
     row_ix: usize,
     inline: &MarkdownInlineImage,
+    own_size: bool,
     context: &MarkdownDocumentContext,
 ) -> AnyElement {
-    let image = div()
-        .flex_none()
-        .child(crate::view::rows::markdown_preview_inline_image(
-            inline,
-            context.theme,
-            context.ui_scale_percent,
-            pictures(context),
-        ));
+    // The wrappers are held to the line too: the picture's own `max_w_full`
+    // resolves against them, so unbounded they would let it overflow.
+    let image =
+        div()
+            .flex_none()
+            .max_w_full()
+            .child(crate::view::rows::markdown_preview_inline_image(
+                inline,
+                own_size,
+                context.theme,
+                context.ui_scale_percent,
+                pictures(context),
+            ));
 
     // A picture wrapped in a link opens the same menu its text would.
     let (Some(view), Some(url)) = (context.view.clone(), inline.link_url.clone()) else {
@@ -1667,6 +1732,7 @@ fn render_inline_image(
         // The wrapper stands where the picture stood, so it keeps the picture's
         // sizing in the line it sits on.
         .flex_none()
+        .max_w_full()
         .on_children_prepainted(move |children_bounds, _window, _cx| {
             record_bounds.set(children_bounds.first().copied());
         })
@@ -1705,6 +1771,7 @@ fn render_inline_image(
 
 /// One row's text, wrapping naturally and — when interactive — selectable.
 fn render_row_text(
+    tab_width: usize,
     row_ix: usize,
     row: &MarkdownPreviewRow,
     context: &MarkdownDocumentContext,
@@ -1712,6 +1779,7 @@ fn render_row_text(
     // The flowing document renders one element per source row, so the row
     // index is also the index the search cursor addresses.
     let styled = crate::view::rows::markdown_preview_styled_row_with_query(
+        tab_width,
         context.theme,
         row,
         row_ix,
@@ -1725,12 +1793,20 @@ fn render_row_text(
     let styled = styled.as_ref();
 
     // Text that scrolls takes the width it needs; text that wraps takes the
-    // width it is given.
+    // width it is given — except aligned text beside a picture, which hugs
+    // its words so the line can move them together.
+    let aligned = gpui_text_align(row.align);
     let mut text = if row_scrolls_sideways(row.kind) {
         div().flex_none()
+    } else if aligned.is_some() && !row.inline_images.is_empty() {
+        div().min_w(px(0.0))
     } else {
         div().flex_1().min_w(px(0.0))
     };
+    // The backend uses this style to align both glyphs and selection geometry.
+    if let Some(align) = aligned {
+        text = text.text_align(align);
+    }
     let code_ranges = row
         .inline_spans
         .iter()
@@ -1765,6 +1841,7 @@ fn render_row_text(
     .debug_selector(move || format!("markdown_preview_text_box_{row_ix}"))
     .child(
         MarkdownFlowText::new(
+            tab_width,
             view,
             row_ix,
             context.text_region,
@@ -1778,7 +1855,17 @@ fn render_row_text(
     .into_any_element()
 }
 
+/// The `gpui` alignment for `align`, when it moves anything.
+fn gpui_text_align(align: MarkdownTextAlign) -> Option<gpui::TextAlign> {
+    match align {
+        MarkdownTextAlign::Center => Some(gpui::TextAlign::Center),
+        MarkdownTextAlign::Right => Some(gpui::TextAlign::Right),
+        MarkdownTextAlign::None | MarkdownTextAlign::Left => None,
+    }
+}
+
 fn render_heading(
+    tab_width: usize,
     level: u8,
     row_ix: usize,
     document: &MarkdownPreviewDocument,
@@ -1797,7 +1884,7 @@ fn render_heading(
     let mut heading = row_shell(row_ix, row, context)
         .text_size(scaled(font_size, context))
         .font_weight(FontWeight::BOLD)
-        .child(render_row_line(row_ix, row, context));
+        .child(render_row_line(tab_width, row_ix, row, context));
 
     // Only the top two levels get a rule under them, the way a rendered
     // README reads.
@@ -1813,10 +1900,16 @@ fn render_heading(
     recorded(heading, MarkdownBoxKind::Row(row_ix), context)
 }
 
-fn render_list(rows: RowRun<'_>, context: &MarkdownDocumentContext, indent_base: u8) -> AnyElement {
+fn render_list(
+    tab_width: usize,
+    rows: RowRun<'_>,
+    context: &MarkdownDocumentContext,
+    indent_base: u8,
+) -> AnyElement {
     let mut list = div().flex().flex_col().w_full().min_w(px(0.0));
     for (row_ix, row) in rows.iter() {
         list = list.child(render_marked_row(
+            tab_width,
             row_ix,
             row,
             row.indent_level.saturating_sub(indent_base),
@@ -1830,6 +1923,7 @@ fn render_list(rows: RowRun<'_>, context: &MarkdownDocumentContext, indent_base:
 /// checkbox, or a footnote's label. A later row of the same item keeps the
 /// marker column empty so its text lines up.
 fn render_marked_row(
+    tab_width: usize,
     row_ix: usize,
     row: &MarkdownPreviewRow,
     indent: u8,
@@ -1868,7 +1962,7 @@ fn render_marked_row(
                 context,
             ))
             .child(marker_slot)
-            .child(render_row_line(row_ix, row, context)),
+            .child(render_row_line(tab_width, row_ix, row, context)),
         MarkdownBoxKind::Row(row_ix),
         context,
     )
@@ -1917,6 +2011,7 @@ fn render_task_checkbox(
 }
 
 fn render_blockquote(
+    tab_width: usize,
     document: &MarkdownPreviewDocument,
     range: Range<usize>,
     context: &MarkdownDocumentContext,
@@ -1960,6 +2055,7 @@ fn render_blockquote(
         );
     }
     body = body.child(render_nested_block_column(
+        tab_width,
         document,
         &blocks,
         range.start,
@@ -1984,7 +2080,11 @@ fn render_blockquote(
         .into_any_element()
 }
 
-fn render_code(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyElement {
+fn render_code(
+    tab_width: usize,
+    rows: RowRun<'_>,
+    context: &MarkdownDocumentContext,
+) -> AnyElement {
     let first_row_ix = rows.first().map(|(row_ix, _)| row_ix).unwrap_or_default();
     let last_row_ix = rows.iter().last().map(|(row_ix, _)| row_ix);
     let mut body = div()
@@ -2006,7 +2106,7 @@ fn render_code(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyElemen
     }
     for (row_ix, row) in rows.iter() {
         body = body.child(recorded(
-            row_shell(row_ix, row, context).child(render_row_line(row_ix, row, context)),
+            row_shell(row_ix, row, context).child(render_row_line(tab_width, row_ix, row, context)),
             MarkdownBoxKind::Row(row_ix),
             context,
         ));
@@ -2064,12 +2164,16 @@ fn render_code_padding(
 /// An inline diff interleaves the old table's rows with the new one's, so a
 /// block can mix tables of different widths: the widest sets the grid, and a
 /// narrower row is filled out with empty cells.
-fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyElement {
+fn render_table(
+    tab_width: usize,
+    rows: RowRun<'_>,
+    context: &MarkdownDocumentContext,
+) -> AnyElement {
     let first_row_ix = rows.first().map(|(row_ix, _)| row_ix).unwrap_or_default();
     let column_count = rows
         .iter()
         .filter_map(|(_, row)| row.table.as_ref())
-        .map(|cells| cells.cells.len().max(cells.table.alignments.len()))
+        .map(|cells| cells.cells.len())
         .max()
         .unwrap_or(0);
     if column_count == 0 {
@@ -2128,6 +2232,7 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
         };
         // Styled once for the row; each cell paints its slice.
         let styled = crate::view::rows::markdown_preview_styled_row_with_query(
+            tab_width,
             context.theme,
             row,
             row_ix,
@@ -2138,17 +2243,9 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
                 row_ix,
             ),
         );
-        for (column, range) in cells.cells.iter().enumerate() {
-            let align = if is_header {
-                MarkdownTableAlign::Center
-            } else {
-                cells
-                    .table
-                    .alignments
-                    .get(column)
-                    .copied()
-                    .unwrap_or_default()
-            };
+        for (column, cell_data) in cells.cells.iter().enumerate() {
+            let header_cell = is_header || cell_data.is_header;
+            let align = cell_data.align;
             // The search reveal needs one box per row; the first cell stands in.
             let shell = if column == 0 {
                 reveal_listener(row_ix, context)
@@ -2157,20 +2254,24 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
             };
             let cell = cell_shell(shell, column)
                 .debug_selector(move || format!("markdown_preview_cell_box_{row_ix}_{column}"))
-                .when(is_header, |cell| cell.font_weight(FontWeight::SEMIBOLD))
+                .when(header_cell, |cell| cell.font_weight(FontWeight::SEMIBOLD))
+                .when(
+                    cell_data.is_header
+                        && !is_header
+                        && row.change_hint
+                            == crate::view::markdown_preview::MarkdownChangeHint::None,
+                    |cell| cell.bg(header_band),
+                )
                 // The text box moves, not the glyphs inside it: `gpui` hit-tests
                 // and places selections as if every line started at the left.
                 .flex()
-                .map(|cell| match align {
-                    MarkdownTableAlign::Center => cell.justify_center(),
-                    MarkdownTableAlign::Right => cell.justify_end(),
-                    MarkdownTableAlign::None | MarkdownTableAlign::Left => cell,
-                })
-                .child(render_cell_text(
+                .map(|cell| markdown_preview_justify(cell, align))
+                .child(render_table_cell(
+                    tab_width,
                     row_ix,
                     row,
                     column,
-                    range.clone(),
+                    cell_data,
                     styled.as_ref(),
                     context,
                 ));
@@ -2195,9 +2296,159 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
     )
 }
 
+/// Images and selectable text retain their order within the cell.
+fn render_table_cell(
+    tab_width: usize,
+    row_ix: usize,
+    row: &MarkdownPreviewRow,
+    column: usize,
+    cell: &MarkdownTableCell,
+    styled: &CachedDiffStyledText,
+    context: &MarkdownDocumentContext,
+) -> AnyElement {
+    if cell.content.is_empty() {
+        return render_cell_text(
+            tab_width,
+            row_ix,
+            row,
+            column,
+            cell.range.clone(),
+            styled,
+            context,
+        );
+    }
+    let mut content = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .min_w(px(0.0))
+        .max_w_full();
+    for part in cell.content.iter() {
+        content = content.child(match part {
+            MarkdownTableCellPart::Text(range) => render_cell_text(
+                tab_width,
+                row_ix,
+                row,
+                column,
+                range.clone(),
+                styled,
+                context,
+            ),
+            MarkdownTableCellPart::Image { index, range } => {
+                render_table_image(row_ix, column, row, *index, range.clone(), context)
+            }
+        });
+    }
+    content.into_any_element()
+}
+
+fn table_image_matches_query(
+    text: &str,
+    range: std::ops::Range<usize>,
+    query: &crate::view::rows::MarkdownPreviewQuery,
+) -> bool {
+    if range.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(found) = query.matcher.find_range_at_or_after(text, start) {
+        if found.start >= range.end {
+            break;
+        }
+        if found.end > range.start {
+            return true;
+        }
+        start = found.end;
+    }
+    false
+}
+
+fn render_table_image(
+    row_ix: usize,
+    column: usize,
+    row: &MarkdownPreviewRow,
+    index: usize,
+    range: std::ops::Range<usize>,
+    context: &MarkdownDocumentContext,
+) -> AnyElement {
+    let mut shell = div()
+        .debug_selector(move || format!("markdown_table_image_box_{row_ix}_{column}_{index}"))
+        .id(SharedString::from(format!(
+            "markdown_table_cell_image_{row_ix}_{column}_{index}"
+        )))
+        .relative()
+        .min_w(px(0.0))
+        .max_w_full()
+        .child(render_inline_image(
+            row_ix,
+            &row.inline_images[index],
+            true,
+            context,
+        ));
+    if let Some(view) = context.view.clone() {
+        let region = context.text_region;
+        let row_len = row.text.len();
+        let searched = context
+            .query
+            .as_ref()
+            .is_some_and(|query| table_image_matches_query(&row.text, range.clone(), query));
+        let search_color = context.theme.colors.editor.search_match_background;
+        shell = shell.child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    if !super::markdown_flow_text::markdown_flow_row_is_near_viewport(
+                        bounds, window,
+                    ) {
+                        return;
+                    }
+                    view.update(cx, |pane, _| {
+                        pane.add_diff_text_cell_hitbox(
+                            row_ix,
+                            region,
+                            row_len,
+                            DiffTextHitbox {
+                                atomic: true,
+                                bounds,
+                                layout_key: 0,
+                                source_visible_ix: row_ix,
+                                text_start_offset: range.start,
+                                text_len: range.len(),
+                                offset_map: None,
+                                painted_text: SharedString::default(),
+                                streamed_ascii_monospace_cell_width: None,
+                                wrapped: None,
+                                cells: Vec::new(),
+                            },
+                        );
+                        let selected = pane
+                            .diff_text_local_selection_range_in(region, (row_ix, range.clone()))
+                            .is_some_and(|selected| !selected.is_empty());
+                        if selected {
+                            super::markdown_flow_text::record_selection_paint_for_tests(
+                                row_ix,
+                                &[bounds],
+                            );
+                            window.paint_quad(fill(bounds, pane.diff_text_selection_color()));
+                        } else if searched {
+                            window.paint_quad(fill(bounds, with_alpha(search_color, 0.35)));
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        );
+    }
+    shell.into_any_element()
+}
+
 /// One table cell's text: its slice of the row's styled text, selectable in
 /// row coordinates.
 fn render_cell_text(
+    tab_width: usize,
     row_ix: usize,
     row: &MarkdownPreviewRow,
     column: usize,
@@ -2208,6 +2459,7 @@ fn render_cell_text(
     let styled = super::diff_text::slice_cached_diff_styled_text(
         row_styled,
         super::history::markdown_preview_expanded_slice_range(
+            tab_width,
             row.text.as_ref(),
             row_styled.text.len(),
             &range,
@@ -2247,6 +2499,7 @@ fn render_cell_text(
     .debug_selector(move || format!("markdown_preview_cell_text_box_{row_ix}_{column}"))
     .child(
         MarkdownFlowText::new(
+            tab_width,
             view,
             row_ix,
             context.text_region,
@@ -2347,9 +2600,91 @@ fn scrolling_block(
         .into_any_element()
 }
 
+fn render_image(
+    row_ix: usize,
+    row: &MarkdownPreviewRow,
+    context: &MarkdownDocumentContext,
+) -> AnyElement {
+    crate::view::rows::markdown_preview_flow_image(
+        row,
+        row_ix,
+        context.theme,
+        context.ui_scale_percent,
+        pictures(context),
+    )
+}
+
+fn pictures(context: &MarkdownDocumentContext) -> crate::view::rows::MarkdownPictureContext<'_> {
+    crate::view::rows::MarkdownPictureContext {
+        image_root: context.image_root.as_ref(),
+        picture_sizes: &context.picture_sizes,
+        remote_image_access: &context.remote_image_access,
+        drawn: context.drawn_pictures.as_ref(),
+    }
+}
+
+fn scaled(value: f32, context: &MarkdownDocumentContext) -> Pixels {
+    context.theme.markdown_px(value, context.ui_scale_percent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_search_query(
+        text: &str,
+        options: crate::view::panes::main::diff_search::DiffSearchOptions,
+    ) -> crate::view::rows::MarkdownPreviewQuery {
+        crate::view::rows::MarkdownPreviewQuery {
+            matcher: Arc::new(
+                crate::view::panes::main::diff_search::DiffSearchMatcher::new(text, options),
+            ),
+            current_row: None,
+        }
+    }
+
+    #[test]
+    fn table_image_search_respects_full_row_regex_anchors() {
+        let query = image_search_query(
+            "^cat$",
+            crate::view::panes::main::diff_search::DiffSearchOptions {
+                regex: true,
+                ..Default::default()
+            },
+        );
+        assert!(!table_image_matches_query("label\tcat", 6..9, &query));
+        assert!(table_image_matches_query("cat", 0..3, &query));
+    }
+
+    #[test]
+    fn table_image_search_highlights_phrases_crossing_image_boundaries() {
+        for phrase in ["before cat", "cat after", "before cat after"] {
+            let query = image_search_query(phrase, Default::default());
+            assert!(table_image_matches_query("before cat after", 7..10, &query));
+        }
+        let query = image_search_query("before", Default::default());
+        assert!(!table_image_matches_query(
+            "before cat after",
+            7..10,
+            &query
+        ));
+        let query = image_search_query("cat", Default::default());
+        assert!(table_image_matches_query("cat cat", 4..7, &query));
+        assert!(!table_image_matches_query("cat", 1..1, &query));
+    }
+
+    #[test]
+    fn table_image_search_respects_full_row_word_boundaries() {
+        let query = image_search_query(
+            "cat",
+            crate::view::panes::main::diff_search::DiffSearchOptions {
+                whole_word: true,
+                ..Default::default()
+            },
+        );
+        assert!(!table_image_matches_query("scatter", 1..4, &query));
+        assert!(table_image_matches_query("label\tcat", 6..9, &query));
+    }
 
     #[test]
     fn amber_fenced_code_blocks_follow_gitcomet_darks_neutral_surface_rule() {
@@ -2375,6 +2710,8 @@ mod tests {
     #[test]
     #[ignore]
     fn timing_table_preview_frames() {
+        let tab_width = 4;
+
         use crate::view::markdown_preview::parse_markdown;
         use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
 
@@ -2425,7 +2762,7 @@ mod tests {
             };
             let start = std::time::Instant::now();
             for _ in 0..FRAMES {
-                drop(render_markdown_document(&document, &context));
+                drop(render_markdown_document(tab_width, &document, &context));
             }
             eprintln!(
                 "timing flowing_table[{label}] {:?}/frame",
@@ -2433,31 +2770,4 @@ mod tests {
             );
         }
     }
-}
-
-fn render_image(
-    row_ix: usize,
-    row: &MarkdownPreviewRow,
-    context: &MarkdownDocumentContext,
-) -> AnyElement {
-    crate::view::rows::markdown_preview_flow_image(
-        row,
-        row_ix,
-        context.theme,
-        context.ui_scale_percent,
-        pictures(context),
-    )
-}
-
-fn pictures(context: &MarkdownDocumentContext) -> crate::view::rows::MarkdownPictureContext<'_> {
-    crate::view::rows::MarkdownPictureContext {
-        image_root: context.image_root.as_ref(),
-        picture_sizes: &context.picture_sizes,
-        remote_image_access: &context.remote_image_access,
-        drawn: context.drawn_pictures.as_ref(),
-    }
-}
-
-fn scaled(value: f32, context: &MarkdownDocumentContext) -> Pixels {
-    context.theme.markdown_px(value, context.ui_scale_percent)
 }

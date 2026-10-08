@@ -17,6 +17,7 @@ const PIN_LOCAL_PREFIX: &str = "local:";
 const PIN_REMOTE_PREFIX: &str = "remote:";
 const WORKTREES_SECTION_KEY: &str = "section:worktrees";
 const SUBMODULES_SECTION_KEY: &str = "section:submodules";
+const ANNEX_SECTION_KEY: &str = "section:annex";
 const STASH_SECTION_KEY: &str = "section:stash";
 const EXPANDED_DEFAULT_SECTION_PREFIX: &str = "expanded:";
 const TRAILING_BOTTOM_SPACERS: usize = 3;
@@ -72,13 +73,6 @@ impl BranchMenuTarget {
 
 type BranchSidebarDepth = u16;
 
-pub(super) const fn pinned_section_storage_key(section: BranchSection) -> &'static str {
-    match section {
-        BranchSection::Local => PINNED_LOCAL_SECTION_KEY,
-        BranchSection::Remote => PINNED_REMOTE_SECTION_KEY,
-    }
-}
-
 /// Build the persisted key identifying a pinned branch (`local:<name>` or
 /// `remote:<remote>/<name>`).
 pub(super) fn branch_pin_storage_key(section: BranchSection, name: &str) -> String {
@@ -97,12 +91,38 @@ pub(super) fn branch_pin_storage_key(section: BranchSection, name: &str) -> Stri
 /// The row builder drops a pin whose branch no longer exists and one the branch
 /// filter excludes, so anything reporting "how many are pinned" has to ask the
 /// same question or it disagrees with what is on screen.
+#[cfg(test)]
 pub(super) fn pinned_branch_renders(
     repo: &RepoState,
     key: &str,
     section: BranchSection,
     raw_filter: &str,
 ) -> bool {
+    if let Some((key_section, remote, path)) = parse_group_pin_key(key) {
+        if key_section != section {
+            return false;
+        }
+        let prefix = format!("{path}/");
+        return match section {
+            BranchSection::Local => repo.branches.ready().is_some_and(|branches| {
+                branches.iter().any(|branch| {
+                    branch.name.starts_with(&prefix)
+                        && branch_matches_raw_filter(&branch.name, raw_filter)
+                })
+            }),
+            BranchSection::Remote => repo.remote_branches.ready().is_some_and(|branches| {
+                branches.iter().any(|branch| {
+                    Some(branch.remote.as_str()) == remote
+                        && branch.name.starts_with(&prefix)
+                        && remote_branch_matches_raw_filter(
+                            &branch.remote,
+                            &branch.name,
+                            raw_filter,
+                        )
+                })
+            }),
+        };
+    }
     let Some((key_section, name)) = parse_branch_pin_key(key) else {
         return false;
     };
@@ -141,6 +161,35 @@ fn parse_branch_pin_key(key: &str) -> Option<(BranchSection, &str)> {
     }
 }
 
+/// Group pins reuse the canonical group key. The remote/path boundary is
+/// unambiguous even for remote names containing slashes (`:` is not a ref-name
+/// character). Existing branch pin keys continue to load unchanged.
+fn parse_group_pin_key(key: &str) -> Option<(BranchSection, Option<&str>, &str)> {
+    if let Some(path) = key.strip_prefix(LOCAL_GROUP_PREFIX) {
+        return (!path.is_empty()).then_some((BranchSection::Local, None, path));
+    }
+    let (remote, path) = key.strip_prefix(REMOTE_GROUP_PREFIX)?.split_once(':')?;
+    (!remote.is_empty() && !path.is_empty()).then_some((BranchSection::Remote, Some(remote), path))
+}
+
+pub(super) fn pinned_row_storage_key(row: &BranchSidebarRow) -> Option<(BranchSection, String)> {
+    match row {
+        BranchSidebarRow::Branch {
+            section,
+            name,
+            depth: 0,
+            ..
+        } => Some((*section, branch_pin_storage_key(*section, name))),
+        BranchSidebarRow::GroupHeader {
+            section,
+            collapse_key,
+            depth: 0,
+            ..
+        } => Some((*section, collapse_key.to_string())),
+        _ => None,
+    }
+}
+
 pub(super) const fn local_section_storage_key() -> &'static str {
     LOCAL_SECTION_KEY
 }
@@ -155,6 +204,10 @@ pub(super) const fn worktrees_section_storage_key() -> &'static str {
 
 pub(super) const fn submodules_section_storage_key() -> &'static str {
     SUBMODULES_SECTION_KEY
+}
+
+pub(super) const fn annex_section_storage_key() -> &'static str {
+    ANNEX_SECTION_KEY
 }
 
 pub(super) const fn stash_section_storage_key() -> &'static str {
@@ -186,11 +239,17 @@ pub(super) fn remote_group_storage_key(remote: &str, path: &str) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum BranchSidebarRow {
-    PinnedHeader {
-        section: BranchSection,
-        top_border: bool,
+    ContributionHeader {
+        section: usize,
+        title: SharedString,
         collapsed: bool,
         collapse_key: SharedString,
+    },
+    ContributionItem {
+        section: usize,
+        row: usize,
+        label: SharedString,
+        key: SharedString,
     },
     SectionHeader {
         section: BranchSection,
@@ -199,11 +258,6 @@ pub(super) enum BranchSidebarRow {
         collapse_key: SharedString,
     },
     SectionSpacer,
-    /// A non-interactive group label. Only the collapsed-rail branch popovers
-    /// emit these, to separate Local from Remote when a filter spans both.
-    FilterGroupHeader {
-        section: BranchSection,
-    },
     Placeholder {
         section: BranchSection,
         message: SharedString,
@@ -269,6 +323,28 @@ pub(super) enum BranchSidebarRow {
         recorded_head: CommitId,
         checked_out_head: Option<CommitId>,
     },
+    /// git-annex: the repositories and special remotes content can live in.
+    AnnexHeader {
+        collapsed: bool,
+        collapse_key: SharedString,
+        /// e.g. "numcopies 2" or "adjusted (unlocked)".
+        summary: Option<SharedString>,
+    },
+    AnnexPlaceholder {
+        message: SharedString,
+        /// This clone has not run `git annex init` yet.
+        can_init: bool,
+        /// Files were left stale by an interrupted command; offer a restage.
+        can_restage: bool,
+    },
+    AnnexRepositoryItem {
+        uuid: SharedString,
+        name: SharedString,
+        /// Type and trust, e.g. "directory · untrusted".
+        detail: SharedString,
+        here: bool,
+        untrusted: bool,
+    },
     StashHeader {
         top_border: bool,
         collapsed: bool,
@@ -278,6 +354,7 @@ pub(super) enum BranchSidebarRow {
         message: SharedString,
     },
     StashItem {
+        id: CommitId,
         index: usize,
         message: SharedString,
         tooltip: SharedString,
@@ -400,6 +477,10 @@ pub(in crate::view) struct BranchSidebarSourceFingerprint(u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::view) struct BranchSidebarSourceFingerprintParts {
+    annex_refs_hidden: bool,
+    annex_rev: u64,
+    annex_reuse_identity: fingerprint::LoadableArcIdentity,
+    annex_hash: u64,
     local_revs: (u64, u64),
     local_hash: u64,
     local_reuse_key: u64,
@@ -419,6 +500,9 @@ pub(in crate::view) struct BranchSidebarSourceFingerprintParts {
 
 impl BranchSidebarSourceFingerprintParts {
     fn for_repo(repo: &RepoState, reuse: Option<&Self>) -> Self {
+        let annex_refs_hidden = repo.annex_refs_hidden;
+        let annex_rev = repo.large_file_support_rev;
+        let annex_reuse_identity = fingerprint::loadable_arc_identity(&repo.large_file_support);
         let local_revs = (repo.head_branch_rev, repo.branches_rev);
         let local_reuse_key = branch_sidebar_local_reuse_key(repo);
         let remote_revs = (
@@ -436,6 +520,19 @@ impl BranchSidebarSourceFingerprintParts {
         let stash_reuse_identity = fingerprint::loadable_arc_identity(&repo.stashes);
 
         Self {
+            annex_refs_hidden,
+            annex_rev,
+            annex_reuse_identity,
+            annex_hash: reuse
+                .filter(|parts| {
+                    parts.annex_refs_hidden == annex_refs_hidden
+                        && parts.annex_rev == annex_rev
+                        && parts.annex_reuse_identity == annex_reuse_identity
+                })
+                .map_or_else(
+                    || branch_sidebar_annex_source_hash(repo),
+                    |parts| parts.annex_hash,
+                ),
             local_revs,
             local_reuse_key,
             local_hash: reuse
@@ -504,6 +601,8 @@ impl BranchSidebarSourceFingerprintParts {
         self.submodule_hash.hash(&mut hasher);
         4u8.hash(&mut hasher);
         self.stash_hash.hash(&mut hasher);
+        5u8.hash(&mut hasher);
+        self.annex_hash.hash(&mut hasher);
         BranchSidebarSourceFingerprint(hasher.finish())
     }
 }
@@ -524,6 +623,13 @@ pub(in crate::view) fn branch_sidebar_source_matches_cached(
     repo: &RepoState,
     cached: &BranchSidebarSourceFingerprintParts,
 ) -> bool {
+    if cached.annex_refs_hidden != repo.annex_refs_hidden
+        || cached.annex_rev != repo.large_file_support_rev
+        || cached.annex_reuse_identity
+            != fingerprint::loadable_arc_identity(&repo.large_file_support)
+    {
+        return false;
+    }
     let local_revs = (repo.head_branch_rev, repo.branches_rev);
     if cached.local_revs != local_revs
         && cached.local_reuse_key != branch_sidebar_local_reuse_key(repo)
@@ -683,6 +789,16 @@ fn branch_sidebar_worktree_source_hash(repo: &RepoState) -> u64 {
     hasher.finish()
 }
 
+fn branch_sidebar_annex_source_hash(repo: &RepoState) -> u64 {
+    let mut hasher = FxHasher::default();
+    repo.annex_refs_hidden.hash(&mut hasher);
+    fingerprint::hash_loadable_kind(&repo.large_file_support, &mut hasher);
+    if let Loadable::Ready(support) = &repo.large_file_support {
+        support.annex.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn hash_branch_sidebar_submodule_source<H: Hasher>(repo: &RepoState, hasher: &mut H) {
     fingerprint::hash_loadable_kind(&repo.submodules, hasher);
     if let Loadable::Ready(submodules) = &repo.submodules {
@@ -715,6 +831,7 @@ fn hash_branch_sidebar_stash_source<H: Hasher>(repo: &RepoState, hasher: &mut H)
     fingerprint::hash_loadable_kind(&repo.stashes, hasher);
     if let Loadable::Ready(stashes) = &repo.stashes {
         for stash in stashes.iter() {
+            stash.id.hash(hasher);
             stash.index.hash(hasher);
             stash.message.hash(hasher);
             stash.created_at.hash(hasher);
@@ -804,12 +921,15 @@ pub(super) fn group_paths_at_or_below<'a>(
     let mut out = BTreeSet::new();
     // Always present, so the invoked group toggles even when its membership
     // cannot be resolved.
-    out.insert(path.to_string());
-    if path.is_empty() {
-        return out;
+    if !path.is_empty() {
+        out.insert(path.to_string());
     }
 
-    let needle = format!("{path}/");
+    let needle = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
     for name in branch_names {
         let Some(rest) = name.strip_prefix(needle.as_str()) else {
             continue;
@@ -818,7 +938,9 @@ pub(super) fn group_paths_at_or_below<'a>(
         let mut segments: Vec<&str> = rest.split('/').collect();
         segments.pop();
         for segment in segments {
-            accumulated.push('/');
+            if !accumulated.is_empty() {
+                accumulated.push('/');
+            }
             accumulated.push_str(segment);
             out.insert(accumulated.clone());
         }
@@ -858,11 +980,54 @@ pub(super) fn toggle_collapse_state(collapsed_items: &mut BTreeSet<String>, coll
     }
 }
 
+#[cfg(any(test, feature = "benchmarks"))]
 pub(super) fn branch_sidebar_rows(
     repo: &RepoState,
     collapsed_items: &BTreeSet<String>,
     pinned_branches: &BTreeSet<String>,
     branch_filter: &str,
+) -> Vec<BranchSidebarRow> {
+    let mut rows = pinned_rows(
+        repo,
+        pinned_branches,
+        &branch_filter.trim().to_ascii_lowercase(),
+        Some(collapsed_items),
+    );
+    rows.extend(sidebar_rows(repo, collapsed_items, branch_filter, false));
+    rows
+}
+
+/// Base tree with open top-level sections. The shared presentation adds pins,
+/// search results and an optional section scope for a minimized flyout.
+pub(super) fn expanded_sidebar_rows(
+    repo: &RepoState,
+    collapsed_items: &BTreeSet<String>,
+    branch_filter: &str,
+) -> Vec<BranchSidebarRow> {
+    sidebar_rows(repo, collapsed_items, branch_filter, true)
+}
+
+pub(super) fn is_top_level_collapse_key(key: &str) -> bool {
+    key.starts_with("section:extension:")
+        || matches!(
+            key.strip_prefix(EXPANDED_DEFAULT_SECTION_PREFIX)
+                .unwrap_or(key),
+            PINNED_LOCAL_SECTION_KEY
+                | PINNED_REMOTE_SECTION_KEY
+                | LOCAL_SECTION_KEY
+                | REMOTE_SECTION_KEY
+                | WORKTREES_SECTION_KEY
+                | SUBMODULES_SECTION_KEY
+                | ANNEX_SECTION_KEY
+                | STASH_SECTION_KEY
+        )
+}
+
+fn sidebar_rows(
+    repo: &RepoState,
+    collapsed_items: &BTreeSet<String>,
+    branch_filter: &str,
+    always_expanded: bool,
 ) -> Vec<BranchSidebarRow> {
     let head = match &repo.head_branch {
         Loadable::Ready(head) => Some(head.as_str()),
@@ -872,12 +1037,18 @@ pub(super) fn branch_sidebar_rows(
     // sections; a live query force-expands them so matches are always visible.
     let filter = branch_filter.trim().to_ascii_lowercase();
     let filtering = !filter.is_empty();
-    let local_collapsed = !filtering && is_collapsed(collapsed_items, local_section_storage_key());
-    let remote_collapsed =
-        !filtering && is_collapsed(collapsed_items, remote_section_storage_key());
-    let worktrees_collapsed = is_collapsed(collapsed_items, worktrees_section_storage_key());
-    let submodules_collapsed = is_collapsed(collapsed_items, submodules_section_storage_key());
-    let stash_collapsed = is_collapsed(collapsed_items, stash_section_storage_key());
+    let local_collapsed = !always_expanded
+        && !filtering
+        && is_collapsed(collapsed_items, local_section_storage_key());
+    let remote_collapsed = !always_expanded
+        && !filtering
+        && is_collapsed(collapsed_items, remote_section_storage_key());
+    let worktrees_collapsed =
+        !always_expanded && is_collapsed(collapsed_items, worktrees_section_storage_key());
+    let submodules_collapsed =
+        !always_expanded && is_collapsed(collapsed_items, submodules_section_storage_key());
+    let stash_collapsed =
+        !always_expanded && is_collapsed(collapsed_items, stash_section_storage_key());
     let visible_rows = if local_collapsed {
         0
     } else {
@@ -924,37 +1095,6 @@ pub(super) fn branch_sidebar_rows(
         }
     }
 
-    // Pinned branches surface in a Pinned section directly above their home
-    // Local/Remote section, while still remaining in that home section below.
-    let (pinned_local_rows, pinned_remote_rows) =
-        build_pinned_branch_rows(repo, head, pinned_branches, &filter);
-    let emit_pinned_section = |rows: &mut Vec<BranchSidebarRow>,
-                               section: BranchSection,
-                               pinned_rows: Vec<BranchSidebarRow>,
-                               top_border: bool|
-     -> bool {
-        if pinned_rows.is_empty() {
-            return false;
-        }
-        let key = pinned_section_storage_key(section);
-        let pinned_collapsed = !filtering && is_collapsed(collapsed_items, key);
-        rows.push(BranchSidebarRow::PinnedHeader {
-            section,
-            top_border,
-            collapsed: pinned_collapsed,
-            collapse_key: key.into(),
-        });
-        if !pinned_collapsed {
-            rows.extend(pinned_rows);
-        }
-        rows.push(BranchSidebarRow::SectionSpacer);
-        true
-    };
-
-    // The pinned local section leads the whole list, so it needs no divider and
-    // the Local header joins it without one either.
-    let _ = emit_pinned_section(&mut rows, BranchSection::Local, pinned_local_rows, false);
-
     rows.push(BranchSidebarRow::SectionHeader {
         section: BranchSection::Local,
         top_border: false,
@@ -979,6 +1119,12 @@ pub(super) fn branch_sidebar_rows(
                     // retains its upstream tint.
                     record_local_branch_sidebar_metadata(branch, head, &mut head_upstream_full);
                     if !matches_branch_filter(&branch.name, &filter) {
+                        continue;
+                    }
+                    if repo.annex_refs_hidden
+                        && head != Some(branch.name.as_str())
+                        && gitcomet_core::annex::is_annex_ref(&branch.name)
+                    {
                         continue;
                     }
                     local_leaf_meta.push(SlashTreeLeafMeta {
@@ -1026,15 +1172,9 @@ pub(super) fn branch_sidebar_rows(
 
     rows.push(BranchSidebarRow::SectionSpacer);
 
-    // The Remote area's divider sits above the pinned remote section (when it
-    // exists) so the pins live under it, grouped with Remote Branches; otherwise
-    // the Remote header carries the divider itself.
-    let has_pinned_remote =
-        emit_pinned_section(&mut rows, BranchSection::Remote, pinned_remote_rows, true);
-
     rows.push(BranchSidebarRow::SectionHeader {
         section: BranchSection::Remote,
-        top_border: !has_pinned_remote,
+        top_border: true,
         collapsed: remote_collapsed,
         collapse_key: remote_section_storage_key().into(),
     });
@@ -1057,6 +1197,9 @@ pub(super) fn branch_sidebar_rows(
                         branch.name.as_str(),
                         &filter,
                     ) {
+                        continue;
+                    }
+                    if repo.annex_refs_hidden && gitcomet_core::annex::is_annex_ref(&branch.name) {
                         continue;
                     }
                     let inserted = push_remote_group_branch(
@@ -1213,6 +1356,8 @@ pub(super) fn branch_sidebar_rows(
 
     rows.push(BranchSidebarRow::SectionSpacer);
 
+    push_annex_section_rows(repo, collapsed_items, always_expanded, &mut rows);
+
     rows.push(BranchSidebarRow::StashHeader {
         top_border: true,
         collapsed: stash_collapsed,
@@ -1235,6 +1380,7 @@ pub(super) fn branch_sidebar_rows(
                         message.clone()
                     };
                     rows.push(BranchSidebarRow::StashItem {
+                        id: stash.id.clone(),
                         index: stash.index,
                         message,
                         tooltip,
@@ -1548,6 +1694,82 @@ fn ensure_remote_group<'a>(
     });
 }
 
+/// Only repositories that use git-annex get the section.
+fn push_annex_section_rows(
+    repo: &RepoState,
+    collapsed_items: &BTreeSet<String>,
+    always_expanded: bool,
+    rows: &mut Vec<BranchSidebarRow>,
+) {
+    let Loadable::Ready(support) = &repo.large_file_support else {
+        return;
+    };
+    let annex = &support.annex;
+    if !annex.in_use() {
+        return;
+    }
+    let collapsed = !always_expanded && is_collapsed(collapsed_items, annex_section_storage_key());
+    let summary = match (repo.annex_adjusted_branch(), annex.numcopies) {
+        (Some((_, mode)), _) => Some(format!("adjusted ({mode})").into()),
+        (None, Some(copies)) => Some(format!("numcopies {copies}").into()),
+        (None, None) => None,
+    };
+    rows.push(BranchSidebarRow::AnnexHeader {
+        collapsed,
+        collapse_key: annex_section_storage_key().into(),
+        summary,
+    });
+    if collapsed {
+        rows.push(BranchSidebarRow::SectionSpacer);
+        return;
+    }
+    if !annex.initialized() {
+        rows.push(BranchSidebarRow::AnnexPlaceholder {
+            message: "Not initialized in this clone".into(),
+            can_init: true,
+            can_restage: false,
+        });
+    } else {
+        if annex.restage_pending {
+            rows.push(BranchSidebarRow::AnnexPlaceholder {
+                message: "Some annexed files need a refresh".into(),
+                can_init: false,
+                can_restage: true,
+            });
+        }
+        let visible: Vec<_> = annex
+            .repositories
+            .iter()
+            .filter(|repository| !repository.is_builtin())
+            .collect();
+        if visible.is_empty() {
+            rows.push(BranchSidebarRow::AnnexPlaceholder {
+                message: "Repositories unknown (is git-annex installed?)".into(),
+                can_init: false,
+                can_restage: false,
+            });
+        }
+        for repository in visible {
+            let kind = repository
+                .special_type
+                .as_deref()
+                .unwrap_or(if repository.here {
+                    "this clone"
+                } else {
+                    "git repository"
+                });
+            rows.push(BranchSidebarRow::AnnexRepositoryItem {
+                uuid: repository.uuid.clone().into(),
+                name: repository.display_description().into(),
+                detail: format!("{kind} · {}", repository.trust.label()).into(),
+                here: repository.here,
+                untrusted: repository.trust == gitcomet_core::large_files::AnnexTrust::Untrusted,
+            });
+        }
+    }
+    rows.push(BranchSidebarRow::SectionSpacer);
+}
+
 fn push_remote_branch_sidebar_rows(
     remote: &str,
     branches: Vec<&str>,
@@ -1790,12 +2012,14 @@ fn matches_branch_filter(name: &str, filter: &str) -> bool {
 ///
 /// The row builder lowercases and trims once up front; menus acting on the same
 /// rows get here instead of repeating that normalisation and drifting from it.
+#[cfg(test)]
 pub(super) fn branch_matches_raw_filter(name: &str, filter: &str) -> bool {
     matches_branch_filter(name, &filter.trim().to_ascii_lowercase())
 }
 
 /// [`matches_remote_branch_filter`] for a raw query, matching against the full
 /// `remote/name` form the tree filters on.
+#[cfg(test)]
 pub(super) fn remote_branch_matches_raw_filter(remote: &str, branch: &str, filter: &str) -> bool {
     matches_remote_branch_filter(remote, branch, &filter.trim().to_ascii_lowercase())
 }
@@ -1810,15 +2034,69 @@ fn matches_remote_branch_filter(remote: &str, branch: &str, filter: &str) -> boo
     full.to_ascii_lowercase().contains(filter)
 }
 
-/// Build the `Branch` rows for the pinned sections, split into `(local, remote)`
-/// so each renders under its own header. Each list follows the persisted
-/// (sorted) order; pins whose branch no longer exists are skipped so a deleted
-/// branch simply drops out.
+/// Unfiltered pins in local-then-remote order. Missing or ambiguous refs are
+/// skipped, matching the section-scoped pin lists in rail popovers.
+pub(super) fn expanded_pinned_rows(
+    repo: &RepoState,
+    pins: &BTreeSet<String>,
+    collapsed_items: &BTreeSet<String>,
+) -> Vec<BranchSidebarRow> {
+    pinned_rows(repo, pins, "", Some(collapsed_items))
+}
+
+/// Visible explicit roots under the same matcher used by the sidebar. Expand
+/// groups before filtering, so a matching descendant keeps its root available.
+pub(super) fn matching_pinned_roots(
+    repo: &RepoState,
+    pins: &BTreeSet<String>,
+    search: &super::sidebar_search::SidebarSearch,
+) -> Vec<BranchSidebarRow> {
+    search
+        .project(&expanded_pinned_rows(repo, pins, &BTreeSet::new()))
+        .into_iter()
+        .filter(|row| {
+            matches!(
+                row,
+                BranchSidebarRow::Branch { depth: 0, .. }
+                    | BranchSidebarRow::GroupHeader { depth: 0, .. }
+            )
+        })
+        .collect()
+}
+
+/// Only explicitly pinned roots, for counts and bulk unpin. Descendants do
+/// not count as extra pins, and closed groups still participate.
+#[cfg(test)]
+pub(super) fn pinned_root_rows(
+    repo: &RepoState,
+    pins: &BTreeSet<String>,
+    filter: &str,
+) -> Vec<BranchSidebarRow> {
+    pinned_rows(repo, pins, &filter.trim().to_ascii_lowercase(), None)
+}
+
+fn pinned_rows(
+    repo: &RepoState,
+    pins: &BTreeSet<String>,
+    filter: &str,
+    collapsed_items: Option<&BTreeSet<String>>,
+) -> Vec<BranchSidebarRow> {
+    let head = match &repo.head_branch {
+        Loadable::Ready(head) => Some(head.as_str()),
+        _ => None,
+    };
+    let (mut local, remote) = build_pinned_branch_rows(repo, head, pins, filter, collapsed_items);
+    local.extend(remote);
+    local
+}
+
+/// Build separate local and remote pin lists in persisted (sorted) order.
 fn build_pinned_branch_rows(
     repo: &RepoState,
     head: Option<&str>,
     pinned_branches: &BTreeSet<String>,
     filter: &str,
+    collapsed_items: Option<&BTreeSet<String>>,
 ) -> (Vec<BranchSidebarRow>, Vec<BranchSidebarRow>) {
     if pinned_branches.is_empty() {
         return (Vec::new(), Vec::new());
@@ -1840,10 +2118,132 @@ fn build_pinned_branch_rows(
             _ => None,
         });
 
+    // Resolve all pins in linear passes rather than scanning every branch for
+    // each pin. Remote spellings can be ambiguous in legacy persisted keys.
+    let local_index: FxHashMap<&str, _> = match &repo.branches {
+        Loadable::Ready(branches) => branches.iter().map(|b| (b.name.as_str(), b)).collect(),
+        _ => FxHashMap::default(),
+    };
+    let mut remote_index = FxHashMap::default();
+    if let Loadable::Ready(branches) = &repo.remote_branches {
+        for branch in branches.iter() {
+            remote_index
+                .entry(format!("{}/{}", branch.remote, branch.name))
+                .and_modify(|value| *value = None)
+                .or_insert(Some(branch));
+        }
+    }
     let mut local_rows: Vec<BranchSidebarRow> = Vec::new();
     let mut remote_rows: Vec<BranchSidebarRow> = Vec::new();
 
+    // Build each pinned section/remote's tree once, then look up pinned
+    // subtrees by path. No per-pin scans of the repository and no flattened
+    // copies of unrelated worktree/stash rows. Presentation caching keeps
+    // this work out of scrolling and repainting.
+    let mut local_tree = SlashTree::default();
+    let mut local_meta = Vec::new();
+    if pinned_branches
+        .iter()
+        .any(|key| key.starts_with(LOCAL_GROUP_PREFIX))
+    {
+        for branch in local_index.values() {
+            if !matches_branch_filter(&branch.name, filter) {
+                continue;
+            }
+            local_meta.push(SlashTreeLeafMeta {
+                divergence: branch.divergence,
+                is_head: head == Some(branch.name.as_str()),
+            });
+            local_tree.insert_local(
+                &branch.name,
+                NonZeroU32::new(
+                    u32::try_from(local_meta.len()).expect("branch pin metadata index overflow"),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    let mut remote_trees: FxHashMap<&str, SlashTree<'_>> = pinned_branches
+        .iter()
+        .filter_map(|key| parse_group_pin_key(key).and_then(|(_, remote, _)| remote))
+        .map(|remote| (remote, SlashTree::default()))
+        .collect();
+    if !remote_trees.is_empty()
+        && let Loadable::Ready(branches) = &repo.remote_branches
+    {
+        for branch in branches.iter() {
+            if let Some(tree) = remote_trees.get_mut(branch.remote.as_str())
+                && matches_remote_branch_filter(&branch.remote, &branch.name, filter)
+            {
+                tree.insert(&branch.name);
+            }
+        }
+    }
+
     for key in pinned_branches.iter() {
+        if let Some((section, remote, path)) = parse_group_pin_key(key) {
+            let (tree, out, meta) = match section {
+                BranchSection::Local => (&local_tree, &mut local_rows, Some(local_meta.as_slice())),
+                BranchSection::Remote => {
+                    let Some(tree) = remote.and_then(|remote| remote_trees.get(remote)) else {
+                        continue;
+                    };
+                    (tree, &mut remote_rows, None)
+                }
+            };
+            let Some(node) = path
+                .split('/')
+                .try_fold(tree, |node, label| node.children.get(label))
+            else {
+                continue;
+            };
+            if node.children.is_empty() {
+                continue;
+            }
+            let label: SharedString = match remote {
+                Some(remote) => format!("{remote}/{path}/").into(),
+                None => format!("{path}/").into(),
+            };
+            let Some(collapsed_items) = collapsed_items else {
+                out.push(BranchSidebarRow::GroupHeader {
+                    label,
+                    path: path.into(),
+                    remote: remote.map(SharedString::from),
+                    section,
+                    depth: 0,
+                    collapsed: false,
+                    collapse_key: key.clone().into(),
+                });
+                continue;
+            };
+            let (parent, leaf) = path.rsplit_once('/').map_or(("", path), |(parent, leaf)| {
+                (&path[..parent.len() + 1], leaf)
+            });
+            let mut name_prefix = remote.map_or_else(String::new, |remote| format!("{remote}/"));
+            name_prefix.push_str(parent);
+            let root_ix = out.len();
+            push_slash_tree_child_rows(
+                leaf,
+                node,
+                out,
+                meta,
+                head_upstream_full.as_deref(),
+                0,
+                section == BranchSection::Remote,
+                section,
+                &mut name_prefix,
+                &mut parent.to_owned(),
+                remote,
+                collapsed_items,
+            );
+            if let BranchSidebarRow::GroupHeader {
+                label: root_label, ..
+            } = &mut out[root_ix]
+            {
+                *root_label = label;
+            }
+            continue;
+        }
         let Some((section, name)) = parse_branch_pin_key(key) else {
             continue;
         };
@@ -1852,10 +2252,7 @@ fn build_pinned_branch_rows(
                 if !matches_branch_filter(name, filter) {
                     continue;
                 }
-                let Loadable::Ready(branches) = &repo.branches else {
-                    continue;
-                };
-                let Some(branch) = branches.iter().find(|branch| branch.name == name) else {
+                let Some(branch) = local_index.get(name) else {
                     continue;
                 };
                 local_rows.push(BranchSidebarRow::Branch {
@@ -1878,21 +2275,9 @@ fn build_pinned_branch_rows(
                 if !matches_branch_filter(name, filter) {
                     continue;
                 }
-                let Loadable::Ready(branches) = &repo.remote_branches else {
+                let Some(Some(branch)) = remote_index.get(name) else {
                     continue;
                 };
-                let mut matching = branches
-                    .iter()
-                    .filter(|branch| format!("{}/{}", branch.remote, branch.name) == name);
-                let Some(branch) = matching.next() else {
-                    continue;
-                };
-                if matching.next().is_some() {
-                    // Legacy pin keys contain only the rendered name. Do not
-                    // attach actions to the wrong ref when that old spelling is
-                    // ambiguous; newly selected rows keep their exact target.
-                    continue;
-                }
                 remote_rows.push(BranchSidebarRow::Branch {
                     name: SharedString::new(name),
                     target: BranchMenuTarget::remote(&branch.remote, &branch.name),
@@ -1968,6 +2353,107 @@ fn push_branch_sidebar_branch_row(
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn group_paths_at_remote_root_collects_all_directories_without_an_empty_key() {
+        let paths =
+            group_paths_at_or_below("", ["main", "feat/a", "feat/b/c", "fix/d"].into_iter());
+        assert_eq!(
+            paths,
+            BTreeSet::from(["feat".into(), "feat/b".into(), "fix".into()])
+        );
+    }
+
+    #[test]
+    fn pinned_group_trees_preserve_identity_metadata_and_nested_collapse() {
+        let mut repo = populated_repo();
+        let branch = |name: &str| Branch {
+            name: name.into(),
+            target: commit_id("a"),
+            upstream: None,
+            divergence: Some(UpstreamDivergence {
+                ahead: 3,
+                behind: 2,
+            }),
+        };
+        repo.branches = Loadable::Ready(Arc::new(vec![
+            branch("main"),
+            branch("feat/a"),
+            branch("feat/nested/b"),
+            branch("features/x"),
+        ]));
+        repo.head_branch = Loadable::Ready("feat/a".into());
+        let remote = |remote: &str, name: &str| RemoteBranch {
+            remote: remote.into(),
+            name: name.into(),
+            target: commit_id("b"),
+        };
+        repo.remote_branches = Loadable::Ready(Arc::new(vec![
+            remote("team/origin", "feat/a"),
+            remote("team/origin", "feat/nested/b"),
+            remote("team", "origin/feat/wrong-remote"),
+            remote("team/origin", "features/x"),
+        ]));
+        let local_key = local_group_storage_key("feat");
+        let remote_key = remote_group_storage_key("team/origin", "feat");
+        let pins = BTreeSet::from([
+            local_key.clone(),
+            remote_key.clone(),
+            branch_pin_storage_key(BranchSection::Local, "main"),
+            local_group_storage_key("gone"),
+        ]);
+        let rows = expanded_pinned_rows(&repo, &pins, &BTreeSet::new());
+        assert!(
+            rows.iter().any(|row| matches!(row,
+            BranchSidebarRow::GroupHeader { label, depth: 0, .. } if label == "team/origin/feat/"))
+        );
+        assert!(rows.iter().any(|row| matches!(row,
+            BranchSidebarRow::Branch { name, depth: 1, is_head: true,
+                divergence_ahead: Some(ahead), divergence_behind: Some(behind), .. }
+                if name == "feat/a" && ahead.get() == 3 && behind.get() == 2)));
+        assert!(rows.iter().any(|row| matches!(row,
+            BranchSidebarRow::Branch { target, depth: 2, .. }
+                if target == &BranchMenuTarget::remote("team/origin", "feat/nested/b"))));
+        let names = |rows: &[BranchSidebarRow]| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    BranchSidebarRow::Branch { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            names(&rows),
+            BTreeSet::from([
+                "main".into(),
+                "feat/a".into(),
+                "feat/nested/b".into(),
+                "team/origin/feat/a".into(),
+                "team/origin/feat/nested/b".into(),
+            ])
+        );
+
+        let nested_closed = BTreeSet::from([local_group_storage_key("feat/nested")]);
+        let rows = expanded_pinned_rows(&repo, &pins, &nested_closed);
+        assert!(!names(&rows).contains("feat/nested/b"));
+        assert!(names(&rows).contains("team/origin/feat/nested/b"));
+        let roots_closed = BTreeSet::from([local_key.clone(), remote_key.clone()]);
+        let rows = expanded_pinned_rows(&repo, &pins, &roots_closed);
+        assert_eq!(rows.len(), 3, "closed groups keep one root row each");
+        let roots = pinned_root_rows(&repo, &pins, "");
+        assert_eq!(roots.len(), 3, "members are not counted as individual pins");
+        for (section, key) in roots.iter().filter_map(pinned_row_storage_key) {
+            assert!(pins.contains(&key));
+            assert!(pinned_branch_renders(&repo, &key, section, ""));
+        }
+        let filtered = pinned_root_rows(&repo, &pins, "nested/B");
+        assert_eq!(filtered.len(), 2);
+        assert!(pinned_root_rows(&repo, &pins, "absent").is_empty());
+        assert_eq!(
+            expanded_pinned_rows(&repo, &pins, &BTreeSet::new()).len(),
+            9
+        );
+    }
+
     /// A group's descendants come from the member branch names, and the
     /// trailing segment of each name is the branch, not a group.
     #[test]
@@ -2042,6 +2528,281 @@ mod tests {
         // An unknown prefix is ignored rather than mis-rendered, so a stale key
         // from an older session cannot claim a section.
         assert_eq!(parse_branch_pin_key("garbage"), None);
+    }
+
+    fn annex_repo() -> RepoState {
+        let mut repo = RepoState::new_opening(
+            RepoId(7),
+            RepoSpec {
+                workdir: PathBuf::from("/tmp/annex"),
+            },
+        );
+        let branch = |name: &str| Branch {
+            name: name.to_string(),
+            target: commit_id("aaaaaaaa"),
+            upstream: None,
+            divergence: None,
+        };
+        repo.branches = Loadable::Ready(Arc::new(vec![
+            branch("main"),
+            branch("git-annex"),
+            branch("synced/main"),
+        ]));
+        repo.remote_branches = Loadable::Ready(Arc::new(vec![
+            RemoteBranch {
+                remote: "origin".to_string(),
+                name: "main".to_string(),
+                target: commit_id("aaaaaaaa"),
+            },
+            RemoteBranch {
+                remote: "origin".to_string(),
+                name: "git-annex".to_string(),
+                target: commit_id("bbbbbbbb"),
+            },
+        ]));
+        let mut support = gitcomet_core::large_files::LargeFileSupport::default();
+        support.annex.uuid = Some("u-here".into());
+        support.annex.has_annex_branch = true;
+        support.annex.numcopies = Some(2);
+        support.annex.repositories = vec![
+            gitcomet_core::large_files::AnnexRepository {
+                uuid: "00000000-0000-0000-0000-000000000001".into(),
+                description: "web".into(),
+                remote_name: None,
+                special_type: None,
+                special_name: None,
+                trust: gitcomet_core::large_files::AnnexTrust::Semitrusted,
+                here: false,
+            },
+            gitcomet_core::large_files::AnnexRepository {
+                uuid: "u-here".into(),
+                description: "laptop".into(),
+                remote_name: None,
+                special_type: None,
+                special_name: None,
+                trust: gitcomet_core::large_files::AnnexTrust::Semitrusted,
+                here: true,
+            },
+            gitcomet_core::large_files::AnnexRepository {
+                uuid: "u-backup".into(),
+                description: String::new(),
+                remote_name: Some("backup".into()),
+                special_type: Some("directory".into()),
+                special_name: None,
+                trust: gitcomet_core::large_files::AnnexTrust::Untrusted,
+                here: false,
+            },
+        ];
+        repo.large_file_support = Loadable::Ready(Arc::new(support));
+        repo
+    }
+
+    fn branch_labels(rows: &[BranchSidebarRow]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                BranchSidebarRow::Branch { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn annex_section_lists_repositories_without_builtin_remotes() {
+        let repo = annex_repo();
+        let rows = branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), "");
+        let header = rows.iter().find_map(|row| match row {
+            BranchSidebarRow::AnnexHeader { summary, .. } => Some(summary.clone()),
+            _ => None,
+        });
+        assert_eq!(header, Some(Some("numcopies 2".into())));
+        let items: Vec<(String, String, bool, bool)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                BranchSidebarRow::AnnexRepositoryItem {
+                    name,
+                    detail,
+                    here,
+                    untrusted,
+                    ..
+                } => Some((name.to_string(), detail.to_string(), *here, *untrusted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                (
+                    "laptop".into(),
+                    "this clone · semitrusted".into(),
+                    true,
+                    false
+                ),
+                (
+                    "[backup]".into(),
+                    "directory · untrusted".into(),
+                    false,
+                    true
+                ),
+            ]
+        );
+
+        let rows_for =
+            |repo: &RepoState| branch_sidebar_rows(repo, &BTreeSet::new(), &BTreeSet::new(), "");
+        let mut uninitialized = annex_repo();
+        if let Loadable::Ready(support) = &mut uninitialized.large_file_support {
+            Arc::make_mut(support).annex.uuid = None;
+        }
+        let rows = branch_sidebar_rows(&uninitialized, &BTreeSet::new(), &BTreeSet::new(), "");
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            BranchSidebarRow::AnnexPlaceholder { can_init: true, .. }
+        )));
+
+        let is_restage_row = |row: &BranchSidebarRow| {
+            matches!(
+                row,
+                BranchSidebarRow::AnnexPlaceholder {
+                    can_restage: true,
+                    ..
+                }
+            )
+        };
+        assert!(!rows_for(&annex_repo()).iter().any(is_restage_row));
+        let mut stale = annex_repo();
+        if let Loadable::Ready(support) = &mut stale.large_file_support {
+            Arc::make_mut(support).annex.restage_pending = true;
+        }
+        let rows = rows_for(&stale);
+        assert!(
+            rows.iter().any(is_restage_row),
+            "interrupted get offers a refresh"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, BranchSidebarRow::AnnexRepositoryItem { .. })),
+            "repositories stay listed below the refresh row"
+        );
+        let (fresh_source, _) = branch_sidebar_source_fingerprint(&annex_repo(), None);
+        let (stale_source, _) = branch_sidebar_source_fingerprint(&stale, None);
+        assert_ne!(fresh_source, stale_source, "cached rows must not be reused");
+
+        let mut plain = annex_repo();
+        plain.large_file_support = Loadable::Ready(Arc::new(Default::default()));
+        let rows = branch_sidebar_rows(&plain, &BTreeSet::new(), &BTreeSet::new(), "");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, BranchSidebarRow::AnnexHeader { .. }))
+        );
+    }
+
+    #[test]
+    fn review_annex_sidebar_displays_raw_description_with_remote_decoration() {
+        let mut repo = annex_repo();
+        let Loadable::Ready(support) = &mut repo.large_file_support else {
+            panic!("support")
+        };
+        Arc::make_mut(support).annex.repositories[2].description = "Archive".into();
+        let rows = branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), "");
+        assert!(rows.iter().any(|row| matches!(row, BranchSidebarRow::AnnexRepositoryItem { name, .. } if name.as_ref() == "Archive [backup]")));
+    }
+
+    #[test]
+    fn hidden_annex_refs_leave_branch_lists_and_change_the_cache_source() {
+        let mut repo = annex_repo();
+        let shown = branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), "");
+        let (shown_source, cached) = branch_sidebar_source_fingerprint(&repo, None);
+        assert!(branch_labels(&shown).iter().any(|name| name == "git-annex"));
+
+        repo.annex_refs_hidden = true;
+        let hidden = branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), "");
+        let labels = branch_labels(&hidden);
+        assert!(
+            !labels
+                .iter()
+                .any(|name| name == "git-annex" || name.starts_with("synced")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|name| name == "main"), "{labels:?}");
+        assert!(!branch_sidebar_source_matches_cached(&repo, &cached));
+        let (hidden_source, _) = branch_sidebar_source_fingerprint(&repo, Some(&cached));
+        assert_eq!(
+            hidden_source,
+            branch_sidebar_source_fingerprint(&repo, None).0
+        );
+        assert_ne!(
+            shown_source, hidden_source,
+            "cached rows must not be reused"
+        );
+    }
+
+    #[test]
+    fn annex_support_invalidates_both_sidebar_cache_reuse_paths() {
+        let mut repo = annex_repo();
+        repo.large_file_support = Loadable::NotLoaded;
+        let (mut source, mut cached) = branch_sidebar_source_fingerprint(&repo, None);
+        for support in [
+            Loadable::Loading,
+            annex_repo().large_file_support,
+            {
+                let mut support = match annex_repo().large_file_support {
+                    Loadable::Ready(support) => (*support).clone(),
+                    _ => unreachable!(),
+                };
+                support.annex.uuid = Some("changed-uuid".into());
+                support.annex.restage_pending = true;
+                Loadable::Ready(Arc::new(support))
+            },
+            Loadable::NotLoaded,
+        ] {
+            repo.large_file_support = support;
+            repo.branch_sidebar_rev += 1;
+            assert!(!branch_sidebar_source_matches_cached(&repo, &cached));
+            let (next, parts) = branch_sidebar_source_fingerprint(&repo, Some(&cached));
+            assert_ne!(source, next);
+            assert_eq!(next, branch_sidebar_source_fingerprint(&repo, None).0);
+            assert_eq!(parts.local_hash, cached.local_hash);
+            assert_eq!(parts.remote_hash, cached.remote_hash);
+            assert!(branch_sidebar_source_matches_cached(&repo, &parts));
+            (source, cached) = (next, parts);
+        }
+    }
+
+    #[test]
+    fn annex_support_revision_invalidates_an_in_place_update() {
+        let mut repo = annex_repo();
+        let (old, cached) = branch_sidebar_source_fingerprint(&repo, None);
+        let Loadable::Ready(support) = &mut repo.large_file_support else {
+            unreachable!()
+        };
+        Arc::make_mut(support).annex.restage_pending = true;
+        repo.large_file_support_rev += 1;
+        assert!(!branch_sidebar_source_matches_cached(&repo, &cached));
+        let (updated, _) = branch_sidebar_source_fingerprint(&repo, Some(&cached));
+        assert_ne!(old, updated);
+        assert_eq!(updated, branch_sidebar_source_fingerprint(&repo, None).0);
+    }
+
+    #[test]
+    fn checked_out_annex_bookkeeping_branch_stays_visible() {
+        for head in ["git-annex", "synced/main"] {
+            let mut repo = annex_repo();
+            repo.annex_refs_hidden = true;
+            repo.head_branch = Loadable::Ready(head.into());
+            let rows = branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), "");
+            let labels = branch_labels(&rows);
+            assert!(labels.iter().any(|name| name == head), "{head}: {labels:?}");
+            let other = if head == "git-annex" {
+                "synced/main"
+            } else {
+                "git-annex"
+            };
+            assert!(
+                !labels.iter().any(|name| name == other),
+                "{head}: {labels:?}"
+            );
+            assert!(!labels.iter().any(|name| name == "origin/git-annex"));
+        }
     }
 
     #[test]
@@ -2159,198 +2920,31 @@ mod tests {
     }
 
     #[test]
-    fn pinned_branches_render_in_a_pinned_section_above_their_home_section() {
+    fn pinned_branches_keep_their_tree_copies_without_extra_headers() {
         let repo = populated_repo();
         let pinned = BTreeSet::from([
             branch_pin_storage_key(BranchSection::Local, "main"),
             branch_pin_storage_key(BranchSection::Remote, "origin/main"),
         ]);
-        let rows = branch_sidebar_rows(&repo, &BTreeSet::new(), &pinned, "");
-
-        // The pinned local section leads the whole list.
-        assert!(
-            matches!(
-                rows.first(),
-                Some(BranchSidebarRow::PinnedHeader {
-                    section: BranchSection::Local,
-                    ..
-                })
-            ),
-            "the pinned local section header should be the first row"
-        );
-
-        let pinned_headers: Vec<BranchSection> = rows
-            .iter()
-            .filter_map(|row| match row {
-                BranchSidebarRow::PinnedHeader { section, .. } => Some(*section),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            pinned_headers,
-            vec![BranchSection::Local, BranchSection::Remote],
-            "there should be one pinned local header then one pinned remote header"
-        );
-
-        // The pinned local branch sits under the local pinned header, the remote
-        // one under the remote pinned header — never mixed together.
-        let local_pin_pos = rows
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    BranchSidebarRow::PinnedHeader {
-                        section: BranchSection::Local,
-                        ..
-                    }
-                )
-            })
-            .expect("pinned local header should exist");
-        let remote_pin_pos = rows
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    BranchSidebarRow::PinnedHeader {
-                        section: BranchSection::Remote,
-                        ..
-                    }
-                )
-            })
-            .expect("pinned remote header should exist");
-        let local_header_pos_for_order = rows
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    BranchSidebarRow::SectionHeader {
-                        section: BranchSection::Local,
-                        ..
-                    }
-                )
-            })
-            .expect("local section header should exist");
-        let remote_header_pos_for_order = rows
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    BranchSidebarRow::SectionHeader {
-                        section: BranchSection::Remote,
-                        ..
-                    }
-                )
-            })
-            .expect("remote section header should exist");
-        // Each pinned section sits directly above its home section: pinned-local
-        // above Local, and pinned-remote between the Local and Remote sections.
-        assert!(
-            local_pin_pos < local_header_pos_for_order,
-            "the pinned local section should render above the Local Branches section"
-        );
-        assert!(
-            local_header_pos_for_order < remote_pin_pos
-                && remote_pin_pos < remote_header_pos_for_order,
-            "the pinned remote section should render above the Remote Branches section, \
-             not at the very top"
-        );
-
-        // The Remote area's divider sits above the pinned remote header (grouping
-        // the pins with Remote Branches), so the pinned remote header carries the
-        // top border and the Remote header does not. The pinned local section
-        // leads the list, so neither it nor the Local header draws a divider.
-        let header_top_border = |pos: usize| match &rows[pos] {
-            BranchSidebarRow::PinnedHeader { top_border, .. }
-            | BranchSidebarRow::SectionHeader { top_border, .. } => *top_border,
-            other => panic!("expected a header row, got {other:?}"),
-        };
-        assert!(
-            !header_top_border(local_pin_pos),
-            "the pinned local header should not draw a divider"
-        );
-        assert!(
-            !header_top_border(local_header_pos_for_order),
-            "the Local Branches header should not draw a divider"
-        );
-        assert!(
-            header_top_border(remote_pin_pos),
-            "the pinned remote header should carry the Remote area divider"
-        );
-        assert!(
-            !header_top_border(remote_header_pos_for_order),
-            "the Remote Branches header should not draw a second divider below the pins"
-        );
-
-        let local_pin_entries: Vec<(&str, BranchSection)> = rows[local_pin_pos + 1..]
-            .iter()
-            .take_while(|row| !matches!(row, BranchSidebarRow::SectionSpacer))
-            .filter_map(|row| match row {
-                BranchSidebarRow::Branch { name, section, .. } => Some((name.as_ref(), *section)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            local_pin_entries,
-            vec![("main", BranchSection::Local)],
-            "the pinned local section should hold only the pinned local branch"
-        );
-        let remote_pin_entries: Vec<(&str, BranchSection)> = rows[remote_pin_pos + 1..]
-            .iter()
-            .take_while(|row| !matches!(row, BranchSidebarRow::SectionSpacer))
-            .filter_map(|row| match row {
-                BranchSidebarRow::Branch { name, section, .. } => Some((name.as_ref(), *section)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            remote_pin_entries,
-            vec![("origin/main", BranchSection::Remote)],
-            "the pinned remote section should hold only the pinned remote branch"
-        );
-
-        // The pinned branch also remains in its home Local section below.
-        let local_header_pos = rows
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    BranchSidebarRow::SectionHeader {
-                        section: BranchSection::Local,
-                        ..
-                    }
-                )
-            })
-            .expect("local section header should exist");
-        let main_below_header = rows[local_header_pos..].iter().any(|row| {
-            matches!(
-                row,
-                BranchSidebarRow::Branch {
-                    name,
-                    section: BranchSection::Local,
-                    ..
-                } if name.as_ref() == "main"
-            )
-        });
-        assert!(
-            main_below_header,
-            "a pinned branch should still appear in its home section"
-        );
+        let pins = expanded_pinned_rows(&repo, &pinned, &BTreeSet::new());
+        assert_eq!(pins.len(), 2);
+        let tree = expanded_sidebar_rows(&repo, &BTreeSet::new(), "");
+        for pin in pins {
+            let BranchSidebarRow::Branch { target, .. } = pin else {
+                panic!("expected a branch pin")
+            };
+            assert!(tree.iter().any(|row| matches!(row, BranchSidebarRow::Branch { target: candidate, .. } if *candidate == target)));
+        }
     }
 
     #[test]
-    fn pins_for_missing_branches_produce_no_pinned_section() {
+    fn pins_for_missing_branches_produce_no_rows() {
         let repo = populated_repo();
         let pinned = BTreeSet::from([branch_pin_storage_key(
             BranchSection::Local,
             "branch-that-was-deleted",
         )]);
-        let rows = branch_sidebar_rows(&repo, &BTreeSet::new(), &pinned, "");
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row, BranchSidebarRow::PinnedHeader { .. })),
-            "a pin for a nonexistent branch should not create a Pinned section"
-        );
+        assert!(expanded_pinned_rows(&repo, &pinned, &BTreeSet::new()).is_empty());
     }
 
     #[test]

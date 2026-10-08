@@ -1,9 +1,9 @@
 use super::util::{
     DiffReloadMode, SelectedConflictTarget, apply_selected_diff_load_plan_state,
-    apply_selected_diff_load_plan_state_with_reload_mode, clear_banner_error_for_repo,
-    diff_reload_effects, format_failure_summary, push_action_log, push_command_log,
-    refresh_full_effects, refresh_primary_effects, selected_conflict_target,
-    selected_diff_load_plan, start_conflict_target_reload, start_current_conflict_target_reload,
+    apply_selected_diff_load_plan_state_with_reload_mode, diff_reload_effects,
+    format_failure_summary, push_action_log, push_command_log, refresh_full_effects,
+    refresh_primary_effects, selected_conflict_target, selected_diff_load_plan,
+    start_conflict_target_reload, start_current_conflict_target_reload,
 };
 use crate::model::{
     AppState, InteractiveCherryPickSetup, InteractiveRebaseSetup, Loadable, RepoId,
@@ -62,6 +62,7 @@ pub(super) fn cherry_pick_commit(
         commit,
         mainline,
         summary,
+        auth: None,
     }]
 }
 
@@ -78,6 +79,21 @@ pub(super) fn revert_commit(
         commit,
         mainline,
         summary,
+        auth: None,
+    }]
+}
+
+pub(super) fn apply_file_change(
+    repo_id: RepoId,
+    target: gitcomet_core::domain::ApplyChangeTarget,
+    commit: bool,
+    commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
+) -> Vec<Effect> {
+    vec![Effect::ApplyFileChange {
+        repo_id,
+        target,
+        commit,
+        commit_retry,
         auth: None,
     }]
 }
@@ -264,14 +280,18 @@ pub(super) fn discard_worktree_changes_paths(repo_id: RepoId, paths: Vec<PathBuf
 pub(super) fn save_worktree_file(
     repo_id: RepoId,
     path: PathBuf,
-    contents: String,
+    contents: crate::msg::ContentBytes,
+    expected_contents: Option<std::sync::Arc<[u8]>>,
     stage: bool,
+    completion: Option<smol::channel::Sender<bool>>,
 ) -> Vec<Effect> {
     vec![Effect::SaveWorktreeFile {
         repo_id,
         path,
         contents,
+        expected_contents,
         stage,
+        completion,
     }]
 }
 
@@ -341,6 +361,82 @@ fn bump_in_flight(
     }
 }
 
+pub(super) fn run_large_file_command(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    command: gitcomet_core::large_files::LargeFileCommand,
+) -> Vec<Effect> {
+    run_large_file_command_with_auth(repos, state, repo_id, command, None)
+}
+
+fn run_large_file_command_with_auth(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    command: gitcomet_core::large_files::LargeFileCommand,
+    auth: Option<StagedGitAuth>,
+) -> Vec<Effect> {
+    let pulls = command.pulls();
+    let pushes = command.pushes();
+    if let Some(repo) = state.repos.iter_mut().find(|repo| repo.id == repo_id)
+        && repo.large_file_command_busy(&command)
+    {
+        let label = command.label();
+        repo.pending
+            .large_file_commands
+            .push_back(crate::model::PendingLargeFileCommand { command, auth });
+        repo.bump_ops_rev();
+        super::util::push_notification(
+            state,
+            crate::model::AppNotificationKind::Info,
+            format!("{label} queued until the running pull or push finishes."),
+        );
+        return Vec::new();
+    }
+    if pulls {
+        bump_in_flight(repos, state, repo_id, InFlightKind::WorktreePull);
+    }
+    if pushes {
+        bump_in_flight(repos, state, repo_id, InFlightKind::Push);
+    }
+    super::begin_local_action(state, repo_id);
+    vec![Effect::RunLargeFileCommand {
+        repo_id,
+        command,
+        auth,
+    }]
+}
+
+pub(super) fn start_queued_large_file_commands(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    while let Some(repo) = state.repos.iter_mut().find(|repo| repo.id == repo_id) {
+        let Some(next) = repo.pending.large_file_commands.front() else {
+            break;
+        };
+        if repo.large_file_command_busy(&next.command) {
+            break;
+        }
+        let next = repo
+            .pending
+            .large_file_commands
+            .pop_front()
+            .expect("queued command");
+        effects.extend(run_large_file_command_with_auth(
+            repos,
+            state,
+            repo_id,
+            next.command,
+            next.auth,
+        ));
+    }
+    effects
+}
+
 pub(super) fn fetch_all(
     repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
@@ -367,6 +463,22 @@ pub(super) fn fetch_branch(
         repo_id,
         remote,
         branch,
+    }]
+}
+
+pub(super) fn fetch_refspecs(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    remote: String,
+    refspecs: Vec<String>,
+) -> Vec<Effect> {
+    bump_in_flight(repos, state, repo_id, InFlightKind::Pull);
+    vec![Effect::FetchRefspecs {
+        repo_id,
+        remote,
+        refspecs,
+        auth: None,
     }]
 }
 
@@ -707,8 +819,13 @@ pub(super) fn open_interactive_cherry_pick_setup(
 pub(super) fn interactive_cherry_pick(
     repo_id: RepoId,
     entries: Vec<InteractiveRebaseEntry>,
+    commit: bool,
 ) -> Vec<Effect> {
-    vec![Effect::InteractiveCherryPick { repo_id, entries }]
+    vec![Effect::InteractiveCherryPick {
+        repo_id,
+        entries,
+        commit,
+    }]
 }
 
 pub(super) fn cancel_interactive_rebase_setup(
@@ -871,55 +988,24 @@ pub(super) fn drop_stash(repo_id: RepoId, index: usize) -> Vec<Effect> {
 /// and `blame_source` are intentionally preserved so the view reloads the same
 /// target's blame against the new content.
 pub(super) fn invalidate_loaded_blame(repo_state: &mut RepoState) {
-    if !matches!(repo_state.history_state.blame, Loadable::NotLoaded) {
+    if !matches!(repo_state.diff_state.blame, Loadable::NotLoaded) {
         // Keep the outgoing annotations available to the view so the column
         // stays painted across the reload; the target is unchanged, so they
         // still describe the right file.
         repo_state.retain_blame_while_loading();
-        repo_state.history_state.blame = Loadable::NotLoaded;
+        repo_state.diff_state.blame = Loadable::NotLoaded;
     }
 }
 
+/// Completion handling for `Msg::CommitFinished` / `Msg::CommitAmendFinished`.
 pub(super) fn commit_finished(
     state: &mut AppState,
     repo_id: RepoId,
     result: std::result::Result<(), Error>,
+    amend: bool,
 ) -> Vec<Effect> {
-    commit_completion_finished(state, repo_id, result, CommitCompletionKind::Commit)
-}
-
-pub(super) fn commit_amend_finished(
-    state: &mut AppState,
-    repo_id: RepoId,
-    result: std::result::Result<(), Error>,
-) -> Vec<Effect> {
-    commit_completion_finished(state, repo_id, result, CommitCompletionKind::Amend)
-}
-
-#[derive(Clone, Copy)]
-enum CommitCompletionKind {
-    Commit,
-    Amend,
-}
-
-impl CommitCompletionKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Commit => "Commit",
-            Self::Amend => "Amend",
-        }
-    }
-}
-
-/// Shared completion handling for `Msg::CommitFinished` / `Msg::CommitAmendFinished`.
-fn commit_completion_finished(
-    state: &mut AppState,
-    repo_id: RepoId,
-    result: std::result::Result<(), Error>,
-    kind: CommitCompletionKind,
-) -> Vec<Effect> {
-    let label = kind.label();
-    let mut clear_banner = false;
+    let label = if amend { "Amend" } else { "Commit" };
+    let mut succeeded = false;
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
     };
@@ -931,7 +1017,7 @@ fn commit_completion_finished(
     match result {
         Ok(()) => {
             repo_state.feedback.last_error = None;
-            clear_banner = true;
+            succeeded = true;
             repo_state.set_recent_commit_messages(Loadable::NotLoaded);
             repo_state.set_diff_target(None);
             repo_state.diff_state.diff = Loadable::NotLoaded;
@@ -956,13 +1042,11 @@ fn commit_completion_finished(
             push_action_log(repo_state, false, label.to_string(), summary, Some(&e));
         }
     }
-    if clear_banner {
+    if succeeded {
         let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
             return Vec::new();
         };
-        let effects = refresh_primary_effects(repo_state);
-        clear_banner_error_for_repo(state, repo_id);
-        return effects;
+        return refresh_primary_effects(repo_state);
     }
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
@@ -1027,6 +1111,93 @@ pub(super) fn safe_push_after_commit_finished(
     }
 }
 
+/// Support facts come from config, remotes, `.gitattributes`, HEAD,
+/// git-annex's logs and local object stores. A reload reads the index and every attributes file, so
+/// commands that change none of those skip it.
+fn command_may_change_large_file_support(command: &RepoCommandKind) -> bool {
+    match command {
+        RepoCommandKind::LargeFile { command } => {
+            use gitcomet_core::large_files::LargeFileCommand as C;
+            match command {
+                C::LfsPull { .. } | C::LfsFetchForDiff { .. }
+                | C::LfsInstall | C::LfsTrack { .. } | C::LfsFetchAll
+                | C::AnnexAdd { .. } | C::AnnexPull { .. } | C::AnnexPush { .. }
+                | C::AnnexSync { .. } | C::AnnexInit | C::AnnexAdjust { .. }
+                | C::AnnexLeaveAdjusted { .. } | C::AnnexEnableRemote { .. }
+                | C::AnnexInitRemote { .. } | C::AnnexTrust { .. }
+                | C::AnnexDescribe { .. } | C::AnnexNumcopies { .. }
+                | C::AnnexWebapp | C::AnnexStopAssistant | C::AnnexRestage => true,
+                C::LfsPushAll { .. } | C::LfsPrune
+                | C::LfsFsck | C::LfsLock { .. } | C::LfsUnlock { .. }
+                | C::AnnexGet { .. } | C::AnnexGetKeys { .. } | C::AnnexDrop { .. }
+                | C::AnnexCopy { .. } | C::AnnexMove { .. } | C::AnnexUnlock { .. }
+                | C::AnnexLock { .. } | C::AnnexFsck
+                | C::AnnexDropUnused { .. } => false,
+            }
+        }
+        // New commits or checked-out files can bring other `.gitattributes`.
+        RepoCommandKind::Pull { .. }
+        | RepoCommandKind::PullBranch { .. }
+        | RepoCommandKind::MergeRef { .. }
+        | RepoCommandKind::SquashRef { .. }
+        | RepoCommandKind::Reset { .. }
+        | RepoCommandKind::SquashCommits { .. }
+        | RepoCommandKind::Rebase { .. }
+        | RepoCommandKind::RebaseContinue
+        | RepoCommandKind::RebaseAbort
+        | RepoCommandKind::InteractiveRebase { .. }
+        | RepoCommandKind::InteractiveCherryPick { .. }
+        | RepoCommandKind::CherryPick { .. }
+        | RepoCommandKind::Revert { .. }
+        | RepoCommandKind::MergeAbort
+        | RepoCommandKind::ApplyPatch { .. }
+        | RepoCommandKind::ApplyFileChange { .. }
+        | RepoCommandKind::SaveWorktreeFile { .. }
+        | RepoCommandKind::AppendGitattributesRule { .. }
+        // Annex repositories are listed under their remote names.
+        | RepoCommandKind::AddRemote { .. }
+        | RepoCommandKind::RemoveRemote { .. }
+        | RepoCommandKind::SetRemoteUrl { .. } => true,
+        RepoCommandKind::FetchAll
+        | RepoCommandKind::FetchBranch { .. }
+        | RepoCommandKind::FetchRefspecs { .. }
+        | RepoCommandKind::PruneMergedBranches
+        | RepoCommandKind::PruneLocalTags
+        | RepoCommandKind::Push
+        | RepoCommandKind::PushWithTags { .. }
+        | RepoCommandKind::PushAfterCommit { .. }
+        | RepoCommandKind::ForcePush
+        | RepoCommandKind::ForcePushWithLease { .. }
+        | RepoCommandKind::PushSetUpstream { .. }
+        | RepoCommandKind::SetUpstreamBranch { .. }
+        | RepoCommandKind::UnsetUpstreamBranch { .. }
+        | RepoCommandKind::DeleteRemoteBranch { .. }
+        | RepoCommandKind::DeleteRemoteBranches { .. }
+        | RepoCommandKind::CreateTag { .. }
+        | RepoCommandKind::DeleteTag { .. }
+        | RepoCommandKind::PushTag { .. }
+        | RepoCommandKind::DeleteRemoteTag { .. }
+        | RepoCommandKind::CheckoutConflict { .. }
+        | RepoCommandKind::AcceptConflictDeletion { .. }
+        | RepoCommandKind::CheckoutConflictBase { .. }
+        | RepoCommandKind::LaunchMergetool { .. }
+        | RepoCommandKind::AppendGitignorePatterns { .. }
+        | RepoCommandKind::ExportPatch { .. }
+        | RepoCommandKind::AddWorktree { .. }
+        | RepoCommandKind::RemoveWorktree { .. }
+        | RepoCommandKind::ForceRemoveWorktree { .. }
+        | RepoCommandKind::AddSubmodule { .. }
+        | RepoCommandKind::UpdateSubmodules { .. }
+        | RepoCommandKind::LoadSubmodule { .. }
+        | RepoCommandKind::ChangeSubmodulePointer { .. }
+        | RepoCommandKind::RemoveSubmodule { .. }
+        | RepoCommandKind::StageHunk
+        | RepoCommandKind::UnstageHunk
+        | RepoCommandKind::ApplyWorktreePatch { .. }
+        | RepoCommandKind::RunMaintenance => false,
+    }
+}
+
 fn tracks_local_actions_in_flight(command: &RepoCommandKind) -> bool {
     matches!(
         command,
@@ -1041,6 +1212,7 @@ fn tracks_local_actions_in_flight(command: &RepoCommandKind) -> bool {
             | RepoCommandKind::InteractiveCherryPick { .. }
             | RepoCommandKind::CherryPick { .. }
             | RepoCommandKind::Revert { .. }
+            | RepoCommandKind::ApplyFileChange { .. }
             | RepoCommandKind::MergeAbort
             | RepoCommandKind::CreateTag { .. }
             | RepoCommandKind::DeleteTag { .. }
@@ -1055,6 +1227,7 @@ fn tracks_local_actions_in_flight(command: &RepoCommandKind) -> bool {
             | RepoCommandKind::LaunchMergetool { .. }
             | RepoCommandKind::SaveWorktreeFile { .. }
             | RepoCommandKind::AppendGitignorePatterns { .. }
+            | RepoCommandKind::LargeFile { .. }
             | RepoCommandKind::ExportPatch { .. }
             | RepoCommandKind::ApplyPatch { .. }
             | RepoCommandKind::AddSubmodule { .. }
@@ -1084,6 +1257,7 @@ pub(super) fn command_touches_sequencer_state(command: &RepoCommandKind) -> bool
             | RepoCommandKind::InteractiveCherryPick { .. }
             | RepoCommandKind::CherryPick { .. }
             | RepoCommandKind::Revert { .. }
+            | RepoCommandKind::ApplyFileChange { commit: true, .. }
             | RepoCommandKind::MergeAbort
     )
 }
@@ -1109,6 +1283,7 @@ fn command_clears_pending_force_push_lease(command: &RepoCommandKind) -> bool {
             | RepoCommandKind::InteractiveCherryPick { .. }
             | RepoCommandKind::CherryPick { .. }
             | RepoCommandKind::Revert { .. }
+            | RepoCommandKind::ApplyFileChange { commit: true, .. }
             | RepoCommandKind::MergeAbort
     )
 }
@@ -1163,14 +1338,7 @@ pub(super) fn repo_command_finished(
             | RepoCommandKind::RemoveSubmodule { .. }
     ) && result.is_ok();
     let command_succeeded = result.is_ok();
-    let fetch_like_command = matches!(
-        &command,
-        RepoCommandKind::FetchAll
-            | RepoCommandKind::FetchBranch { .. }
-            | RepoCommandKind::PruneMergedBranches
-            | RepoCommandKind::Pull { .. }
-            | RepoCommandKind::PullBranch { .. }
-    );
+    let fetch_like_command = command.fetches_objects();
     let refresh_remote_branches = fetch_like_command
         || matches!(
             &command,
@@ -1192,7 +1360,6 @@ pub(super) fn repo_command_finished(
                 | RepoCommandKind::DeleteTag { .. }
                 | RepoCommandKind::PruneLocalTags
         );
-    let mut clear_banner = false;
 
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
@@ -1202,6 +1369,16 @@ pub(super) fn repo_command_finished(
     }
 
     let mut extra_effects = Vec::new();
+    if let RepoCommandKind::LargeFile { command } = &command {
+        if command.pulls() {
+            repo_state.pull_in_flight = repo_state.pull_in_flight.saturating_sub(1);
+            repo_state.worktree_pull_in_flight =
+                repo_state.worktree_pull_in_flight.saturating_sub(1);
+        }
+        if command.pushes() {
+            repo_state.push_in_flight = repo_state.push_in_flight.saturating_sub(1);
+        }
+    }
     if refresh_remote_branches && !matches!(repo_state.remote_branches, Loadable::Ready(_)) {
         // A fetch may have updated or pruned refs even when a later phase failed.
         // Keep a successful pre-command snapshot visible while it is revalidated;
@@ -1211,6 +1388,7 @@ pub(super) fn repo_command_finished(
     match &command {
         RepoCommandKind::FetchAll
         | RepoCommandKind::FetchBranch { .. }
+        | RepoCommandKind::FetchRefspecs { .. }
         | RepoCommandKind::PruneMergedBranches
         | RepoCommandKind::PruneLocalTags => {
             repo_state.pull_in_flight = repo_state.pull_in_flight.saturating_sub(1);
@@ -1260,7 +1438,6 @@ pub(super) fn repo_command_finished(
     match result {
         Ok(output) => {
             repo_state.feedback.last_error = None;
-            clear_banner = true;
             if command_clears_pending_force_push_lease(&command) {
                 repo_state.pending.force_push_lease = None;
             }
@@ -1333,6 +1510,66 @@ pub(super) fn repo_command_finished(
         repo_state.diff_state.inline_submodule_diff = None;
         repo_state.bump_diff_state_rev();
         extra_effects.extend(diff_reload_effects(repo_state, repo_id, target));
+    }
+    if command_succeeded
+        && command_may_change_large_file_support(&command)
+        && let Some(effect) = super::effects::request_large_file_support_effect(repo_state)
+    {
+        extra_effects.push(effect);
+    }
+    if command_succeeded
+        && let RepoCommandKind::LargeFile { command } = &command
+        && command.is_annex()
+        && (command.changes_object_store()
+            || matches!(
+                command,
+                gitcomet_core::large_files::LargeFileCommand::AnnexTrust { .. }
+                    | gitcomet_core::large_files::LargeFileCommand::AnnexDescribe { .. }
+            ))
+    {
+        for key in repo_state.annex_whereis.keys().cloned().collect::<Vec<_>>() {
+            repo_state.set_annex_whereis(key.clone(), Loadable::Loading);
+            extra_effects.push(Effect::LoadAnnexWhereis { repo_id, key });
+        }
+    }
+    // A listing that was shown is stale once content moved.
+    if matches!(&command, RepoCommandKind::LargeFile { command } if command.is_annex() && command.changes_object_store())
+        && !matches!(repo_state.annex_unused, Loadable::NotLoaded)
+    {
+        extra_effects.extend(super::effects::request_annex_unused_effect(repo_state));
+    }
+    // Lock and unlock change server state the rows show.
+    if matches!(&command, RepoCommandKind::LargeFile { command } if command.changes_locks())
+        && let Some(effect) = super::effects::request_lfs_locks_effect(repo_state)
+    {
+        extra_effects.push(effect);
+    }
+    // Object-store changes do not modify Git history, but do change the
+    // contents and presence metadata of an already selected historical diff.
+    // A batch can fetch some keys and still fail overall.
+    if matches!(
+        &command,
+        RepoCommandKind::LargeFile { command } if command.changes_object_store()
+    ) {
+        if let Some(target) = repo_state.diff_state.diff_target.clone() {
+            let load_plan = selected_diff_load_plan(repo_state, &target);
+            apply_selected_diff_load_plan_state_with_reload_mode(
+                repo_state,
+                load_plan,
+                DiffReloadMode::KeepLoaded,
+            );
+            repo_state.bump_diff_state_rev();
+            extra_effects.extend(diff_reload_effects(repo_state, repo_id, target));
+        }
+        if let Some(commit_id) = repo_state.history_state.selected_commit.clone() {
+            extra_effects.push(Effect::LoadCommitDetails { repo_id, commit_id });
+        }
+    }
+    if command_succeeded && matches!(command, RepoCommandKind::AppendGitattributesRule { .. }) {
+        // A root rule can be shadowed by deeper attributes or info/attributes.
+        // Keep the user's choice for this open file; Auto-detect or selecting
+        // another file ends it. The refreshed attributes decide any reload.
+        extra_effects.extend(super::util::reload_selected_text_attributes(repo_state));
     }
     if refresh_submodules {
         repo_state.set_submodules(Loadable::Loading);
@@ -1407,9 +1644,6 @@ pub(super) fn repo_command_finished(
     }
     let mut effects = refresh_full_effects(repo_state, state.git_log_settings);
     effects.extend(extra_effects);
-    if clear_banner {
-        clear_banner_error_for_repo(state, repo_id);
-    }
     effects
 }
 

@@ -21,6 +21,10 @@ required-features = ["benchmarks"]
 name = "operation-context-probe"
 required-features = ["benchmarks"]
 
+[[example]]
+name = "interaction-probe"
+required-features = ["benchmarks"]
+
 # Cargo builds this fixture for integration tests. Application packages depend
 # only on this package's library, so it is not part of application distributions.
 [[bin]]
@@ -31,14 +35,24 @@ bench = false
 doc = false
 
 [dependencies]
+crc32fast = { workspace = true }
+flate2 = { workspace = true }
+fnv = { workspace = true }
 gitcomet-core = { workspace = true }
+filetime = { workspace = true }
 gix = { workspace = true }
+itertools = { workspace = true }
 lru = { workspace = true }
 memchr = { workspace = true }
 rustc-hash = { workspace = true }
 rustix = { workspace = true }
+same-file = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
 
 [dev-dependencies]
 gitcomet-core = { workspace = true, features = ["test-support", "benchmarks"] }

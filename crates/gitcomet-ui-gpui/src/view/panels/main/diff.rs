@@ -17,6 +17,55 @@ fn image_diff_ready_shows_processing(has_file: bool, cache_active: bool) -> bool
     has_file && !cache_active
 }
 
+/// At most two distinct content versions; identical sides share a lookup.
+fn annex_card_keys(
+    old: Option<&gitcomet_core::large_files::LargeFileSide>,
+    new: Option<&gitcomet_core::large_files::LargeFileSide>,
+    missing_only: bool,
+) -> Vec<String> {
+    use gitcomet_core::large_files::{LargeFileContent, LargeFilePointer};
+    let mut keys = Vec::new();
+    for side in [old, new].into_iter().flatten() {
+        if missing_only
+            && matches!(
+                side.content,
+                LargeFileContent::Available | LargeFileContent::TooLarge { .. }
+            )
+        {
+            continue;
+        }
+        if let LargeFilePointer::Annex(key) = &side.pointer
+            && !keys.iter().any(|raw: &String| raw == key.raw.as_ref())
+        {
+            keys.push(key.raw.to_string());
+        }
+    }
+    keys
+}
+
+fn annex_whereis_lines(
+    loaded: &Loadable<std::sync::Arc<gitcomet_core::large_files::AnnexWhereis>>,
+) -> Vec<String> {
+    match loaded {
+        Loadable::Ready(whereis) if whereis.copies.is_empty() && whereis.untrusted.is_empty() => {
+            vec!["No known copies.".to_string()]
+        }
+        Loadable::Ready(whereis) => whereis
+            .copies
+            .iter()
+            .map(|copy| (copy, false))
+            .chain(whereis.untrusted.iter().map(|copy| (copy, true)))
+            .map(|(copy, untrusted)| {
+                let trust = if untrusted { " (untrusted)" } else { "" };
+                let here = if copy.here { " · this clone" } else { "" };
+                format!("{}{here}{trust}", copy.description)
+            })
+            .collect(),
+        Loadable::Error(error) => vec![error.clone()],
+        Loadable::Loading | Loadable::NotLoaded => vec!["Looking up copies…".to_string()],
+    }
+}
+
 /// Inset between an image/SVG preview column and its artwork.
 const IMAGE_PREVIEW_CELL_PADDING_PX: f32 = 16.0;
 
@@ -55,6 +104,164 @@ impl MainPaneView {
         conflict.map(|kind| {
             gitcomet_core::conflict_session::ConflictResolverStrategy::for_conflict(kind, is_binary)
         })
+    }
+
+    /// Metadata also travels through the image and single-side preview paths,
+    /// which deliberately do not load a text diff.
+    pub(super) fn rendered_large_file_sides(
+        &self,
+        image: bool,
+    ) -> (
+        Option<gitcomet_core::large_files::LargeFileSide>,
+        Option<gitcomet_core::large_files::LargeFileSide>,
+    ) {
+        if image {
+            return match self.rendered_file_image_diff_loadable() {
+                Some(Loadable::Ready(Some(file))) => {
+                    (file.old_large.clone(), file.new_large.clone())
+                }
+                _ => (None, None),
+            };
+        }
+        if !self.is_inline_submodule_diff_active()
+            && let Some(repo) = self.active_repo()
+            && let Loadable::Ready(Some(preview)) = &repo.diff_state.diff_preview_text_file
+            && preview.large_file.is_some()
+        {
+            return match preview.side {
+                gitcomet_core::domain::DiffPreviewTextSide::Old => {
+                    (preview.large_file.clone(), None)
+                }
+                gitcomet_core::domain::DiffPreviewTextSide::New => {
+                    (None, preview.large_file.clone())
+                }
+            };
+        }
+        match self.rendered_file_diff_loadable() {
+            Some(Loadable::Ready(Some(file))) => (file.old_large.clone(), file.new_large.clone()),
+            _ => (None, None),
+        }
+    }
+
+    /// Buttons under the large-file card, and for git-annex the list of
+    /// repositories holding the content once "Where is it?" has run.
+    /// `content_shown`: the real diff is below, so only lookups make sense.
+    pub(super) fn large_file_card_actions(
+        &mut self,
+        theme: AppTheme,
+        old: Option<&gitcomet_core::large_files::LargeFileSide>,
+        new: Option<&gitcomet_core::large_files::LargeFileSide>,
+        content_shown: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<AnyElement> {
+        use gitcomet_core::large_files::{LargeFileCommand, LargeFileContent};
+        if self.is_inline_submodule_diff_active() {
+            return None;
+        }
+        let repo = self.active_repo()?;
+        let repo_id = repo.id;
+        let target = self.rendered_diff_target()?.clone();
+        let sides = [old, new];
+        let mut buttons = div().flex().flex_wrap().gap_2();
+        let mut any = false;
+
+        let missing_lfs = sides
+            .iter()
+            .flatten()
+            .any(|side| side.pointer.is_lfs() && side.content == LargeFileContent::MissingLocally);
+        if missing_lfs && !content_shown {
+            let tool_missing = self.large_file_tools().git_lfs.is_not_found();
+            let target = target.clone();
+            any = true;
+            buttons = buttons.child(
+                components::Button::new(
+                    "large_file_card_download",
+                    if tool_missing {
+                        "Download content (install git-lfs)"
+                    } else {
+                        "Download content"
+                    },
+                )
+                .style(components::ButtonStyle::Filled)
+                .disabled(tool_missing)
+                .on_click(theme, cx, move |this, _e, _w, _cx| {
+                    this.store.dispatch(Msg::RunLargeFileCommand {
+                        repo_id,
+                        command: LargeFileCommand::LfsFetchForDiff {
+                            target: target.clone(),
+                        },
+                    });
+                }),
+            );
+        }
+
+        let annex_missing_tool = self.large_file_tools().git_annex.is_not_found();
+        let annex_keys = annex_card_keys(old, new, true);
+        if !annex_keys.is_empty() && !content_shown {
+            any = true;
+            buttons = buttons.child(
+                components::Button::new(
+                    "large_file_card_annex_get",
+                    if annex_missing_tool {
+                        "Get content (install git-annex)"
+                    } else {
+                        "Get content"
+                    },
+                )
+                .style(components::ButtonStyle::Filled)
+                .disabled(annex_missing_tool)
+                .on_click(theme, cx, move |this, _e, _w, _cx| {
+                    this.store.dispatch(Msg::RunLargeFileCommand {
+                        repo_id,
+                        command: LargeFileCommand::AnnexGetKeys {
+                            keys: annex_keys.clone(),
+                        },
+                    });
+                }),
+            );
+        }
+        let annex_keys = annex_card_keys(old, new, false);
+        let mut whereis_lines = Vec::new();
+        if !annex_keys.is_empty() {
+            for key in &annex_keys {
+                if let Some(loaded) = repo.annex_whereis_for(key) {
+                    if annex_keys.len() > 1 {
+                        whereis_lines.push(format!("{key}:"));
+                    }
+                    whereis_lines.extend(annex_whereis_lines(loaded));
+                }
+            }
+            any = true;
+            buttons = buttons.child(
+                components::Button::new("large_file_card_annex_whereis", "Where is it?")
+                    .style(components::ButtonStyle::Outlined)
+                    .disabled(annex_missing_tool)
+                    .on_click(theme, cx, move |this, _e, _w, _cx| {
+                        this.store.dispatch(Msg::LoadAnnexWhereis {
+                            repo_id,
+                            keys: annex_keys.clone(),
+                        });
+                    }),
+            );
+        }
+        if !any {
+            return None;
+        }
+        let mut column = div().flex().flex_col().gap_1().child(buttons);
+        if !whereis_lines.is_empty() {
+            let mut list = div()
+                .debug_selector(|| "large_file_card_whereis".to_string())
+                .flex()
+                .flex_col()
+                .text_size(theme.ui_text(12.0))
+                .text_color(theme.colors.foreground.secondary)
+                .child("Copies git-annex knows about:");
+            for line in whereis_lines {
+                list = list.child(div().pl_2().child(line));
+            }
+            column = column.child(list);
+        }
+        Some(column.into_any_element())
     }
 
     pub(super) fn render_selected_file_diff(
@@ -128,6 +335,7 @@ impl MainPaneView {
                         .flex_1()
                         .min_h(px(0.0))
                         .overflow_y_scroll()
+                        .track_scroll(&self.diff_raw_scroll)
                         .child(self.diff_raw_input.clone())
                         .into_any_element()
                 }
@@ -242,7 +450,7 @@ impl MainPaneView {
                         // A/B header and no empty "before" half to explain away.
                         let is_content_view = self
                             .active_repo()
-                            .is_some_and(|repo| repo.diff_state.content_preview);
+                            .is_some_and(|repo| self.bound_diff_state(repo).content_preview);
                         if is_content_view {
                             return div()
                                 .id("diff_image_container")
@@ -349,6 +557,7 @@ impl MainPaneView {
                             .flex_1()
                             .min_h(px(0.0))
                             .overflow_y_scroll()
+                            .track_scroll(&self.diff_raw_scroll)
                             .child(self.diff_raw_input.clone())
                             .into_any_element()
                     }
@@ -383,10 +592,25 @@ impl MainPaneView {
                     if !has_file {
                         components::empty_state(theme, "Diff", "No file contents available.")
                             .into_any_element()
+                    } else if let Some(
+                        crate::view::panes::main::diff_cache::FileDiffCacheError::NotText {
+                            old_bytes,
+                            new_bytes,
+                        },
+                    ) = self.file_diff_cache_error
+                    {
+                        components::empty_state(
+                            theme,
+                            "Binary file",
+                            crate::view::diff_utils::binary_diff_placeholder_message(
+                                old_bytes, new_bytes,
+                            ),
+                        )
+                        .into_any_element()
                     } else if let Some(error) = self.file_diff_cache_error.clone() {
                         self.diff_raw_input.update(cx, |input, cx| {
                             input.set_theme(theme, cx);
-                            input.set_text(error, cx);
+                            input.set_text(error.to_string(), cx);
                             input.set_read_only(true, cx);
                         });
                         div()
@@ -398,6 +622,7 @@ impl MainPaneView {
                             .flex_1()
                             .min_h(px(0.0))
                             .overflow_y_scroll()
+                            .track_scroll(&self.diff_raw_scroll)
                             .child(self.diff_raw_input.clone())
                             .into_any_element()
                     } else if file_diff_ready_shows_processing(
@@ -445,8 +670,8 @@ impl MainPaneView {
                                         );
                                     let list = uniform_list(
                                         "diff",
-                                        self.diff_visible_len(),
-                                        cx.processor(Self::render_diff_rows),
+                                        self.diff_list_len(),
+                                        cx.processor(Self::render_projected_inline),
                                     )
                                     .h_full()
                                     .min_h(px(0.0))
@@ -516,7 +741,7 @@ impl MainPaneView {
                                     self.sync_diff_split_scroll();
                                     let vertical_sync_enabled =
                                         self.diff_scroll_sync.includes_vertical();
-                                    let count = self.diff_visible_len();
+                                    let count = self.diff_list_len();
                                     let horizontal_scrollbar_gutter = components::Scrollbar::gutter(
                                         components::ScrollbarAxis::Horizontal,
                                     );
@@ -545,7 +770,7 @@ impl MainPaneView {
                                     let left = uniform_list(
                                         "diff_split_left",
                                         count,
-                                        cx.processor(Self::render_diff_split_left_rows),
+                                        cx.processor(Self::render_projected_left),
                                     )
                                     .h_full()
                                     .min_h(px(0.0))
@@ -570,7 +795,7 @@ impl MainPaneView {
                                     let right = uniform_list(
                                         "diff_split_right",
                                         count,
-                                        cx.processor(Self::render_diff_split_right_rows),
+                                        cx.processor(Self::render_projected_right),
                                     )
                                     .h_full()
                                     .min_h(px(0.0))
@@ -960,6 +1185,8 @@ impl MainPaneView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        let tab_width = self.display_tab_width;
+
         let ui_scale_percent = crate::ui_scale::UiScale::current(cx).percent();
         if preview.old_blocks.is_empty() && preview.new_blocks.is_empty() {
             return empty_diff_text_document(
@@ -1027,11 +1254,13 @@ impl MainPaneView {
             };
         let body = match self.diff_view {
             DiffViewMode::Inline => rows::render_markdown_document_with_blocks(
+                tab_width,
                 &preview.inline,
                 &preview.inline_blocks,
                 &context(self, DiffTextRegion::Inline, 2),
             ),
             DiffViewMode::Split => rows::render_markdown_diff_split(
+                tab_width,
                 &preview,
                 &context(self, DiffTextRegion::SplitLeft, 0),
                 &context(self, DiffTextRegion::SplitRight, 1),
@@ -1245,6 +1474,82 @@ impl MainPaneView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annex_locations_use_both_displayed_keys_and_deduplicate_identical_sides() {
+        use gitcomet_core::large_files::{LargeFileContent, LargeFilePointer, LargeFileSide};
+        let old = LargeFileSide {
+            pointer: LargeFilePointer::Annex(
+                gitcomet_core::annex::parse_key("SHA256E-s3--old.bin").unwrap(),
+            ),
+            content: LargeFileContent::Available,
+        };
+        let new = LargeFileSide {
+            pointer: LargeFilePointer::Annex(
+                gitcomet_core::annex::parse_key("SHA256E-s4--new.bin").unwrap(),
+            ),
+            content: LargeFileContent::MissingLocally,
+        };
+        assert_eq!(
+            annex_card_keys(Some(&old), Some(&new), false),
+            ["SHA256E-s3--old.bin", "SHA256E-s4--new.bin"]
+        );
+        assert_eq!(
+            annex_card_keys(Some(&old), Some(&new), true),
+            ["SHA256E-s4--new.bin"]
+        );
+        assert_eq!(
+            annex_card_keys(Some(&old), Some(&old), false),
+            ["SHA256E-s3--old.bin"]
+        );
+        assert_eq!(
+            annex_card_keys(Some(&old), None, false),
+            ["SHA256E-s3--old.bin"]
+        );
+        let too_large = LargeFileSide {
+            content: LargeFileContent::TooLarge {
+                bytes: 20 * 1024 * 1024,
+            },
+            ..old.clone()
+        };
+        assert!(annex_card_keys(Some(&too_large), None, true).is_empty());
+        assert_eq!(
+            annex_card_keys(Some(&too_large), None, false),
+            ["SHA256E-s3--old.bin"]
+        );
+    }
+
+    #[test]
+    fn annex_location_lines_include_untrusted_copies_even_without_trusted_ones() {
+        use gitcomet_core::large_files::{AnnexLocation, AnnexWhereis};
+        let mut whereis = AnnexWhereis {
+            key: "key".into(),
+            copies: vec![AnnexLocation {
+                uuid: "here".into(),
+                description: "laptop".into(),
+                here: true,
+            }],
+            untrusted: vec![AnnexLocation {
+                uuid: "backup".into(),
+                description: "backup".into(),
+                here: false,
+            }],
+        };
+        assert_eq!(
+            annex_whereis_lines(&Loadable::Ready(std::sync::Arc::new(whereis.clone()))),
+            ["laptop · this clone", "backup (untrusted)"]
+        );
+        whereis.copies.clear();
+        assert_eq!(
+            annex_whereis_lines(&Loadable::Ready(std::sync::Arc::new(whereis.clone()))),
+            ["backup (untrusted)"]
+        );
+        whereis.untrusted.clear();
+        assert_eq!(
+            annex_whereis_lines(&Loadable::Ready(std::sync::Arc::new(whereis))),
+            ["No known copies."]
+        );
+    }
 
     #[test]
     fn file_diff_ready_state_prefers_processing_when_cache_is_stale() {

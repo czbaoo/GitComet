@@ -3,6 +3,7 @@ mod backend;
 pub mod command_trace;
 mod ignore;
 mod open;
+mod refs;
 mod repo;
 mod util;
 
@@ -26,4 +27,11 @@ pub fn install_test_git_command_environment(
 #[doc(hidden)]
 pub fn allow_test_repo_local_mergetool_command(repo: &std::path::Path, tool_name: &str) {
     repo::allow_test_repo_local_mergetool_command(repo, tool_name);
+}
+
+/// Optional decoded retention and caller-pinned allocations, in bytes, followed
+/// by optional retained row count. Pinned bytes may overlap retained bytes.
+#[doc(hidden)]
+pub fn shared_history_memory() -> (usize, usize, usize) {
+    repo::shared_history_memory()
 }

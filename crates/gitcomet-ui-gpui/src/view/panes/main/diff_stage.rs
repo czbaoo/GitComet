@@ -11,6 +11,9 @@ impl MainPaneView {
     /// commit-range diffs have no index to move lines to, and the preview,
     /// conflict and submodule modes render something other than a patch.
     pub(in crate::view) fn diff_stage_gutter_area(&self) -> Option<DiffArea> {
+        if !self.store.policy.allow_stage || !self.store.policy.line_action {
+            return None;
+        }
         // Cheap check first: this runs once per rendered frame, and the preview
         // probes below stat the filesystem.
         let area = match self.rendered_diff_target()? {
@@ -21,6 +24,8 @@ impl MainPaneView {
             || self.is_conflict_resolver_active()
             || self.is_inline_submodule_diff_active()
             || self.is_markdown_preview_active()
+            // The displayed payload lines do not address the stored pointer.
+            || self.has_large_file_text_diff()
         {
             return None;
         }
@@ -49,7 +54,7 @@ impl MainPaneView {
         &self,
         visible_ix: usize,
         kind: DiffLineKind,
-    ) -> Option<String> {
+    ) -> Option<gitcomet_state::msg::ContentBytes> {
         let area = self.diff_stage_gutter_area()?;
         let src_ix = self.diff_stage_gutter_src_ix(visible_ix, kind)?;
         let rows = self.patch_diff_rows_slice(0, self.patch_diff_row_len());
@@ -67,6 +72,7 @@ impl MainPaneView {
                 )
             }
         }
+        .map(Into::into)
     }
 
     /// Apply the gutter button: stage the line in an unstaged diff, unstage it in
@@ -93,7 +99,7 @@ impl MainPaneView {
         // `local_actions_in_flight`, and the reload it asks for only starts
         // there, so between them the rows are at their most stale.
         if self.active_repo().is_some_and(|repo| {
-            repo.local_actions_in_flight > 0 || repo.diff_state.diff_reload_in_flight
+            repo.local_actions_in_flight > 0 || self.bound_diff_state(repo).diff_reload_in_flight
         }) {
             return;
         }

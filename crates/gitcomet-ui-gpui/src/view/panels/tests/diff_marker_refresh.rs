@@ -5,17 +5,7 @@ use super::*;
 use gitcomet_core::services::GitBackend;
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    crate::test_support::git(dir, args);
 }
 
 fn lines(edits: &[(usize, &str)]) -> String {
@@ -128,6 +118,10 @@ fn markers_follow_an_in_place_external_edit(
 
     let repo = gitcomet_git_gix::GixBackend.open(root).expect("open repo");
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    // The test dispatches the watcher's message itself. A live watcher reloads
+    // too (Windows: late NTFS `.git` timestamps ~250 ms in), and a reload that
+    // reads a.rs mid-write lands first and satisfies the wait: markers [0.0].
+    store.disable_repo_monitors_for_test();
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store.clone(), events, None, window, cx)
     });
@@ -144,10 +138,10 @@ fn markers_follow_an_in_place_external_edit(
         });
     });
 
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: "a.rs".into(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(
+        "a.rs".into(),
+        gitcomet_core::domain::DiffArea::Unstaged,
+    );
     store.dispatch(Msg::SelectDiff {
         repo_id,
         target: target.clone(),
@@ -239,6 +233,8 @@ fn markers_are_current_after_editing_reloading_and_reopening_the_diff(
 
     let repo = gitcomet_git_gix::GixBackend.open(root).expect("open repo");
     let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    // Only the reloads the test dispatches; see the helper above.
+    store.disable_repo_monitors_for_test();
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store.clone(), events, None, window, cx)
     });
@@ -255,10 +251,10 @@ fn markers_are_current_after_editing_reloading_and_reopening_the_diff(
         });
     });
 
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: "a.rs".into(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(
+        "a.rs".into(),
+        gitcomet_core::domain::DiffArea::Unstaged,
+    );
     let open_diff = |cx: &mut gpui::VisualTestContext| {
         store.dispatch(Msg::SelectDiff {
             repo_id,

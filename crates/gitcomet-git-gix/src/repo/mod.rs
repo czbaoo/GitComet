@@ -3,10 +3,10 @@ use crate::util::git_workdir_cmd_for as util_git_workdir_cmd_for;
 use gitcomet_core::conflict_session::ConflictSession;
 use gitcomet_core::domain::{
     Branch, Commit, CommitDetails, CommitFileChange, CommitId, CommitSignature, Diff, DiffArea,
-    DiffPreviewTextSide, DiffTarget, FileDiffImage, FileDiffText, FileEntry, HistoryMode,
-    LogCursor, LogPage, RecentCommitMessage, RefMetadata, ReflogEntry, Remote, RemoteBranch,
-    RemoteTag, RepoSpec, RepoStatus, StashEntry, Submodule, SubmoduleDiffSummary, Tag, Upstream,
-    UpstreamDivergence, Worktree,
+    DiffPreviewTextFile, DiffPreviewTextSide, DiffTarget, FileDiffImage, FileDiffText, FileEntry,
+    HistoryMode, LogCursor, LogPage, RecentCommitMessage, RefMetadata, ReflogEntry, Remote,
+    RemoteBranch, RemoteTag, RepoSpec, RepoStatus, StashEntry, Submodule, SubmoduleDiffSummary,
+    Tag, Upstream, UpstreamDivergence, Worktree,
 };
 use gitcomet_core::git_ops_trace::{self, GitOpTraceKind};
 use gitcomet_core::remote_url::RemoteUrlPolicy;
@@ -30,6 +30,16 @@ pub(super) fn oid_to_arc_str(oid: &gix::oid) -> Arc<str> {
     Arc::from(hex)
 }
 
+/// A full id in `kind`'s object format; `None` for abbreviations, names and the other format.
+pub(super) fn object_id_from_commit_id(
+    id: &CommitId,
+    kind: gix::hash::Kind,
+) -> Option<gix::ObjectId> {
+    gix::ObjectId::from_hex(id.as_ref().as_bytes())
+        .ok()
+        .filter(|oid| oid.kind() == kind)
+}
+
 /// Convert bytes to `Arc<str>`, avoiding an intermediate String allocation when the input is
 /// valid UTF-8 (the common case for git commit metadata).
 #[inline]
@@ -40,24 +50,36 @@ pub(super) fn bstr_to_arc_str(bytes: &[u8]) -> Arc<str> {
     }
 }
 
+mod annex;
+mod apply_change;
 mod blame;
+mod comparison;
+mod config;
 mod conflict_stages;
 mod diff;
 mod discard;
 mod file_browser;
 mod git_ops;
 mod history;
+mod large_files;
+mod lfs;
 mod line_stats;
 mod log;
+mod maintenance;
 mod mergetool;
 mod mergetool_builtin;
+pub(crate) mod object_store;
 mod patch;
 mod porcelain;
 mod remotes;
+mod shared;
+mod shared_ranges;
 mod signatures;
 mod status;
 mod submodules;
 mod tags;
+mod text_attributes;
+mod text_decode;
 mod worktrees;
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
@@ -176,6 +198,7 @@ impl ShallowSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogPageCacheKey {
+    generation: u64,
     mode: HistoryMode,
     seed: LogPageSeed,
     /// Invalidates cached pages when a shallow repository is deepened or its
@@ -215,11 +238,12 @@ type LogPagedWalkFilter = Box<dyn FnMut(&gix::oid) -> bool + Send>;
 enum LogPagedWalk {
     CommitTime(gix::traverse::commit::Simple<gix::OdbHandleArc, LogPagedWalkFilter>),
     DateOrder(gix::traverse::commit::Topo<log::CancellableLogWalkFind, LogPagedWalkFilter>),
+    CachedDateOrder(log::TopologyWalk),
 }
 
 impl LogPagedWalk {
     fn is_date_order(&self) -> bool {
-        matches!(self, Self::DateOrder(_))
+        matches!(self, Self::DateOrder(_) | Self::CachedDateOrder(_))
     }
 }
 
@@ -233,6 +257,7 @@ impl Iterator for LogPagedWalk {
         match self {
             Self::CommitTime(walk) => walk.next().map(|info| info.map_err(Into::into)),
             Self::DateOrder(walk) => walk.next().map(|info| info.map_err(Into::into)),
+            Self::CachedDateOrder(walk) => walk.next().map(Ok),
         }
     }
 }
@@ -259,6 +284,8 @@ struct LogPagedWalkCacheEntry {
     /// filter would silently skip whatever the first pass rejected.
     author: Option<log::AuthorFilter>,
     state: LogPagedWalkState,
+    /// The store generation the walk reads from; see [`GixRepo::reopen_object_store`].
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -445,11 +472,26 @@ const LOG_PAGED_WALK_CACHE_LIMIT: usize = 32;
 /// Date-order walks retain in-degree state for the reachable history.
 const LOG_PAGED_TOPO_WALK_CACHE_LIMIT: usize = 4;
 
+/// The store every handle comes from, swapped by [`GixRepo::reopen_object_store`].
+struct RepoStore {
+    repo: gix::ThreadSafeRepository,
+    /// Bumped on every reopen, so walks parked from an older store are dropped.
+    generation: u64,
+    shared: Arc<shared::SharedStore>,
+}
+
 pub(crate) struct GixRepo {
+    pub(crate) identity: shared::WorktreeIdentity,
+    /// Stable fallback identity when a store cannot be safely shared.
+    private_store_scope: u64,
+    pub(crate) options: gitcomet_core::services::RepositoryOptions,
     spec: RepoSpec,
-    _repo: gix::ThreadSafeRepository,
+    store: std::sync::RwLock<RepoStore>,
+    config_repo: std::sync::Mutex<config::ConfigRepo>,
     gitlink_status_capability: std::sync::Mutex<Option<GitlinkStatusCapabilityCacheEntry>>,
     branch_tracking_config: std::sync::Mutex<Option<BranchTrackingConfigCacheEntry>>,
+    /// Shared by row, diff and preview readers; refreshed with support metadata.
+    large_file_scan: std::sync::Mutex<Option<Arc<large_files::CommittedPointerScan>>>,
     tree_index_cache: std::sync::Mutex<Option<TreeIndexCacheEntry>>,
     log_page_cache: std::sync::Mutex<Vec<LogPageCacheEntry>>,
     history_authors_cache: std::sync::Mutex<Option<log::HistoryAuthorsCache>>,
@@ -461,21 +503,54 @@ pub(crate) struct GixRepo {
     ref_metadata_cache: RefMetadataCache,
     preview_blob_verified: std::sync::Mutex<rustc_hash::FxHashMap<PathBuf, VerifiedPreviewBlob>>,
     worktree_source_memo: std::sync::Mutex<rustc_hash::FxHashMap<PathBuf, WorktreeSourceMemoEntry>>,
+    /// Keyed by source identity, attributes and encoding choice.
+    text_format_memo:
+        std::sync::Mutex<rustc_hash::FxHashMap<u64, text_decode::TextFormatMemoEntry>>,
     log_file_follow_cache: std::sync::Mutex<Vec<LogFileFollowCacheEntry>>,
     log_paged_walk_cache: std::sync::Mutex<LogPagedWalkCache>,
+    line_stats_memo: std::sync::Mutex<line_stats::LineStatsMemo>,
+    /// Stats the worktree walk found stale but content-clean; see
+    /// [`status::StatRefreshedIndex`].
+    stat_refreshed_index: std::sync::Mutex<Option<status::StatRefreshedIndex>>,
+    staged_line_stats_cache: std::sync::Mutex<Option<line_stats::StagedLineStatsCache>>,
     /// Immutable signature formats by oid. `None` means an unsigned commit.
     signature_format_cache: std::sync::Mutex<
         lru::LruCache<gix::ObjectId, Option<gitcomet_core::domain::SignatureFormat>>,
     >,
+    /// Fixed at open: refs the all-branches walk leaves out.
+    history_ref_filter: gitcomet_core::services::HistoryRefFilter,
 }
 
 impl GixRepo {
     pub(crate) fn new(workdir: PathBuf, repo: gix::ThreadSafeRepository) -> Self {
+        Self::new_with_options(workdir, repo, Default::default())
+    }
+
+    pub(crate) fn new_with_options(
+        workdir: PathBuf,
+        repo: gix::ThreadSafeRepository,
+        options: gitcomet_core::services::RepositoryOptions,
+    ) -> Self {
+        let identity = shared::WorktreeIdentity::new(&workdir, &repo.to_thread_local());
+        let private_store_scope = shared::next_id();
+        let common = shared::CommonRepository::get(&repo.to_thread_local(), private_store_scope);
+        let mut repo = repo;
+        let shared = common.attach(&mut repo, private_store_scope);
+        let config_repo = config::ConfigRepo::new(repo.to_thread_local());
         Self {
+            identity,
+            private_store_scope,
+            options: options.clone(),
             spec: RepoSpec { workdir },
-            _repo: repo,
+            store: std::sync::RwLock::new(RepoStore {
+                repo,
+                generation: shared.mapping_id,
+                shared,
+            }),
+            config_repo: std::sync::Mutex::new(config_repo),
             gitlink_status_capability: std::sync::Mutex::new(None),
             branch_tracking_config: std::sync::Mutex::new(None),
+            large_file_scan: Default::default(),
             tree_index_cache: std::sync::Mutex::new(None),
             log_page_cache: std::sync::Mutex::new(Vec::new()),
             history_authors_cache: Default::default(),
@@ -485,11 +560,16 @@ impl GixRepo {
             ref_metadata_cache: std::sync::Mutex::new(None),
             preview_blob_verified: std::sync::Mutex::default(),
             worktree_source_memo: std::sync::Mutex::default(),
+            text_format_memo: std::sync::Mutex::default(),
             log_file_follow_cache: std::sync::Mutex::new(Vec::new()),
             log_paged_walk_cache: std::sync::Mutex::new(LogPagedWalkCache::default()),
+            line_stats_memo: std::sync::Mutex::default(),
+            stat_refreshed_index: std::sync::Mutex::new(None),
+            staged_line_stats_cache: std::sync::Mutex::new(None),
             signature_format_cache: std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(signatures::SIGNATURE_CACHE_LIMIT).unwrap(),
             )),
+            history_ref_filter: options.history_ref_filter,
         }
     }
 
@@ -506,7 +586,132 @@ impl GixRepo {
     /// thousands of refs). Only an operation that re-reads objects benefits;
     /// see [`with_object_cache`].
     pub(super) fn repo(&self) -> gix::Repository {
-        self._repo.to_thread_local()
+        self.store
+            .read()
+            .expect("repo store")
+            .repo
+            .to_thread_local()
+    }
+
+    /// The shared store and its generation, for walks that outlive a handle.
+    /// Cloned out rather than borrowed: holding the read guard across a walk
+    /// deadlocks once a reopen queues for the write lock.
+    #[cfg(test)]
+    pub(super) fn thread_safe_repo(&self) -> (gix::ThreadSafeRepository, u64) {
+        let store = self.store.read().expect("repo store");
+        (store.repo.clone(), store.generation)
+    }
+
+    fn store_generation(&self) -> u64 {
+        self.store.read().expect("repo store").generation
+    }
+
+    /// Replaces the object store with a fresh open and drops every handle this
+    /// repository keeps on the old one, so its pack mappings go once in-flight
+    /// readers finish. Also picks up packs a repack wrote since.
+    pub(crate) fn reopen_object_store(&self) -> Result<()> {
+        let shared = self.shared_store();
+        let _maintenance = shared
+            .common
+            .maintenance
+            .lock()
+            .expect("common maintenance");
+        shared.common.invalidate();
+        crate::backend::refresh_common_stores(self, shared.common.id)
+    }
+
+    /// An I/O retry rotates physical mappings, preserving valid immutable
+    /// indexes. Fresh store keys still detect actual interpretation changes.
+    fn recover_object_store(&self) -> Result<()> {
+        let shared = self.shared_store();
+        let _maintenance = shared
+            .common
+            .maintenance
+            .lock()
+            .expect("common maintenance");
+        shared.common.rotate_mappings();
+        crate::backend::refresh_common_stores(self, shared.common.id)
+    }
+
+    pub(crate) fn common_identity(&self) -> u64 {
+        self.shared_store().common.id
+    }
+
+    pub(crate) fn refresh_object_store(&self) -> Result<()> {
+        let fresh = self.reopen_repo()?.into_sync();
+        self.install_history_store(fresh);
+        Ok(())
+    }
+
+    fn shared_store(&self) -> Arc<shared::SharedStore> {
+        self.store.read().expect("repo store").shared.clone()
+    }
+
+    /// Fresh refs/config belong to this worktree. Only the compatible object
+    /// store is attached; never substitute another worktree's repository handle.
+    fn fresh_history_store(&self) -> Result<(gix::ThreadSafeRepository, Arc<shared::SharedStore>)> {
+        Ok(self.install_history_store(self.reopen_repo()?.into_sync()))
+    }
+
+    fn install_history_store(
+        &self,
+        mut fresh: gix::ThreadSafeRepository,
+    ) -> (gix::ThreadSafeRepository, Arc<shared::SharedStore>) {
+        let common =
+            shared::CommonRepository::get(&fresh.to_thread_local(), self.private_store_scope);
+        let shared = common.attach(&mut fresh, self.private_store_scope);
+        let changed = {
+            let mut store = self.store.write().expect("repo store");
+            let changed = store.generation != shared.mapping_id;
+            // Keep this worktree's parsed index and refs/config handles.
+            store.repo.objects = fresh.objects.clone();
+            store.generation = shared.mapping_id;
+            store.shared = shared.clone();
+            changed
+        };
+        if changed {
+            self.config_repo
+                .lock()
+                .expect("config repository")
+                .share_objects(&fresh);
+            *self.range_reader.lock().expect("range reader") = None;
+            self.log_paged_walk_cache
+                .lock()
+                .expect("log paged walk cache")
+                .entries
+                .clear();
+            self.log_page_cache.lock().expect("log page cache").clear();
+            *self.all_branches_tips.lock().expect("all branches tips") = None;
+            *self.history_authors_cache.lock().expect("history authors") = None;
+        }
+        (fresh, shared)
+    }
+
+    /// Runs a history read, reopening the object store and retrying once when
+    /// a pack failed to open in a way gix does not recover from.
+    fn with_store_retry<T>(&self, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+        let failures = object_store::io_failures();
+        let error = match read() {
+            Err(error)
+                if !matches!(error.kind(), gitcomet_core::error::ErrorKind::Cancelled)
+                    && object_store::io_failures() != failures =>
+            {
+                error
+            }
+            result => return result,
+        };
+        if self.recover_object_store().is_err() {
+            return Err(error);
+        }
+        read()
+    }
+
+    /// For index-vs-worktree status: use the refreshed filter configuration,
+    /// but never start git-annex (see [`large_files::strip_annex_filter`]).
+    pub(super) fn status_repo(&self) -> gix::Repository {
+        let mut repo = self.large_file_read_repo();
+        large_files::strip_annex_filter(&mut repo);
+        repo
     }
 
     /// A fresh open, for operations that must see config/ref changes made after
@@ -564,10 +769,27 @@ impl GitRepository for GixRepo {
         mode: HistoryMode,
         cancellation: &CancellationToken,
     ) -> Result<Arc<[Arc<str>]>> {
-        self.history_authors_impl(mode, cancellation)
+        self.with_store_retry(|| self.history_authors_impl(mode, cancellation))
     }
     fn spec(&self) -> &RepoSpec {
         &self.spec
+    }
+
+    fn release_object_store(&self) {
+        // A repository that can no longer be opened fails the next read instead.
+        let _ = self.reopen_object_store();
+    }
+
+    fn common_dir(&self) -> Option<PathBuf> {
+        Some(self.common_dir_impl())
+    }
+
+    fn maintenance_needed(&self) -> Result<bool> {
+        self.maintenance_needed_impl()
+    }
+
+    fn run_maintenance_with_output(&self) -> Result<CommandOutput> {
+        self.run_maintenance_impl()
     }
 
     fn build_history_index(
@@ -577,7 +799,9 @@ impl GitRepository for GixRepo {
         cancellation: &CancellationToken,
         on_progress: &mut dyn FnMut(gitcomet_core::history_index::HistoryIndexProgress),
     ) -> Result<Option<gitcomet_core::history_index::HistoryIndexHandle>> {
-        self.build_history_index_impl(mode, author, cancellation, on_progress)
+        self.with_store_retry(|| {
+            self.build_history_index_impl(mode, author, cancellation, &mut *on_progress)
+        })
     }
 
     fn read_history_range(
@@ -586,7 +810,16 @@ impl GitRepository for GixRepo {
         range: std::ops::Range<usize>,
         cancellation: &CancellationToken,
     ) -> Result<gitcomet_core::history_index::HistoryRange> {
-        self.read_history_range_impl(index, range, cancellation)
+        self.with_store_retry(|| self.read_history_range_impl(index, range.clone(), cancellation))
+    }
+
+    fn read_history_range_shared(
+        &self,
+        index: &gitcomet_core::history_index::HistoryIndexHandle,
+        range: std::ops::Range<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<gitcomet_core::history_index::HistoryRange>> {
+        self.with_store_retry(|| self.read_shared_history_range(index, range.clone(), cancellation))
     }
 
     fn read_history(
@@ -597,7 +830,9 @@ impl GitRepository for GixRepo {
         cancellation: &CancellationToken,
         on_chunk: &mut dyn FnMut(gitcomet_core::services::LogChunk),
     ) -> Result<gitcomet_core::services::HistoryReadResult> {
-        self.read_history_impl(mode, author, request, cancellation, on_chunk)
+        self.with_store_retry(|| {
+            self.read_history_impl(mode, author, request, cancellation, &mut *on_chunk)
+        })
     }
 
     fn log_history_mode_page(
@@ -731,6 +966,24 @@ impl GitRepository for GixRepo {
         self.resolve_commit_impl(reference)
     }
 
+    fn compare_files(
+        &self,
+        from: &CommitId,
+        to: Option<&CommitId>,
+        options: &gitcomet_core::services::ComparisonOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<gitcomet_core::services::Comparison> {
+        self.compare_files_impl(from, to, options, cancellation)
+    }
+
+    fn merge_base(&self, a: &CommitId, b: &CommitId) -> Result<Option<CommitId>> {
+        self.merge_base_impl(a, b)
+    }
+
+    fn is_ancestor(&self, ancestor: &CommitId, descendant: &CommitId) -> Result<bool> {
+        self.is_ancestor_impl(ancestor, descendant)
+    }
+
     fn diff_range_files(
         &self,
         from: &CommitId,
@@ -759,6 +1012,50 @@ impl GitRepository for GixRepo {
     ) -> Result<gitcomet_core::domain::UncommittedLineStats> {
         let _scope = git_ops_trace::scope(GitOpTraceKind::Diff);
         self.line_stats_for_entries_impl(&status.unstaged, cancellation)
+    }
+
+    fn large_file_support_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<gitcomet_core::large_files::LargeFileSupport> {
+        self.large_file_support_impl(cancellation)
+    }
+
+    fn uncommitted_large_files_for_status_cancellable(
+        &self,
+        status: &RepoStatus,
+        cancellation: &CancellationToken,
+    ) -> Result<gitcomet_core::large_files::UncommittedLargeFiles> {
+        self.uncommitted_large_files_impl(status, cancellation)
+    }
+
+    fn run_large_file_command(
+        &self,
+        command: &gitcomet_core::large_files::LargeFileCommand,
+    ) -> Result<CommandOutput> {
+        self.run_large_file_command_impl(command)
+    }
+
+    fn annex_whereis_cancellable(
+        &self,
+        key: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<gitcomet_core::large_files::AnnexWhereis> {
+        self.annex_whereis_impl(key, cancellation)
+    }
+
+    fn annex_unused_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<gitcomet_core::large_files::AnnexUnused> {
+        self.annex_unused_impl(cancellation)
+    }
+
+    fn lfs_locks_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<gitcomet_core::large_files::LfsLock>> {
+        self.lfs_locks_impl(cancellation)
     }
 
     fn commit_messages(&self, ids: &[CommitId]) -> Result<Vec<String>> {
@@ -945,8 +1242,7 @@ impl GitRepository for GixRepo {
     }
 
     fn diff_parsed(&self, target: &DiffTarget) -> Result<Diff> {
-        let _scope = git_ops_trace::scope(GitOpTraceKind::Diff);
-        self.diff_parsed_impl(target)
+        self.diff_parsed_with_encoding_cancellable(target, None, &CancellationToken::new())
     }
 
     fn diff_parsed_cancellable(
@@ -954,12 +1250,21 @@ impl GitRepository for GixRepo {
         target: &DiffTarget,
         cancellation: &CancellationToken,
     ) -> Result<Diff> {
+        self.diff_parsed_with_encoding_cancellable(target, None, cancellation)
+    }
+
+    fn diff_parsed_with_encoding_cancellable(
+        &self,
+        target: &DiffTarget,
+        encoding: Option<gitcomet_core::text_format::TextEncoding>,
+        cancellation: &CancellationToken,
+    ) -> Result<Diff> {
         let _scope = git_ops_trace::scope(GitOpTraceKind::Diff);
-        self.diff_parsed_cancellable_impl(target, cancellation)
+        self.diff_parsed_with_encoding_impl(target, encoding, cancellation)
     }
 
     fn diff_file_text(&self, target: &DiffTarget) -> Result<Option<FileDiffText>> {
-        self.diff_file_text_impl(target)
+        self.diff_file_text_decoded_impl(target, None, &CancellationToken::new())
     }
 
     fn diff_file_text_cancellable(
@@ -967,16 +1272,29 @@ impl GitRepository for GixRepo {
         target: &DiffTarget,
         cancellation: &CancellationToken,
     ) -> Result<Option<FileDiffText>> {
-        let result = self.diff_file_text_impl_cancellable(target, cancellation);
+        self.diff_file_text_with_encoding_cancellable(target, None, cancellation)
+    }
+
+    fn diff_file_text_with_encoding_cancellable(
+        &self,
+        target: &DiffTarget,
+        encoding: Option<gitcomet_core::text_format::TextEncoding>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<FileDiffText>> {
+        let result = self.diff_file_text_decoded_impl(target, encoding, cancellation);
         cancellation.check_cancelled()?;
         result
+    }
+
+    fn text_attributes(&self, path: &Path) -> Result<gitcomet_core::text_format::TextAttributes> {
+        self.text_attributes_impl(path)
     }
 
     fn diff_preview_text_file(
         &self,
         target: &DiffTarget,
         side: DiffPreviewTextSide,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<DiffPreviewTextFile>> {
         self.diff_preview_text_file_impl(target, side)
     }
 
@@ -999,7 +1317,7 @@ impl GitRepository for GixRepo {
         target: &DiffTarget,
         side: DiffPreviewTextSide,
         cancellation: &CancellationToken,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<DiffPreviewTextFile>> {
         let result = self.diff_preview_text_file_impl_cancellable(target, side, cancellation);
         cancellation.check_cancelled()?;
         result
@@ -1011,6 +1329,14 @@ impl GitRepository for GixRepo {
 
     fn conflict_session(&self, path: &Path) -> Result<Option<ConflictSession>> {
         self.conflict_session_impl(path)
+    }
+
+    fn conflict_session_with_encoding(
+        &self,
+        path: &Path,
+        encoding: Option<gitcomet_core::text_format::TextEncoding>,
+    ) -> Result<Option<ConflictSession>> {
+        self.conflict_session_with_encoding_impl(path, encoding)
     }
 
     fn create_branch(&self, name: &str, target: &CommitId) -> Result<()> {
@@ -1085,6 +1411,21 @@ impl GitRepository for GixRepo {
         self.revert_with_output_impl(id, commit, mainline)
     }
 
+    fn apply_file_change_with_output(
+        &self,
+        target: &gitcomet_core::domain::ApplyChangeTarget,
+        commit: bool,
+    ) -> Result<CommandOutput> {
+        self.apply_file_change_with_output_impl(target, commit, None)
+    }
+
+    fn commit_applied_file_change_with_output(
+        &self,
+        retry: &gitcomet_core::domain::ApplyFileChangeRetry,
+    ) -> Result<CommandOutput> {
+        self.apply_file_change_with_output_impl(&retry.target, true, Some(retry))
+    }
+
     fn stash_create(&self, message: &str, include_untracked: bool) -> Result<()> {
         self.stash_create_impl(message, include_untracked)
     }
@@ -1146,6 +1487,14 @@ impl GitRepository for GixRepo {
 
     fn fetch_branch_with_output(&self, remote: &str, branch: &str) -> Result<CommandOutput> {
         self.fetch_branch_with_output_impl(remote, branch)
+    }
+
+    fn fetch_refspecs_with_output(
+        &self,
+        remote: &str,
+        refspecs: &[String],
+    ) -> Result<CommandOutput> {
+        self.fetch_refspecs_with_output_impl(remote, refspecs)
     }
 
     fn pull(&self, mode: PullMode) -> Result<()> {
@@ -1250,8 +1599,9 @@ impl GitRepository for GixRepo {
     fn interactive_cherry_pick_with_output(
         &self,
         entries: &[InteractiveRebaseEntry],
+        commit: bool,
     ) -> Result<CommandOutput> {
-        self.interactive_cherry_pick_with_output_impl(entries)
+        self.interactive_cherry_pick_with_output_impl(entries, commit)
     }
 
     fn merge_abort_with_output(&self) -> Result<CommandOutput> {
@@ -1443,7 +1793,7 @@ impl GitRepository for GixRepo {
 
     fn apply_unified_patch_to_index_with_output(
         &self,
-        patch: &str,
+        patch: &[u8],
         reverse: bool,
     ) -> Result<CommandOutput> {
         self.apply_unified_patch_to_index_with_output_impl(patch, reverse)
@@ -1451,7 +1801,7 @@ impl GitRepository for GixRepo {
 
     fn apply_unified_patch_to_worktree_with_output(
         &self,
-        patch: &str,
+        patch: &[u8],
         reverse: bool,
     ) -> Result<CommandOutput> {
         self.apply_unified_patch_to_worktree_with_output_impl(patch, reverse)
@@ -1656,6 +2006,10 @@ impl GitRepository for GixRepo {
     fn discard_worktree_changes(&self, paths: &[&Path]) -> Result<()> {
         self.discard_worktree_changes_impl(paths)
     }
+}
+
+pub(crate) fn shared_history_memory() -> (usize, usize, usize) {
+    shared_ranges::memory()
 }
 
 #[cfg(test)]

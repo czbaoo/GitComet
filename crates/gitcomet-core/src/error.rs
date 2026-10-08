@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[error("{kind}")]
 pub struct Error {
     kind: ErrorKind,
@@ -22,8 +22,22 @@ pub enum GitFailureId {
     Timeout,
     BranchAlreadyExists,
     StashApplyConflict,
+    /// `git apply --3way` left the file conflicted in the index and worktree.
+    ApplyChangeConflict,
+    /// An applied file change is staged, but committing it failed.
+    ApplyChangeCommitFailed,
     UntrackedRestoreConflict,
     WorktreeWouldBeOverwritten,
+    /// A filter or hook needs `git-lfs`, which is not on Git's PATH.
+    LfsNotInstalled,
+    /// A pull or merge left a merge or rebase in progress with unmerged paths.
+    StoppedAtConflicts,
+    /// Smudge could not download an LFS object (missing on the server, no remote).
+    LfsObjectMissing,
+    /// A push or edit was refused because another user holds an LFS lock.
+    LfsLocked,
+    /// The pre-push hook could not upload LFS objects.
+    LfsUploadFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +48,7 @@ pub struct GitFailure {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     detail: Option<String>,
+    apply_file_change_retry: Option<Box<crate::domain::ApplyFileChangeRetry>>,
 }
 
 impl GitFailure {
@@ -52,6 +67,7 @@ impl GitFailure {
             stdout,
             stderr,
             detail,
+            apply_file_change_retry: None,
         }
     }
 
@@ -78,6 +94,18 @@ impl GitFailure {
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
+
+    pub fn with_apply_file_change_retry(
+        mut self,
+        retry: crate::domain::ApplyFileChangeRetry,
+    ) -> Self {
+        self.apply_file_change_retry = Some(Box::new(retry));
+        self
+    }
+
+    pub fn apply_file_change_retry(&self) -> Option<&crate::domain::ApplyFileChangeRetry> {
+        self.apply_file_change_retry.as_deref()
+    }
 }
 
 impl fmt::Display for GitFailure {
@@ -95,7 +123,7 @@ impl fmt::Display for GitFailure {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ErrorKind {
     #[error("I/O error: {0}")]
     Io(std::io::ErrorKind),

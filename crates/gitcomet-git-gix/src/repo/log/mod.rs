@@ -3,7 +3,7 @@ use super::{
     GixRepo, LOG_FILE_FOLLOW_CACHE_LIMIT, LOG_PAGE_CACHE_LIMIT, LOG_PAGED_TOPO_WALK_CACHE_LIMIT,
     LOG_PAGED_WALK_CACHE_LIMIT, LogFileFollowCacheEntry, LogFileFollowCacheKey, LogPageCacheEntry,
     LogPageCacheKey, LogPageSeed, LogPagedWalk, LogPagedWalkCacheEntry, LogPagedWalkFilter,
-    LogPagedWalkState, ShallowSnapshot, bstr_to_arc_str, oid_to_arc_str, submodules,
+    LogPagedWalkState, ShallowSnapshot, bstr_to_arc_str, object_id_from_commit_id, oid_to_arc_str,
 };
 use crate::util::{
     bytes_to_text_preserving_utf8, parse_git_log_pretty_records_from_reader,
@@ -11,8 +11,8 @@ use crate::util::{
     unix_seconds_to_system_time_or_epoch,
 };
 use gitcomet_core::domain::{
-    Commit, CommitDetails, CommitFileChange, CommitId, CommitParentIds, EMPTY_TREE_ID, HistoryMode,
-    LogCursor, LogPage, RecentCommitMessage, ReflogEntry, StashEntry,
+    Commit, CommitDetails, CommitFileChange, CommitId, CommitParentIds, HistoryMode, LogCursor,
+    LogPage, RecentCommitMessage, ReflogEntry, StashEntry, is_empty_tree_id,
 };
 use gitcomet_core::error::{Error, ErrorKind, GitFailure, GitFailureId};
 use gitcomet_core::services::{CancellationToken, LogChunk, Result};
@@ -30,12 +30,15 @@ mod index;
 mod reflog;
 mod repo_impl;
 mod snapshot;
+mod topology;
 mod walk;
 
 pub(super) use authors::HistoryAuthorsCache;
 pub(super) use commit_stats::*;
 pub(super) use decode::*;
+pub(super) use index::HistoryQuery;
 pub(super) use reflog::*;
+pub(super) use topology::{TopologyCache, TopologyWalk};
 pub(super) use walk::*;
 
 #[cfg(test)]

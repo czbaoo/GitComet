@@ -11,7 +11,6 @@ use super::{
 };
 use crate::view::markdown_preview::MarkdownInlineSpan;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
-use crate::view::rows::diff_text::DIFF_WRAP_TAB_EXPANDED_COLUMNS;
 use crate::view::{AppTheme, DateTimeFormat, Timezone, format_datetime, format_datetime_utc};
 use crate::view::{
     HISTORY_COL_HANDLE_PX, HISTORY_MESSAGE_BORDER_GAP_PX, HISTORY_MESSAGE_BORDER_W_PX,
@@ -41,13 +40,17 @@ fn markdown_row(kind: MarkdownPreviewRowKind) -> MarkdownPreviewRow {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     }
 }
 
 #[test]
 fn worktree_preview_query_overlay_honors_search_options_for_cached_rows() {
+    let tab_width = 4;
+
     let theme = AppTheme::gitcomet_dark();
     let base = build_cached_diff_styled_text(
+        tab_width,
         theme,
         "Render render cat concat cat",
         &[],
@@ -282,6 +285,7 @@ fn markdown_preview_row_marker_preserves_ordered_item_number() {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     };
 
     assert_eq!(
@@ -312,6 +316,7 @@ fn markdown_preview_row_marker_is_none_for_blockquotes_without_list_items() {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     };
 
     assert_eq!(markdown_preview_row_marker(&row), None);
@@ -337,6 +342,7 @@ fn markdown_preview_row_marker_uses_footnote_label_when_present() {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     };
 
     assert_eq!(
@@ -367,6 +373,7 @@ fn markdown_preview_row_marker_returns_unordered_bullet_inside_blockquote() {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     };
 
     assert_eq!(
@@ -423,6 +430,8 @@ fn markdown_preview_row_background_uses_alert_and_fallback_only_when_unchanged()
 
 #[test]
 fn markdown_preview_row_styled_text_maps_inline_styles_and_skips_normal_spans() {
+    let tab_width = 4;
+
     let theme = AppTheme::gitcomet_light();
 
     let mut row = markdown_row(MarkdownPreviewRowKind::Paragraph);
@@ -450,7 +459,7 @@ fn markdown_preview_row_styled_text_maps_inline_styles_and_skips_normal_spans() 
         },
     ]);
 
-    let styled = markdown_preview_row_styled_text(theme, &row);
+    let styled = markdown_preview_row_styled_text(tab_width, theme, &row);
     let highlights = styled.highlights.as_ref();
 
     assert_eq!(styled.text.as_ref(), "link under strike plain");
@@ -494,25 +503,27 @@ fn amber_inline_code_spans_use_the_neutral_code_surface() {
 
 #[test]
 fn wrapped_slices_map_onto_the_tab_expanded_painted_text() {
+    let tab_width = 4;
+
     // Wrap ranges are measured on `row.text`, where a tab is one byte, but
     // the painted text expands each tab to four spaces. Slicing the
     // painted text with raw offsets shifted every wrapped row and dropped
     // the tail of the line.
     let raw = "\tab\tcd";
-    let expanded_len = raw.len() + raw.matches('\t').count() * (DIFF_WRAP_TAB_EXPANDED_COLUMNS - 1);
+    let expanded_len = crate::view::tab_width::expanded_len(tab_width, raw);
 
     // "\tab" -> "    ab", "\tcd" -> "    cd"
     assert_eq!(
-        markdown_preview_expanded_slice_range(raw, expanded_len, &(0..3)),
+        markdown_preview_expanded_slice_range(tab_width, raw, expanded_len, &(0..3)),
         0..6
     );
     assert_eq!(
-        markdown_preview_expanded_slice_range(raw, expanded_len, &(3..raw.len())),
+        markdown_preview_expanded_slice_range(tab_width, raw, expanded_len, &(3..raw.len())),
         6..expanded_len
     );
     // A row without tabs keeps its ranges untouched.
     assert_eq!(
-        markdown_preview_expanded_slice_range("abcd", 4, &(1..3)),
+        markdown_preview_expanded_slice_range(tab_width, "abcd", 4, &(1..3)),
         1..3
     );
 }
@@ -706,6 +717,8 @@ fn a_picture_is_named_the_same_way_wherever_it_is_asked_about() {
 
 #[test]
 fn markdown_preview_row_styled_text_repairs_spans_that_split_a_multibyte_char() {
+    let tab_width = 4;
+
     // A span pointing inside a multi-byte character used to reach `gpui`
     // as a text run whose length splits that character, aborting the
     // process inside `str::split_at` while shaping the line.
@@ -726,7 +739,7 @@ fn markdown_preview_row_styled_text_repairs_spans_that_split_a_multibyte_char() 
         },
     ]);
 
-    let styled = markdown_preview_row_styled_text(theme, &row);
+    let styled = markdown_preview_row_styled_text(tab_width, theme, &row);
     let text = styled.text.as_ref();
 
     for (range, _) in styled.highlights.iter() {
@@ -740,6 +753,8 @@ fn markdown_preview_row_styled_text_repairs_spans_that_split_a_multibyte_char() 
 
 #[test]
 fn markdown_preview_code_rows_reuse_diff_syntax_highlighting() {
+    let tab_width = 4;
+
     let theme = AppTheme::gitcomet_dark();
     let row = MarkdownPreviewRow {
         kind: MarkdownPreviewRowKind::CodeLine {
@@ -762,13 +777,16 @@ fn markdown_preview_code_rows_reuse_diff_syntax_highlighting() {
         table: None,
         task: None,
         continues_item: false,
+        align: Default::default(),
     };
 
-    let dark_highlights = Arc::clone(&markdown_preview_row_styled_text(theme, &row).highlights);
-    let dark = markdown_preview_row_styled_text(theme, &row);
-    let light = markdown_preview_row_styled_text(AppTheme::gitcomet_light(), &row);
+    let dark_highlights =
+        Arc::clone(&markdown_preview_row_styled_text(tab_width, theme, &row).highlights);
+    let dark = markdown_preview_row_styled_text(tab_width, theme, &row);
+    let light = markdown_preview_row_styled_text(tab_width, AppTheme::gitcomet_light(), &row);
 
-    assert_eq!(dark.text.as_ref(), "fn    main() { let x = 1; }");
+    // The tab after "fn" runs to the stop at column 4.
+    assert_eq!(dark.text.as_ref(), "fn  main() { let x = 1; }");
     assert!(
         !dark.highlights.is_empty(),
         "code rows should reuse syntax highlights from the diff text renderer"
@@ -914,29 +932,24 @@ fn local_link_target_reads_from_the_tree_the_document_came_from() {
         markdown_preview_local_link_target(workdir, target, destination)
     };
 
-    let working_tree = DiffTarget::WorkingTree {
-        path: PathBuf::from("docs/preview.md"),
-        area: DiffArea::Unstaged,
-    };
+    let working_tree =
+        DiffTarget::working_tree(PathBuf::from("docs/preview.md"), DiffArea::Unstaged);
     assert_eq!(
         resolve(&working_tree, "../README.md"),
         Some((FileSource::WorkingDirectory, PathBuf::from("README.md")))
     );
     // A staged document still links into the working tree it lives in.
-    let staged = DiffTarget::WorkingTree {
-        path: PathBuf::from("docs/preview.md"),
-        area: DiffArea::Staged,
-    };
+    let staged = DiffTarget::working_tree(PathBuf::from("docs/preview.md"), DiffArea::Staged);
     assert_eq!(
         resolve(&staged, "other.md"),
         Some((FileSource::WorkingDirectory, PathBuf::from("docs/other.md")))
     );
 
     // A document shown at a commit links into that commit.
-    let at_commit = DiffTarget::Commit {
-        commit_id: CommitId("deadbeef".into()),
-        path: Some(PathBuf::from("docs/preview.md")),
-    };
+    let at_commit = DiffTarget::commit(
+        CommitId("deadbeef".into()),
+        PathBuf::from("docs/preview.md"),
+    );
     assert_eq!(
         resolve(&at_commit, "./other.md"),
         Some((
@@ -945,39 +958,31 @@ fn local_link_target_reads_from_the_tree_the_document_came_from() {
         ))
     );
 
-    // Neither a whole-commit view nor a range has one document to resolve from.
-    let whole_commit = DiffTarget::Commit {
-        commit_id: CommitId("deadbeef".into()),
-        path: None,
-    };
-    assert_eq!(resolve(&whole_commit, "other.md"), None);
-    let range = DiffTarget::CommitRange {
-        from_commit_id: CommitId("aaaa".into()),
-        to_commit_id: Some(CommitId("bbbb".into())),
-        path: Some(PathBuf::from("docs/preview.md")),
-    };
+    // A range has no one document to resolve from.
+    let range = DiffTarget::commit_range(
+        CommitId("aaaa".into()),
+        Some(CommitId("bbbb".into())),
+        Some(PathBuf::from("docs/preview.md")),
+    );
     assert_eq!(resolve(&range, "other.md"), None);
-    let range_to_worktree = DiffTarget::CommitRange {
-        from_commit_id: CommitId("aaaa".into()),
-        to_commit_id: None,
-        path: Some(PathBuf::from("docs/preview.md")),
-    };
+    let range_to_worktree = DiffTarget::commit_range(
+        CommitId("aaaa".into()),
+        None,
+        Some(PathBuf::from("docs/preview.md")),
+    );
     assert_eq!(resolve(&range_to_worktree, "other.md"), None);
 
     // Absolute document paths are taken relative to the workdir…
-    let absolute = DiffTarget::WorkingTree {
-        path: workdir.join("docs/preview.md"),
-        area: DiffArea::Unstaged,
-    };
+    let absolute = DiffTarget::working_tree(workdir.join("docs/preview.md"), DiffArea::Unstaged);
     assert_eq!(
         resolve(&absolute, "other.md"),
         Some((FileSource::WorkingDirectory, PathBuf::from("docs/other.md")))
     );
     // …and one outside it has no repository to link into.
-    let elsewhere = DiffTarget::WorkingTree {
-        path: PathBuf::from("/elsewhere/docs/preview.md"),
-        area: DiffArea::Unstaged,
-    };
+    let elsewhere = DiffTarget::working_tree(
+        PathBuf::from("/elsewhere/docs/preview.md"),
+        DiffArea::Unstaged,
+    );
     assert_eq!(resolve(&elsewhere, "other.md"), None);
 
     // A link the path resolver refuses stays refused whatever the source.

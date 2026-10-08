@@ -50,7 +50,7 @@ On Linux, the cask installs the AppImage build. If your system cannot launch App
 <details>
 <summary>AUR (Arch Linux)</summary>
 
-The community-maintained [`gitcomet-bin`](https://aur.archlinux.org/packages/gitcomet-bin) package repackages the release tarball:
+The [`gitcomet-bin`](https://aur.archlinux.org/packages/gitcomet-bin) package repackages the release tarballs for x86_64 and aarch64 and is updated by the release workflow:
 
 ```bash
 git clone https://aur.archlinux.org/gitcomet-bin.git
@@ -78,10 +78,10 @@ sudo apt update
 sudo apt install gitcomet
 ```
 
-If you install a Linux tarball or Homebrew binary on Debian, Ubuntu, or WSLg instead of the official `apt` package, install the GUI runtime libraries separately. GitComet draws with Vulkan, or EGL when Vulkan is unavailable, and uses the Wayland libraries in Wayland sessions:
+If you install a Linux tarball or Homebrew binary on Debian, Ubuntu, or WSLg instead of the official `apt` package, install the GUI runtime libraries separately. GitComet uses Fontconfig to discover fonts, draws with Vulkan, or EGL when Vulkan is unavailable, and uses the Wayland libraries in Wayland sessions:
 
 ```bash
-sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0 libvulkan1 libegl1 libwayland-client0 libwayland-egl1
+sudo apt install libfontconfig1 libxcb1 libxkbcommon0 libxkbcommon-x11-0 libvulkan1 libegl1 libwayland-client0 libwayland-egl1
 ```
 
 </details>
@@ -101,7 +101,7 @@ The RPM supports Fedora 42 and newer. It needs glibc 2.35 or newer, so RHEL 9 an
 
 ### Requirements
 
-GitComet requires a local Git installation of `2.50` or newer.
+GitComet requires a local Git installation of `2.53` or newer. With an older Git, GitComet shows a notice asking you to update, and features that need newer Git (such as repository maintenance) are turned off.
 
 ### GitComet User Survey
 
@@ -126,6 +126,8 @@ GitComet started from frustration with existing tools on huge codebases like Chr
   - Multi-repository browsing
   - Inline and side-by-side diffs
   - 2-way and 3-way merge tools
+  - Git LFS: file status, content downloads, locks and tracking ([docs](docs/git-lfs.md))
+  - git-annex: content get/drop/copy/move, special remotes, adjusted branches ([docs](docs/git-annex.md))
 
 #### Professional
 
@@ -138,6 +140,8 @@ GitComet started from frustration with existing tools on huge codebases like Chr
 - Join waitlist: [gitcomet.dev/#editions](https://gitcomet.dev/#editions)
 
 ### Build from source
+
+On Linux, install Clang and mold first; see [developer setup](CONTRIBUTING.md#getting-started).
 
 ```bash
 cargo build -p gitcomet --features ui-gpui,gix

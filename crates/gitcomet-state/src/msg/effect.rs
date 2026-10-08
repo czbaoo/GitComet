@@ -12,10 +12,68 @@ use std::path::PathBuf;
 
 use super::RepoPathList;
 
-#[derive(Clone, Debug)]
+/// Matches every effect that runs a command with staged credentials,
+/// binding its `auth` slot, so both accessors list them once.
+macro_rules! match_git_auth {
+    ($effect:expr, $auth:ident => $then:expr) => {
+        match $effect {
+            Effect::RunLargeFileCommand { auth: $auth, .. }
+            | Effect::RevertCommit { auth: $auth, .. }
+            | Effect::CherryPickCommit { auth: $auth, .. }
+            | Effect::ApplyFileChange { auth: $auth, .. }
+            | Effect::CloneRepo { auth: $auth, .. }
+            | Effect::AddSubmodule { auth: $auth, .. }
+            | Effect::UpdateSubmodules { auth: $auth, .. }
+            | Effect::LoadSubmodule { auth: $auth, .. }
+            | Effect::Commit { auth: $auth, .. }
+            | Effect::CommitAmend { auth: $auth, .. }
+            | Effect::SafePushAfterCommit { auth: $auth, .. }
+            | Effect::FetchAll { auth: $auth, .. }
+            | Effect::FetchRefspecs { auth: $auth, .. }
+            | Effect::Pull { auth: $auth, .. }
+            | Effect::PullBranch { auth: $auth, .. }
+            | Effect::PushWithTags { auth: $auth, .. }
+            | Effect::Push { auth: $auth, .. }
+            | Effect::PushAfterCommit { auth: $auth, .. }
+            | Effect::ForcePush { auth: $auth, .. }
+            | Effect::ForcePushWithLease { auth: $auth, .. }
+            | Effect::PushSetUpstream { auth: $auth, .. }
+            | Effect::DeleteRemoteBranch { auth: $auth, .. }
+            | Effect::DeleteRemoteBranches { auth: $auth, .. }
+            | Effect::RebaseContinue { auth: $auth, .. }
+            | Effect::PushTag { auth: $auth, .. }
+            | Effect::DeleteRemoteTag { auth: $auth, .. } => $then,
+            _ => None,
+        }
+    };
+}
+
+impl Effect {
+    /// Credentials an auth-prompt retry attached to this command.
+    #[cfg(test)]
+    pub(crate) fn git_auth(&self) -> Option<&StagedGitAuth> {
+        match_git_auth!(self, auth => auth.as_ref())
+    }
+
+    /// Where an auth-prompt retry attaches credentials; `None` for effects
+    /// that never need them.
+    pub(crate) fn git_auth_slot(&mut self) -> Option<&mut Option<StagedGitAuth>> {
+        match_git_auth!(self, auth => Some(auth))
+    }
+}
+
+#[derive(Clone, Debug, strum::IntoStaticStr)]
 pub enum Effect {
+    Filesystem(gitcomet_core::filesystem::Request),
     IndexedHistory(crate::indexed_history::IndexedHistoryEffect),
+    DiffSession(crate::diff_session::DiffSessionEffect),
     HistoryAuthors(crate::history_authors::HistoryAuthorsEffect),
+    HistoryFind(crate::history_find::HistoryFindEffect),
+    UpdateRepositoryPreferences {
+        repo_id: RepoId,
+        key: crate::model::RepositoryKey,
+        update: crate::model::RepositoryPreferenceUpdate,
+    },
     PersistSession {
         repo_id: Option<RepoId>,
         action: &'static str,
@@ -73,6 +131,8 @@ pub enum Effect {
         repo_id: RepoId,
         generation: crate::model::LineStatsGeneration,
         status: std::sync::Arc<RepoStatus>,
+        /// Also classify rows for Git LFS / git-annex in the same pass.
+        large_files: bool,
     },
     LoadStatus {
         repo_id: RepoId,
@@ -133,6 +193,7 @@ pub enum Effect {
     LoadWorktreeDirty {
         repo_id: RepoId,
         workdir: PathBuf,
+        scope: crate::model::WorktreeDirtyScope,
         /// Worktree whose changed-file lists the scan should carry back; every
         /// other worktree reports counts alone. `None` while no worktree row is
         /// selected. See [`gitcomet_core::domain::WorktreeDirtySummary`].
@@ -142,6 +203,19 @@ pub enum Effect {
         repo_id: RepoId,
     },
     LoadSubmodules {
+        repo_id: RepoId,
+    },
+    LoadLargeFileSupport {
+        repo_id: RepoId,
+    },
+    LoadLfsLocks {
+        repo_id: RepoId,
+    },
+    LoadAnnexWhereis {
+        repo_id: RepoId,
+        key: String,
+    },
+    LoadAnnexUnused {
         repo_id: RepoId,
     },
     LoadFileBrowser {
@@ -199,6 +273,7 @@ pub enum Effect {
         from: CommitId,
         /// `None` lists files between `from` and the working tree.
         to: Option<CommitId>,
+        options: gitcomet_core::services::ComparisonOptions,
         /// Echoed back on the reply so a completion that lost a race against a
         /// newer load can be dropped. See `HistoryState::range_files_request`.
         request: u64,
@@ -284,12 +359,23 @@ pub enum Effect {
     SaveWorktreeFile {
         repo_id: RepoId,
         path: PathBuf,
-        contents: String,
+        contents: super::message::ContentBytes,
+        expected_contents: Option<std::sync::Arc<[u8]>>,
         stage: bool,
+        completion: Option<smol::channel::Sender<bool>>,
     },
     AppendGitignorePatterns {
         repo_id: RepoId,
         patterns: Vec<String>,
+    },
+    RunLargeFileCommand {
+        repo_id: RepoId,
+        command: gitcomet_core::large_files::LargeFileCommand,
+        auth: Option<StagedGitAuth>,
+    },
+    AppendGitattributesRule {
+        repo_id: RepoId,
+        rule: String,
     },
 
     CheckoutBranch {
@@ -313,6 +399,8 @@ pub enum Effect {
         commit: bool,
         mainline: Option<usize>,
         summary: String,
+        /// Signing or fetch auth staged when a failed pick is replayed.
+        auth: Option<StagedGitAuth>,
     },
     RevertCommit {
         repo_id: RepoId,
@@ -321,6 +409,14 @@ pub enum Effect {
         mainline: Option<usize>,
         summary: String,
         /// Signing or fetch auth staged when a failed revert is replayed.
+        auth: Option<StagedGitAuth>,
+    },
+    ApplyFileChange {
+        repo_id: RepoId,
+        target: gitcomet_core::domain::ApplyChangeTarget,
+        commit: bool,
+        commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
+        /// Signing auth staged when a failed commit step is replayed.
         auth: Option<StagedGitAuth>,
     },
     CreateBranch {
@@ -439,15 +535,15 @@ pub enum Effect {
     },
     StageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
     },
     UnstageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
     },
     ApplyWorktreePatch {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
         reverse: bool,
     },
     StagePath {
@@ -499,10 +595,25 @@ pub enum Effect {
         remote: String,
         branch: String,
     },
+    FetchRefspecs {
+        repo_id: RepoId,
+        remote: String,
+        refspecs: Vec<String>,
+        auth: Option<StagedGitAuth>,
+    },
     PruneMergedBranches {
         repo_id: RepoId,
     },
     PruneLocalTags {
+        repo_id: RepoId,
+    },
+    CheckRepoMaintenance {
+        repo_id: RepoId,
+    },
+    PersistRepoMaintenanceSnooze {
+        common_dir: std::path::PathBuf,
+    },
+    RunMaintenance {
         repo_id: RepoId,
     },
     Pull {
@@ -624,6 +735,7 @@ pub enum Effect {
     InteractiveCherryPick {
         repo_id: RepoId,
         entries: Vec<InteractiveRebaseEntry>,
+        commit: bool,
     },
     /// Load the full `%B` messages of the commits selected for an
     /// interactive cherry-pick: the log page only carries subjects, and a

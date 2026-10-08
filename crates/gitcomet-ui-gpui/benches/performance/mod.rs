@@ -2,6 +2,8 @@ pub(crate) mod common;
 
 mod branch_sidebar;
 mod branch_sidebar_cache;
+mod sidebar_sticky;
+pub(crate) use sidebar_sticky::bench_sidebar_sticky;
 mod branch_sidebar_extreme_scale;
 mod clipboard;
 mod commit_details;
@@ -172,3 +174,6 @@ pub(crate) use undo_redo::bench_undo_redo;
 pub(crate) use window_resize_layout::bench_window_resize_layout;
 pub(crate) use window_resize_layout_extreme_scale::bench_window_resize_layout_extreme_scale;
 pub(crate) use worktree_preview_render::bench_worktree_preview_render;
+
+mod extensions;
+pub(crate) use extensions::bench_extensions;

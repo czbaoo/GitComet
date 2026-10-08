@@ -7,9 +7,11 @@ const ACTION_BAR_HEIGHT_PX: f32 = components::CONTROL_HEIGHT_PX + 12.0;
 
 // The main window supports widths down to 820 design pixels. At that size the
 // branch/upstream run and the fixed actions on the right cannot all retain full
-// text. Pull/Push always retain their labels because they describe the remote
-// operation beside the upstream badge. Only compact mode hides the remaining
-// action labels; condensed mode keeps them while using tighter spacing.
+// text. Pull/Push retain their labels because they describe the remote
+// operation beside the upstream badge, except in compact mode at Comfortable or
+// Spacious density, where every control is wider and only icons still fit.
+// Only compact mode hides the remaining action labels; condensed mode keeps
+// them while using tighter spacing.
 // Tooltips keep omitted labels available in compact mode.
 const COMPACT_ACTION_BAR_MAX_WIDTH_PX: f32 = 1120.0;
 const CONDENSED_ACTION_BAR_MAX_WIDTH_PX: f32 = 1400.0;
@@ -21,10 +23,35 @@ pub(in super::super) enum ActionBarDensity {
     Wide,
 }
 
+/// How much wider the bar's content is per density step (Comfortable = 1,
+/// Spacious = 1.6); the breakpoints move out by the same factor.
+const ACTION_BAR_DENSITY_WIDTH_GROWTH: f32 = 0.1;
+
+/// The window width the breakpoints compare against: larger UI text and a
+/// roomier density both make the content wider, so they shrink the budget.
+fn action_bar_width_budget(window_width: Pixels, metrics: crate::appearance::Appearance) -> Pixels {
+    let font_factor = (metrics.ui_font_size_px as f32 / 14.0).max(1.0);
+    let density_factor = 1.0 + ACTION_BAR_DENSITY_WIDTH_GROWTH * metrics.density_step();
+    window_width / (font_factor * density_factor)
+}
+
+/// The widest window (100% zoom, default text size) still in the compact and
+/// condensed tiers at `metrics`' density.
+#[cfg(test)]
+pub(in crate::view) fn action_bar_breakpoints(metrics: crate::appearance::Appearance) -> [f32; 2] {
+    let density_factor = 1.0 + ACTION_BAR_DENSITY_WIDTH_GROWTH * metrics.density_step();
+    [
+        COMPACT_ACTION_BAR_MAX_WIDTH_PX * density_factor,
+        CONDENSED_ACTION_BAR_MAX_WIDTH_PX * density_factor,
+    ]
+}
+
 pub(in super::super) fn action_bar_density(
     window_width: Pixels,
     ui_scale_percent: u32,
+    metrics: crate::appearance::Appearance,
 ) -> ActionBarDensity {
+    let window_width = action_bar_width_budget(window_width, metrics);
     if window_width
         <= crate::ui_scale::design_px_from_percent(
             COMPACT_ACTION_BAR_MAX_WIDTH_PX,
@@ -44,6 +71,20 @@ pub(in super::super) fn action_bar_density(
     }
 }
 
+/// The narrowest tier at a density above Compact: Pull and Push drop their
+/// labels (their tooltips name them) and badges truncate sooner.
+fn tight_action_bar(density: ActionBarDensity, ui_density: crate::appearance::UiDensity) -> bool {
+    density == ActionBarDensity::Compact && ui_density != crate::appearance::UiDensity::Compact
+}
+
+fn tight_badge_label_max_chars(ui_density: crate::appearance::UiDensity) -> usize {
+    match ui_density {
+        crate::appearance::UiDensity::Compact => COMPACT_BADGE_LABEL_MAX_CHARS,
+        crate::appearance::UiDensity::Comfortable => 7,
+        crate::appearance::UiDensity::Spacious => 5,
+    }
+}
+
 fn secondary_action_label(density: ActionBarDensity, label: &'static str) -> &'static str {
     if density == ActionBarDensity::Compact {
         ""
@@ -54,15 +95,14 @@ fn secondary_action_label(density: ActionBarDensity, label: &'static str) -> &'s
 
 pub(in super::super) fn action_bar_height<C>(cx: &mut C) -> Pixels
 where
-    C: gpui::BorrowAppContext,
+    C: std::borrow::BorrowMut<gpui::App>,
 {
     crate::ui_scale::UiScale::current(cx).row_height(ACTION_BAR_HEIGHT_PX, 44.0)
 }
 
-/// Longest badge label rendered before eliding. `components::Button` takes a
-/// plain string with no truncation of its own, so an unbounded branch name or
-/// folder name would squeeze other actions off the right edge. The full value
-/// stays available in each badge's tooltip.
+/// Longest badge label offered to layout. Badges can shrink further when the
+/// viewport cannot fit the preferred labels alongside its fixed actions. The
+/// full value stays available in each badge's tooltip.
 const BADGE_LABEL_MAX_CHARS: usize = 28;
 const CONDENSED_BADGE_LABEL_MAX_CHARS: usize = 16;
 const COMPACT_BADGE_LABEL_MAX_CHARS: usize = 10;
@@ -194,6 +234,13 @@ fn push_tooltip_text(push_count: usize, tracking_branch_name: Option<&str>) -> S
 }
 
 pub(in super::super) struct ActionBarView {
+    /// Set while an extension's repository view is selected.
+    extension_navigation: Option<(
+        gitcomet_extension_api::RepositoryViewContext,
+        Option<gitcomet_extension_api::ViewNavigation>,
+    )>,
+    /// That view's action-bar context.
+    extension_slot: Option<gpui::AnyView>,
     store: Arc<AppStore>,
     state: Arc<AppState>,
     theme: AppTheme,
@@ -218,13 +265,16 @@ impl ActionBarView {
             repo.branches_rev.hash(&mut hasher);
             repo.remotes_rev.hash(&mut hasher);
             repo.remote_branches_rev.hash(&mut hasher);
+            repo.annex_takes_over_pull_push(&state.large_file_settings)
+                .hash(&mut hasher);
             repo.upstream_divergence_rev.hash(&mut hasher);
             repo.merge_message_rev.hash(&mut hasher);
             repo.ops_rev.hash(&mut hasher);
             repo.status_cache_rev().hash(&mut hasher);
-            // The historical-browse badge keys off the file browser source.
-            repo.file_browser.file_browser_rev.hash(&mut hasher);
-            repo.loads_in_flight.any_in_flight().hash(&mut hasher);
+            // The historical-browse badge keys off the file browser source. Not
+            // `file_browser_rev`: that moves on every sidebar search keystroke.
+            repo.file_browser.active.hash(&mut hasher);
+            repo.file_browser.source.hash(&mut hasher);
             // Global back/forward buttons enable/disable with nav stack position.
             repo.navigation.main_history.cursor.hash(&mut hasher);
             repo.navigation.main_history.entries.len().hash(&mut hasher);
@@ -254,6 +304,8 @@ impl ActionBarView {
         });
 
         Self {
+            extension_navigation: None,
+            extension_slot: None,
             store,
             state,
             theme,
@@ -269,6 +321,46 @@ impl ActionBarView {
     pub(in super::super) fn set_theme(&mut self, theme: AppTheme, cx: &mut gpui::Context<Self>) {
         self.theme = theme;
         cx.notify();
+    }
+
+    pub(in crate::view) fn set_extension_navigation(
+        &mut self,
+        navigation: Option<(
+            gitcomet_extension_api::RepositoryViewContext,
+            Option<gitcomet_extension_api::ViewNavigation>,
+        )>,
+        slot: Option<gpui::AnyView>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.extension_navigation.is_none() && navigation.is_none() {
+            return;
+        }
+        self.extension_navigation = navigation;
+        self.extension_slot = slot;
+        cx.notify();
+    }
+
+    fn extension_navigate(&self, forward: bool, cx: &mut gpui::Context<Self>) -> bool {
+        let Some((context, navigation)) = &self.extension_navigation else {
+            return false;
+        };
+        if let Some(navigation) = navigation {
+            let can = if forward {
+                &navigation.can_forward
+            } else {
+                &navigation.can_back
+            };
+            if can(context, cx) {
+                let run = if forward {
+                    navigation.forward.clone()
+                } else {
+                    navigation.back.clone()
+                };
+                let context = context.clone();
+                cx.defer(move |cx| run(context, cx));
+            }
+        }
+        true
     }
 
     pub(in super::super) fn set_active_context_menu_invoker(
@@ -361,11 +453,18 @@ impl Render for ActionBarView {
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
         let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
         let density = action_bar_density(
-            window.viewport_size().width / (theme.metrics.ui_font_size_px as f32 / 14.0).max(1.0),
+            window.viewport_size().width,
             ui_scale_percent,
+            theme.metrics,
         );
         let dense_spacing = density != ActionBarDensity::Wide;
+        // Comfortable and Spacious widen every control, so the narrowest
+        // tier, which just fits at Compact, has to shed more.
+        let tight = tight_action_bar(density, theme.metrics.density);
         let badge_label_max_chars = match density {
+            ActionBarDensity::Compact if tight => {
+                tight_badge_label_max_chars(theme.metrics.density)
+            }
             ActionBarDensity::Compact => COMPACT_BADGE_LABEL_MAX_CHARS,
             ActionBarDensity::Condensed => CONDENSED_BADGE_LABEL_MAX_CHARS,
             ActionBarDensity::Wide => BADGE_LABEL_MAX_CHARS,
@@ -375,6 +474,10 @@ impl Render for ActionBarView {
         // picks the base gap from the viewport, then the user's density setting
         // ramps it.
         let gap = |dense: f32, wide: f32, comfortable: f32| {
+            if tight {
+                // Gaps stop growing where the controls barely fit.
+                return scaled_px(dense);
+            }
             scaled_px(
                 theme
                     .metrics
@@ -383,6 +486,9 @@ impl Render for ActionBarView {
         };
         let action_group_gap = gap(4.0, 8.0, 6.0);
         let tracking_action_gap = gap(2.0, 4.0, 6.0);
+        // Text in the three picker badges gives way before actions do. Keep
+        // enough room for the icon and an ellipsis even at the narrowest size.
+        let badge_min_width = scaled_px(theme.metrics.row_height(22.0, 32.0) + 28.0);
         let action_bar_padding_x = if dense_spacing {
             scaled_px(4.0)
         } else {
@@ -479,10 +585,6 @@ impl Render for ActionBarView {
             .active_repo()
             .and_then(|repo| head_branch_tracking_upstream_name(&repo.head_branch, &repo.branches));
         let active_repo_key = self.active_repo_id().map(|id| id.0).unwrap_or(0);
-        let pull_default_enabled = self
-            .active_repo()
-            .is_some_and(head_branch_has_live_upstream);
-
         let can_stash = self
             .active_repo()
             .map(|repo| {
@@ -505,6 +607,17 @@ impl Render for ActionBarView {
                 )
             })
             .unwrap_or((false, false));
+        let (nav_can_back, nav_can_forward) = self.extension_navigation.as_ref().map_or(
+            (nav_can_back, nav_can_forward),
+            |(context, navigation)| {
+                navigation.as_ref().map_or((false, false), |navigation| {
+                    (
+                        (navigation.can_back)(context, cx),
+                        (navigation.can_forward)(context, cx),
+                    )
+                })
+            },
+        );
         let nav_back = components::Button::new("global_nav_back", "")
             .start_slot(icon(
                 "icons/arrow_left.svg",
@@ -516,7 +629,10 @@ impl Render for ActionBarView {
             ))
             .style(components::ButtonStyle::Transparent)
             .disabled(!nav_can_back)
-            .on_click(theme, cx, |this, _e, _w, _cx| {
+            .on_click(theme, cx, |this, _e, _w, cx| {
+                if this.extension_navigate(false, cx) {
+                    return;
+                }
                 if let Some(repo_id) = this.active_repo_id() {
                     this.store.dispatch(Msg::GlobalNavBack { repo_id });
                 }
@@ -540,7 +656,10 @@ impl Render for ActionBarView {
             ))
             .style(components::ButtonStyle::Transparent)
             .disabled(!nav_can_forward)
-            .on_click(theme, cx, |this, _e, _w, _cx| {
+            .on_click(theme, cx, |this, _e, _w, cx| {
+                if this.extension_navigate(true, cx) {
+                    return;
+                }
                 if let Some(repo_id) = this.active_repo_id() {
                     this.store.dispatch(Msg::GlobalNavForward { repo_id });
                 }
@@ -565,18 +684,19 @@ impl Render for ActionBarView {
 
         // Workspace (worktree) and branch badges show the current state at a
         // glance, with each opening a filterable picker.
-        let workspace_badge = self.active_repo().map(|repo| {
+        let worktree_badge = self.active_repo().map(|repo| {
             let repo_id = repo.id;
             let label = truncate_badge_label_to(
                 &crate::view::path_display::repo_path_name(&repo.spec.workdir),
                 badge_label_max_chars,
             );
             let workdir = repo.spec.workdir.display().to_string();
-            let invoker: SharedString = "workspace_badge".into();
+            let invoker: SharedString = "worktree_badge".into();
             let is_active = active_invoker
                 .as_ref()
                 .is_some_and(|id| id.as_ref() == invoker.as_ref());
-            components::Button::new("workspace_badge", label.clone())
+            components::Button::new("worktree_badge", label.clone())
+                .truncate_label()
                 .start_slot(icon("icons/git_worktree.svg", icon_primary))
                 .style(components::ButtonStyle::Subtle)
                 .open(is_active)
@@ -590,7 +710,8 @@ impl Render for ActionBarView {
                         cx,
                     );
                 })
-                .debug_selector(|| "workspace_badge".to_string())
+                .min_w(badge_min_width)
+                .debug_selector(|| "worktree_badge".to_string())
                 .gitcomet_tooltip(theme, format!("Switch worktree\n{workdir}").into())
         });
 
@@ -601,8 +722,13 @@ impl Render for ActionBarView {
             // Detached HEAD surfaces as the literal "HEAD"; label it as such
             // rather than pretending it is a branch.
             let detached = head == "HEAD";
+            // An annex adjusted branch reads as its base branch plus the mode:
+            // commits made here propagate to the base via git-annex.
+            let adjusted = gitcomet_core::annex::adjusted_branch(head);
             let label: SharedString = if detached {
                 "detached".into()
+            } else if let Some((base, mode)) = adjusted {
+                truncate_badge_label_to(&format!("{base} · adjusted ({mode})"), badge_label_max_chars)
             } else {
                 truncate_badge_label_to(head, badge_label_max_chars)
             };
@@ -612,11 +738,14 @@ impl Render for ActionBarView {
                 .is_some_and(|id| id.as_ref() == invoker.as_ref());
             let tooltip: SharedString = if detached {
                 "Detached HEAD — click to check out a branch".into()
+            } else if let Some((base, _)) = adjusted {
+                format!("On git-annex adjusted branch {head}; commits propagate to {base} through git-annex sync, pull and push").into()
             } else {
                 format!("On branch {head} — click to switch").into()
             };
             Some(
                 components::Button::new("branch_badge", label)
+                    .truncate_label()
                     .start_slot(icon("icons/git_branch.svg", icon_primary))
                     .style(components::ButtonStyle::Subtle)
                     .open(is_active)
@@ -632,6 +761,7 @@ impl Render for ActionBarView {
                             cx,
                         );
                     })
+                    .min_w(badge_min_width)
                     .debug_selector(|| "branch_badge".to_string())
                     .gitcomet_tooltip(theme, tooltip),
             )
@@ -663,6 +793,7 @@ impl Render for ActionBarView {
                 .is_some_and(|id| id.as_ref() == invoker.as_ref());
             Some(
                 components::Button::new("upstream_badge", label)
+                    .truncate_label()
                     .start_slot(icon("icons/cloud.svg", badge_color))
                     .style(components::ButtonStyle::Subtle)
                     .text_color(if has_upstream {
@@ -684,6 +815,7 @@ impl Render for ActionBarView {
                             cx,
                         );
                     })
+                    .min_w(badge_min_width)
                     .debug_selector(|| "upstream_badge".to_string())
                     .gitcomet_tooltip(theme, tooltip),
             )
@@ -692,6 +824,7 @@ impl Render for ActionBarView {
             div()
                 .debug_selector(|| "upstream_arrow".to_string())
                 .flex()
+                .flex_none()
                 .items_center()
                 .child(svg_icon(
                     "icons/arrow_right.svg",
@@ -705,7 +838,7 @@ impl Render for ActionBarView {
         } else {
             icon_muted
         };
-        let mut pull_main = components::Button::new("pull_main", "Pull")
+        let mut pull_main = components::Button::new("pull_main", if tight { "" } else { "Pull" })
             .busy(pull_loading)
             .start_slot(if pull_loading {
                 spinner(("pull_spinner", active_repo_key), pull_color).into_any_element()
@@ -722,9 +855,9 @@ impl Render for ActionBarView {
             .as_ref()
             .is_some_and(|id| id.as_ref() == pull_picker_invoker.as_ref());
         let pull_tracking_branch_name = tracking_branch_name.clone();
-        let pull_request_enabled = self
+        let pull_available = self
             .active_repo()
-            .is_some_and(|repo| matches!(pull_request(repo), PullRequest::Pull));
+            .is_some_and(|repo| pull_enabled(repo, &self.state.large_file_settings));
         let pull_menu_icon_color = if pull_picker_active {
             theme.colors.accent.foreground
         } else {
@@ -738,10 +871,11 @@ impl Render for ActionBarView {
 
         let pull = div()
             .id("pull")
+            .flex_none()
             .debug_selector(|| "pull".to_string())
             .child(
                 components::SplitButton::action_menu(
-                    pull_main.disabled(!pull_default_enabled || !pull_request_enabled),
+                    pull_main.disabled(!pull_available),
                     pull_menu,
                     theme,
                     cx,
@@ -750,7 +884,7 @@ impl Render for ActionBarView {
                             return;
                         };
                         let repo_id = repo.id;
-                        match pull_request(repo) {
+                        match pull_request(repo, &this.state.large_file_settings) {
                             PullRequest::Pull => this.store.dispatch(Msg::Pull {
                                 repo_id,
                                 mode: PullMode::Default,
@@ -812,7 +946,7 @@ impl Render for ActionBarView {
                 })
                 .gitcomet_tooltip(theme, terminal_tooltip),
         );
-        let mut push_main = components::Button::new("push_main", "Push")
+        let mut push_main = components::Button::new("push_main", if tight { "" } else { "Push" })
             .busy(push_loading)
             .start_slot(if push_loading {
                 spinner(("push_spinner", active_repo_key), push_color).into_any_element()
@@ -829,9 +963,12 @@ impl Render for ActionBarView {
             .as_ref()
             .is_some_and(|id| id.as_ref() == push_picker_invoker.as_ref());
         let push_tracking_branch_name = tracking_branch_name.clone();
-        let push_request_ready = self
-            .active_repo()
-            .is_some_and(|repo| !matches!(push_request(repo), PushRequest::NotReady));
+        let push_request_ready = self.active_repo().is_some_and(|repo| {
+            !matches!(
+                push_request(repo, &self.state.large_file_settings),
+                PushRequest::NotReady
+            )
+        });
         let push_menu_icon_color = if push_picker_active {
             theme.colors.accent.foreground
         } else {
@@ -845,6 +982,7 @@ impl Render for ActionBarView {
 
         let push = div()
             .id("push")
+            .flex_none()
             .debug_selector(|| "push".to_string())
             .child(
                 components::SplitButton::action_menu(
@@ -857,7 +995,7 @@ impl Render for ActionBarView {
                             return;
                         };
                         let repo_id = repo.id;
-                        match push_request(repo) {
+                        match push_request(repo, &this.state.large_file_settings) {
                             PushRequest::Push => this.store.dispatch(Msg::Push { repo_id }),
                             PushRequest::SetUpstream { remote } => this.open_popover_at(
                                 PopoverKind::PushSetUpstreamPrompt {
@@ -974,7 +1112,7 @@ impl Render for ActionBarView {
             .id("tracking_actions")
             .debug_selector(|| "tracking_actions".to_string())
             .flex()
-            .flex_none()
+            .min_w(px(0.0))
             .items_center()
             .gap(tracking_action_gap)
             .children(branch_badge)
@@ -982,6 +1120,120 @@ impl Render for ActionBarView {
             .children(upstream_badge)
             .child(pull)
             .child(push);
+
+        let left_group = div()
+            .debug_selector(|| "left_action_group".to_string())
+            .flex()
+            .items_center()
+            .gap(action_group_gap)
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .child(global_nav);
+        // A selected extension view brings its own context; History's branch,
+        // tracking and merge controls stay with History.
+        let left_group = if self.extension_navigation.is_some() {
+            left_group.children(self.extension_slot.clone().map(|slot| {
+                div()
+                    .debug_selector(|| "extension_action_bar".to_string())
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(slot)
+            }))
+        } else {
+            left_group
+                .children(worktree_badge)
+                .child(tracking_actions)
+                .children(historical_badge)
+                .when(is_merging, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "merge_controls".to_string())
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(theme.ui_text(12.0))
+                                    .text_color(theme.colors.status.warning.foreground)
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("MERGING"),
+                            )
+                            .child(
+                                components::Button::new("abort_merge", merge_abort_label)
+                                    .style(components::ButtonStyle::Danger)
+                                    .on_click(theme, cx, |this, e: &ClickEvent, window, cx| {
+                                        if let Some(repo_id) = this.active_repo_id() {
+                                            this.open_popover_at(
+                                                PopoverKind::MergeAbortConfirm { repo_id },
+                                                e.position(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                            ),
+                    )
+                })
+                .when_some(sequencer_banner.filter(|_| !is_merging), |d, banner| {
+                    d.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(theme.ui_text(12.0))
+                                    .text_color(theme.colors.status.warning.foreground)
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(banner.label),
+                            )
+                            .child(
+                                components::Button::new(banner.abort_id, "Abort")
+                                    .style(components::ButtonStyle::Danger)
+                                    .disabled(sequencer_step_busy)
+                                    .on_click(theme, cx, |this, e: &ClickEvent, window, cx| {
+                                        if let Some(repo_id) = this.active_repo_id() {
+                                            this.open_popover_at(
+                                                PopoverKind::MergeAbortConfirm { repo_id },
+                                                e.position(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })
+                                    .when(sequencer_step_busy, |button| {
+                                        button
+                                            .gitcomet_tooltip(theme, SEQUENCER_BUSY_TOOLTIP.into())
+                                    }),
+                            )
+                            .child(
+                                components::Button::new(banner.continue_id, "Continue")
+                                    .style(components::ButtonStyle::Outlined)
+                                    .disabled(rebase_has_unstaged_conflicts || sequencer_step_busy)
+                                    .on_click(theme, cx, |this, _e, _w, _cx| {
+                                        if let Some(repo_id) = this.active_repo_id() {
+                                            this.store.dispatch(Msg::RebaseContinue { repo_id });
+                                        }
+                                    })
+                                    .gitcomet_tooltip(
+                                        theme,
+                                        if sequencer_step_busy {
+                                            SEQUENCER_BUSY_TOOLTIP.into()
+                                        } else if rebase_has_unstaged_conflicts {
+                                            "Resolve all conflicts before continuing".into()
+                                        } else {
+                                            banner.continue_tooltip.into()
+                                        },
+                                    ),
+                            ),
+                    )
+                })
+        };
 
         div()
             .debug_selector(|| "action_bar".to_string())
@@ -993,109 +1245,7 @@ impl Render for ActionBarView {
             .justify_between()
             .px(action_bar_padding_x)
             .bg(theme.colors.surface.chrome)
-            .child(
-                div()
-                    .debug_selector(|| "left_action_group".to_string())
-                    .flex()
-                    .items_center()
-                    .gap(action_group_gap)
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(global_nav)
-                    .children(workspace_badge)
-                    .child(tracking_actions)
-                    .children(historical_badge)
-                    .when(is_merging, |d| {
-                        d.child(
-                            div()
-                                .debug_selector(|| "merge_controls".to_string())
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(theme.ui_text(12.0))
-                                        .text_color(theme.colors.status.warning.foreground)
-                                        .font_weight(FontWeight::BOLD)
-                                        .child("MERGING"),
-                                )
-                                .child(
-                                    components::Button::new("abort_merge", merge_abort_label)
-                                        .style(components::ButtonStyle::Danger)
-                                        .on_click(theme, cx, |this, e: &ClickEvent, window, cx| {
-                                            if let Some(repo_id) = this.active_repo_id() {
-                                                this.open_popover_at(
-                                                    PopoverKind::MergeAbortConfirm { repo_id },
-                                                    e.position(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        }),
-                                ),
-                        )
-                    })
-                    .when_some(sequencer_banner.filter(|_| !is_merging), |d, banner| {
-                        d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(theme.ui_text(12.0))
-                                        .text_color(theme.colors.status.warning.foreground)
-                                        .font_weight(FontWeight::BOLD)
-                                        .child(banner.label),
-                                )
-                                .child(
-                                    components::Button::new(banner.abort_id, "Abort")
-                                        .style(components::ButtonStyle::Danger)
-                                        .disabled(sequencer_step_busy)
-                                        .on_click(theme, cx, |this, e: &ClickEvent, window, cx| {
-                                            if let Some(repo_id) = this.active_repo_id() {
-                                                this.open_popover_at(
-                                                    PopoverKind::MergeAbortConfirm { repo_id },
-                                                    e.position(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        })
-                                        .when(sequencer_step_busy, |button| {
-                                            button.gitcomet_tooltip(
-                                                theme,
-                                                SEQUENCER_BUSY_TOOLTIP.into(),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    components::Button::new(banner.continue_id, "Continue")
-                                        .style(components::ButtonStyle::Outlined)
-                                        .disabled(
-                                            rebase_has_unstaged_conflicts || sequencer_step_busy,
-                                        )
-                                        .on_click(theme, cx, |this, _e, _w, _cx| {
-                                            if let Some(repo_id) = this.active_repo_id() {
-                                                this.store
-                                                    .dispatch(Msg::RebaseContinue { repo_id });
-                                            }
-                                        })
-                                        .gitcomet_tooltip(
-                                            theme,
-                                            if sequencer_step_busy {
-                                                SEQUENCER_BUSY_TOOLTIP.into()
-                                            } else if rebase_has_unstaged_conflicts {
-                                                "Resolve all conflicts before continuing".into()
-                                            } else {
-                                                banner.continue_tooltip.into()
-                                            },
-                                        ),
-                                ),
-                        )
-                    }),
-            )
+            .child(left_group)
             .child(
                 div()
                     .debug_selector(|| "right_action_group".to_string())
@@ -1204,30 +1354,51 @@ mod tests {
     }
 
     #[test]
+    fn roomier_densities_move_the_breakpoints_out() {
+        let at = |density| crate::appearance::Appearance {
+            density,
+            ..crate::appearance::Appearance::default()
+        };
+        let comfortable = at(crate::appearance::UiDensity::Comfortable);
+        assert_eq!(
+            action_bar_density(px(1121.0), 100, comfortable),
+            ActionBarDensity::Compact,
+            "Comfortable needs more room before labels return"
+        );
+        assert_eq!(
+            action_bar_density(px(1233.0), 100, comfortable),
+            ActionBarDensity::Condensed
+        );
+    }
+
+    #[test]
     fn action_bar_density_changes_at_scaled_breakpoints() {
         assert_eq!(
-            action_bar_density(px(960.0), 100),
+            action_bar_density(px(960.0), 100, crate::appearance::Appearance::default()),
             ActionBarDensity::Compact
         );
         assert_eq!(
-            action_bar_density(px(961.0), 100),
+            action_bar_density(px(961.0), 100, crate::appearance::Appearance::default()),
             ActionBarDensity::Compact
         );
         assert_eq!(
-            action_bar_density(px(1120.0), 100),
+            action_bar_density(px(1120.0), 100, crate::appearance::Appearance::default()),
             ActionBarDensity::Compact
         );
         assert_eq!(
-            action_bar_density(px(1121.0), 100),
+            action_bar_density(px(1121.0), 100, crate::appearance::Appearance::default()),
             ActionBarDensity::Condensed
         );
         assert_eq!(
-            action_bar_density(px(1400.0), 100),
+            action_bar_density(px(1400.0), 100, crate::appearance::Appearance::default()),
             ActionBarDensity::Condensed
         );
-        assert_eq!(action_bar_density(px(1401.0), 100), ActionBarDensity::Wide);
         assert_eq!(
-            action_bar_density(px(1200.0), 125),
+            action_bar_density(px(1401.0), 100, crate::appearance::Appearance::default()),
+            ActionBarDensity::Wide
+        );
+        assert_eq!(
+            action_bar_density(px(1200.0), 125, crate::appearance::Appearance::default()),
             ActionBarDensity::Compact
         );
     }
@@ -1333,6 +1504,37 @@ mod tests {
     }
 
     #[test]
+    fn notify_fingerprint_changes_when_annex_pull_availability_changes() {
+        let repo_id = RepoId(1);
+        let mut repo = RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: "/tmp/repo".into(),
+            },
+        );
+        repo.head_branch = Loadable::Ready("adjusted/main(unlocked)".into());
+        let mut state = AppState {
+            repos: vec![repo],
+            active_repo: Some(repo_id),
+            ..AppState::test_default()
+        };
+        let before = ActionBarView::notify_fingerprint(&state);
+        let mut support = gitcomet_core::large_files::LargeFileSupport::default();
+        support.annex.uuid = Some("u".into());
+        state.repos[0].large_file_support = Loadable::Ready(Arc::new(support));
+        let detected = ActionBarView::notify_fingerprint(&state);
+        assert_eq!(
+            before, detected,
+            "unknown support already protects the adjusted branch"
+        );
+        state.repos[0].large_file_support = Loadable::Ready(Arc::default());
+        assert_ne!(detected, ActionBarView::notify_fingerprint(&state));
+        state.repos[0].large_file_support = Loadable::Loading;
+        state.large_file_settings.annex_pull_push = false;
+        assert_ne!(detected, ActionBarView::notify_fingerprint(&state));
+    }
+
+    #[test]
     fn notify_fingerprint_changes_when_remote_branches_rev_changes() {
         let repo_id = RepoId(1);
         let mut state = AppState {
@@ -1351,5 +1553,34 @@ mod tests {
         let after = ActionBarView::notify_fingerprint(&state);
 
         assert_ne!(before, after);
+    }
+
+    /// Sidebar file search and folder expansion move `file_browser_rev` on
+    /// every keystroke; the bar only shows the browse badge, which follows the
+    /// browser's `active` flag and `source`.
+    #[test]
+    fn notify_fingerprint_ignores_file_browser_search() {
+        let repo_id = RepoId(1);
+        let mut state = AppState {
+            active_repo: Some(repo_id),
+            ..AppState::test_default()
+        };
+        state.repos.push(RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: PathBuf::from("/tmp/repo"),
+            },
+        ));
+        let before = ActionBarView::notify_fingerprint(&state);
+
+        let browser = &mut state.repos[0].file_browser;
+        browser.search_query = "src".into();
+        browser.expanded_dirs.insert(Arc::new(PathBuf::from("src")));
+        browser.bump_rev();
+        assert_eq!(before, ActionBarView::notify_fingerprint(&state));
+
+        state.repos[0].file_browser.active = true;
+        state.repos[0].file_browser.bump_rev();
+        assert_ne!(before, ActionBarView::notify_fingerprint(&state));
     }
 }

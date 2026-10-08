@@ -2,6 +2,296 @@ use super::*;
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
 
+/// Place backend-shaped glyphs on Alacritty's authoritative cell grid. Terminal
+/// hit testing and selection use that grid directly, rather than text-layout
+/// caret geometry. Shape once per cached row, including combining characters
+/// and wide-cell spacers, instead of reshaping individual cells.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shape_terminal_grid_line(
+    text: SharedString,
+    runs: &[TextRun],
+    cells: &[IndexedCell],
+    row: i32,
+    cols: usize,
+    font_size: Pixels,
+    cell_width: Pixels,
+    window: &mut Window,
+) -> gpui::ShapedLine {
+    use alacritty_terminal::term::cell::Flags;
+
+    let mut source = Vec::new();
+    let mut offset = 0;
+    for cell in cells
+        .iter()
+        .filter(|cell| cell.point.line.0 == row && cell.point.column.0 < cols)
+    {
+        if cell.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let len = if matches!(cell.cell.c, ' ' | '\0') {
+            1
+        } else {
+            cell.cell.c.len_utf8()
+                + cell
+                    .cell
+                    .zerowidth()
+                    .map_or(0, |chars| chars.iter().map(|ch| ch.len_utf8()).sum())
+        };
+        source.push((
+            offset,
+            offset + len,
+            cell.point.column.0,
+            cell.point.column.0
+                + if cell.cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                },
+        ));
+        offset += len;
+    }
+    debug_assert_eq!(offset, text.len(), "terminal text and cell source agree");
+
+    let ascii = text.is_ascii();
+    let mut shaped = window.text_system().shape_line(text, font_size, runs);
+    let mut layout = (**shaped).clone();
+    let native = &layout.platform_layout;
+    let mut run_starts = Vec::with_capacity(runs.len() + 1);
+    run_starts.push(0);
+    for run in runs {
+        run_starts.push(run_starts.last().copied().unwrap_or(0) + run.len);
+    }
+    // Plain output usually has one glyph per ASCII cell. Avoid a native
+    // hit test and caret lookup for every glyph in that case. Split font
+    // fragments and ligatures retain the general cluster-aware mapping.
+    let mut seen_runs = vec![false; runs.len()];
+    let ascii_grid = ascii
+        && source.len() == offset
+        && layout.paint_fragments.iter().all(|fragment| {
+            let unique = !seen_runs[fragment.source_run];
+            seen_runs[fragment.source_run] = true;
+            unique && fragment.glyphs.len() == runs[fragment.source_run].len
+        })
+        && seen_runs.into_iter().all(|seen| seen);
+    for fragment in &mut layout.paint_fragments {
+        let glyphs = Arc::make_mut(&mut fragment.glyphs);
+        for (glyph_index, glyph) in glyphs.iter_mut().enumerate() {
+            if ascii_grid {
+                let cell = &source[run_starts[fragment.source_run] + glyph_index];
+                glyph.position.x = cell_width * cell.2 as f32;
+                continue;
+            }
+            let index = native
+                .byte_index_from_pixel_point(point(glyph.position.x + px(0.001), px(0.5)), px(1.0))
+                .unwrap_or_else(|index| index);
+            let count = source.partition_point(|cell| cell.0 <= index);
+            let Some(cell) = count.checked_sub(1).map(|index| &source[index]) else {
+                continue;
+            };
+            let origin = native
+                .caret_bounds(
+                    gpui::CaretPosition::attached_to_next_cluster(cell.0),
+                    px(1.0),
+                )
+                .map_or(glyph.position.x, |bounds| bounds.origin.x);
+            glyph.position.x = cell_width * cell.2 as f32 + glyph.position.x - origin;
+        }
+        let start = run_starts[fragment.source_run];
+        let end = run_starts[fragment.source_run + 1];
+        let first = source.partition_point(|cell| cell.1 <= start);
+        let last = source.partition_point(|cell| cell.0 < end);
+        let columns =
+            source[first..last]
+                .iter()
+                .fold(None, |range: Option<(usize, usize)>, cell| {
+                    Some(range.map_or((cell.2, cell.3), |(start, end)| {
+                        (start.min(cell.2), end.max(cell.3))
+                    }))
+                });
+        if let Some((start, end)) = columns {
+            fragment.x_range = cell_width * start as f32..cell_width * end as f32;
+        }
+    }
+    layout.width = cell_width * cols as f32;
+    if let Some(line) = layout.visual_lines.first_mut() {
+        line.advance_width = layout.width;
+    }
+    *shaped = Arc::new(layout);
+    shaped
+}
+
+#[cfg(test)]
+mod grid_layout_tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+    use alacritty_terminal::term::cell::{Cell, Flags};
+
+    #[gpui::test]
+    fn ascii_with_style_changes_keeps_each_glyph_on_its_cell(cx: &mut gpui::TestAppContext) {
+        gitcomet_ui_kit::test_support::use_real_text_backend(cx);
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            for family in ["Lilex", "IBM Plex Sans"] {
+                for text in [
+                    "GitComet-terminal-output",
+                    "AV To 1234 /src/main.rs",
+                    "          ",
+                ] {
+                    let cells: Vec<_> = text
+                        .chars()
+                        .enumerate()
+                        .map(|(col, c)| {
+                            let mut cell = Cell {
+                                c,
+                                ..Cell::default()
+                            };
+                            if col % 3 == 0 {
+                                cell.flags.insert(Flags::BOLD);
+                            }
+                            IndexedCell {
+                                point: AlacPoint::new(Line(0), Column(col)),
+                                cell,
+                            }
+                        })
+                        .collect();
+                    let style = gpui::TextStyle {
+                        font_family: family.into(),
+                        ..Default::default()
+                    };
+                    let (text, runs, _) = build_alacritty_row(
+                        &cells,
+                        0,
+                        cells.len(),
+                        &style,
+                        AppTheme::gitcomet_dark(),
+                    );
+                    let shaped = shape_terminal_grid_line(
+                        text,
+                        &runs,
+                        &cells,
+                        0,
+                        cells.len(),
+                        px(12.),
+                        px(16.),
+                        window,
+                    );
+                    let mut positions: Vec<_> = shaped
+                        .paint_fragments
+                        .iter()
+                        .flat_map(|f| f.glyphs.iter())
+                        .map(|g| g.position.x)
+                        .collect();
+                    positions.sort_by(|a, b| f32::from(*a).total_cmp(&f32::from(*b)));
+                    assert_eq!(
+                        positions,
+                        (0..cells.len())
+                            .map(|i| px(i as f32 * 16.))
+                            .collect::<Vec<_>>(),
+                        "{family}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn wide_and_combining_cells_keep_the_authoritative_grid(cx: &mut gpui::TestAppContext) {
+        gitcomet_ui_kit::test_support::use_real_text_backend(cx);
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let mut wide = Cell {
+                c: '日',
+                ..Cell::default()
+            };
+            wide.flags.insert(Flags::WIDE_CHAR);
+            let mut spacer = Cell::default();
+            spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
+            let cells = vec![
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(0)),
+                    cell: Cell {
+                        c: 'a',
+                        ..Cell::default()
+                    },
+                },
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(1)),
+                    cell: wide,
+                },
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(2)),
+                    cell: spacer,
+                },
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(3)),
+                    cell: Cell {
+                        c: 'b',
+                        ..Cell::default()
+                    },
+                },
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(4)),
+                    cell: Cell {
+                        c: 'é',
+                        ..Cell::default()
+                    },
+                },
+            ];
+            let style = gpui::TextStyle {
+                font_family: "Lilex".into(),
+                ..gpui::TextStyle::default()
+            };
+            let (text, runs, _) =
+                build_alacritty_row(&cells, 0, 5, &style, AppTheme::gitcomet_dark());
+            let line =
+                shape_terminal_grid_line(text, &runs, &cells, 0, 5, px(12.0), px(16.0), window);
+            let positions: Vec<_> = line
+                .paint_fragments
+                .iter()
+                .flat_map(|fragment| fragment.glyphs.iter())
+                .map(|glyph| glyph.position.x)
+                .collect();
+            assert_eq!(positions, [px(0.0), px(16.0), px(48.0), px(64.0)]);
+            assert_eq!(line.width, px(80.0));
+
+            let mut accent = Cell {
+                c: 'e',
+                ..Cell::default()
+            };
+            accent.push_zerowidth('\u{301}');
+            let cells = vec![
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(0)),
+                    cell: accent,
+                },
+                IndexedCell {
+                    point: AlacPoint::new(Line(0), Column(1)),
+                    cell: Cell {
+                        c: 'b',
+                        ..Cell::default()
+                    },
+                },
+            ];
+            let (text, runs, _) =
+                build_alacritty_row(&cells, 0, 2, &style, AppTheme::gitcomet_dark());
+            let line =
+                shape_terminal_grid_line(text, &runs, &cells, 0, 2, px(12.0), px(16.0), window);
+            let positions: Vec<_> = line
+                .paint_fragments
+                .iter()
+                .flat_map(|fragment| fragment.glyphs.iter())
+                .map(|glyph| glyph.position.x)
+                .collect();
+            assert_eq!(
+                positions.last(),
+                Some(&px(16.0)),
+                "combining marks do not consume a cell"
+            );
+            assert_eq!(line.width, px(32.0));
+        });
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TerminalCanvasPaintState {
     pub(super) bounds: Bounds<Pixels>,
@@ -78,7 +368,6 @@ pub(super) fn paint_terminal_canvas_state(
                 underline: ime_style.underline,
                 ..Default::default()
             }],
-            None,
         );
         let ime_bg = Bounds::new(
             ime_bounds.origin,
@@ -182,7 +471,6 @@ pub(super) fn terminal_cursor_width(
             color: base_style.color,
             ..Default::default()
         }],
-        None,
     );
     shaped.width.max(cell_width).ceil()
 }

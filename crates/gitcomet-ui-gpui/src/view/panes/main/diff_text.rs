@@ -1,4 +1,6 @@
 use super::*;
+use crate::kit::drag_autoscroll::{DRAG_AUTOSCROLL_TICK, drag_autoscroll_step};
+use gitcomet_ui_kit::text_layout::TextLayoutExt as _;
 
 #[cfg(test)]
 thread_local! {
@@ -141,6 +143,7 @@ impl MainPaneView {
             .diff_text_hitboxes
             .entry((visible_ix, region))
             .or_insert_with(|| DiffTextHitbox {
+                atomic: false,
                 bounds: cell.bounds,
                 layout_key: 0,
                 source_visible_ix: cell.source_visible_ix,
@@ -304,15 +307,32 @@ impl MainPaneView {
             let cell = Self::diff_text_cell_for_position(hitbox, position)?;
             return self.diff_text_hit_in_hitbox(cell, region, position);
         }
+        if hitbox.atomic {
+            let after = position.y > hitbox.bounds.bottom()
+                || (position.y >= hitbox.bounds.top() && position.x >= hitbox.bounds.center().x);
+            return Some(DiffTextHit {
+                pos: DiffTextPos {
+                    source_visible_ix: hitbox.source_visible_ix,
+                    region,
+                    offset: hitbox.text_start_offset + if after { hitbox.text_len } else { 0 },
+                },
+                past_painted_text: true,
+            });
+        }
         if let Some(wrapped) = &hitbox.wrapped {
             // A wrapped row spans several visual lines, so the click resolves
             // against the layout it was painted with; `Err` is the clamp to the
             // nearest boundary, which is what a drag past the text wants.
-            let (painted_offset, past_painted_text) =
+            let (painted_offset, past_painted_text) = if position.y < hitbox.bounds.top() {
+                (0, true)
+            } else if position.y > hitbox.bounds.bottom() {
+                (wrapped.layout.len(), true)
+            } else {
                 match wrapped.layout.index_for_position(position) {
                     Ok(offset) => (offset, false),
                     Err(offset) => (offset, true),
-                };
+                }
+            };
             return Some(DiffTextHit {
                 pos: DiffTextPos {
                     source_visible_ix: hitbox.source_visible_ix,
@@ -387,6 +407,9 @@ impl MainPaneView {
                     .contains(&range.start)
             })?;
             return self.diff_text_bounds_in_hitbox(cell, range, near);
+        }
+        if hitbox.atomic {
+            return Some(hitbox.bounds);
         }
         let local = |offset: usize| {
             offset
@@ -469,22 +492,28 @@ impl MainPaneView {
         let revealed = if self.conflict_text_hitboxes.is_empty() {
             // Every region, not the first that matches: the split columns are
             // separate scrollables and a hit can be in both.
-            let mut revealed = false;
+            let mut painted = false;
+            let mut revealed = true;
             for region in [
                 DiffTextRegion::Inline,
                 DiffTextRegion::SplitLeft,
                 DiffTextRegion::SplitRight,
             ] {
-                revealed |= self.reveal_diff_search_match_in_region(visible_ix, region, &matcher);
+                if self.diff_text_hitboxes.contains_key(&(visible_ix, region)) {
+                    painted = true;
+                    // Evaluate every painted column even if an earlier one
+                    // needs another layout. No column may cancel its retry.
+                    revealed &=
+                        self.reveal_diff_search_match_in_region(visible_ix, region, &matcher);
+                }
             }
-            revealed
+            painted && revealed
         } else {
             self.reveal_conflict_search_match_horizontally(visible_ix, &matcher)
         };
 
-        // A frame that painted the row settles the matter either way: it either
-        // moved or it did not need to. Only a frame that has not painted it yet
-        // is worth retrying.
+        // Retry until the row is painted with usable scroll geometry in every
+        // column. A settled split column cannot cancel another column's retry.
         self.diff_search_horizontal_reveal = if revealed || attempts_left <= 1 {
             None
         } else {
@@ -529,8 +558,8 @@ impl MainPaneView {
         ranges.first().cloned()
     }
 
-    /// Reveals the match in one region, reporting whether the row was painted
-    /// there at all — which is what tells the caller to stop retrying.
+    /// Reveals the match in one region, reporting whether its painted row and
+    /// scroll geometry are ready so the caller can stop retrying that region.
     fn reveal_diff_search_match_in_region(
         &mut self,
         visible_ix: usize,
@@ -582,9 +611,20 @@ impl MainPaneView {
         let offset = handle.offset();
         // Hitbox bounds are window space with the scroll already applied.
         let to_content = |x: Pixels| row_left + x - viewport.origin.x - offset.x;
+        let match_left = to_content(local_left);
+        let match_right = to_content(local_right);
+        // A newly visible long line records its width during paint. The list
+        // uses that width in the following layout, so a hitbox can be ready
+        // while the scroll range still describes the previous, shorter rows.
+        // Retry instead of claiming a reveal clamped to that stale range.
+        if viewport.size.width <= px(0.0)
+            || match_right > viewport.size.width + handle.max_offset().x + px(1.0)
+        {
+            return false;
+        }
         let Some(target_x) = super::helpers::reveal_scroll_x(
-            to_content(local_left),
-            to_content(local_right),
+            match_left,
+            match_right,
             viewport.size.width,
             handle.max_offset().x,
             offset.x,
@@ -1138,6 +1178,9 @@ impl MainPaneView {
         window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
         // Deliberately does not claim the press: the diff row's own release
         // handler reads the claim, and this gesture starts on that same row.
         // A drag that actually moved is suppressed by
@@ -1241,6 +1284,9 @@ impl MainPaneView {
         window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
         self.diff_text_selection_owner.adopt(window, cx);
         self.diff_text_pair_match = None;
         self.diff_text_occurrences.clear();
@@ -1262,6 +1308,9 @@ impl MainPaneView {
         position: Point<Pixels>,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
         let Some(hit) = self.diff_text_hit_from_hitbox(visible_ix, region, position) else {
             return;
         };
@@ -1302,9 +1351,7 @@ impl MainPaneView {
         let autoscroll_seq = self.diff_text_autoscroll_seq;
         cx.spawn(
             async move |view: WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                cx.background_executor().timer(DRAG_AUTOSCROLL_TICK).await;
                 let mut keep_going = false;
                 let _ = view.update(cx, |this, cx| {
                     if !this.diff_text_selecting {
@@ -1665,7 +1712,11 @@ impl MainPaneView {
         side: DiffTextPairSide,
         pos: &DiffTextPos,
     ) -> Option<DiffTextPairMatch> {
-        let hit = rows::prepared_diff_syntax_pair_at_display_offset(document, line_ix, pos.offset)?;
+        let tab_width = self.display_tab_width;
+
+        let hit = rows::prepared_diff_syntax_pair_at_display_offset(
+            tab_width, document, line_ix, pos.offset,
+        )?;
 
         let spans: Vec<DiffTextPairSpan> = hit
             .open
@@ -1701,8 +1752,11 @@ impl MainPaneView {
         side: DiffTextPairSide,
         pos: &DiffTextPos,
     ) -> FxHashMap<(usize, DiffTextRegion), smallvec::SmallVec<[Range<usize>; 4]>> {
-        let ends =
-            rows::prepared_diff_syntax_occurrences_at_display_offset(document, line_ix, pos.offset);
+        let tab_width = self.display_tab_width;
+
+        let ends = rows::prepared_diff_syntax_occurrences_at_display_offset(
+            tab_width, document, line_ix, pos.offset,
+        );
         if ends.is_empty() {
             return FxHashMap::default();
         }
@@ -1944,19 +1998,13 @@ impl MainPaneView {
         visible_ix: usize,
         region: DiffTextRegion,
     ) -> SharedString {
+        let tab_width = self.display_tab_width;
+
         let fallback = SharedString::default();
         let expand_tabs = |s: &str| -> SharedString {
-            if !s.contains('\t') {
-                return SharedString::new(s);
-            }
-            let mut out = String::with_capacity(crate::view::diff_utils::diff_text_display_len(s));
-            for ch in s.chars() {
-                match ch {
-                    '\t' => out.push_str("    "),
-                    _ => out.push(ch),
-                }
-            }
-            out.into()
+            crate::view::tab_width::expand_tabs(tab_width, s)
+                .into_owned()
+                .into()
         };
 
         // When markdown rendered preview is active, rows come from the
@@ -1972,7 +2020,7 @@ impl MainPaneView {
             }
             return self
                 .worktree_preview_line_raw_text(visible_ix)
-                .map(|line| file_diff_display_text(&line))
+                .map(|line| file_diff_display_text(tab_width, &line))
                 .unwrap_or(fallback);
         }
 
@@ -2011,7 +2059,7 @@ impl MainPaneView {
                         {
                             return styled.text.clone();
                         }
-                        return file_diff_display_text(&row.text);
+                        return file_diff_display_text(tab_width, &row.text);
                     }
                     DiffViewMode::Split => {
                         if !matches!(
@@ -2035,7 +2083,9 @@ impl MainPaneView {
                             DiffTextRegion::SplitRight => row.new.as_ref(),
                             DiffTextRegion::Inline => unreachable!(),
                         };
-                        return text.map(file_diff_display_text).unwrap_or(fallback);
+                        return text
+                            .map(|text| file_diff_display_text(tab_width, text))
+                            .unwrap_or(fallback);
                     }
                 },
             }
@@ -2056,7 +2106,7 @@ impl MainPaneView {
                     {
                         return styled.text.clone();
                     }
-                    return file_diff_display_text(&row.text);
+                    return file_diff_display_text(tab_width, &row.text);
                 } else if let Some(line) = self.file_diff_inline_row(mapped_ix) {
                     let cache_epoch = self.file_diff_inline_style_cache_epoch(&line);
                     if let Some(styled) = self.diff_text_segments_cache_get(mapped_ix, cache_epoch)
@@ -2086,7 +2136,9 @@ impl MainPaneView {
             {
                 return display.clone();
             }
-            return expand_tabs(line.text.as_ref());
+            return crate::view::tab_width::expand_patch_tabs(tab_width, line.text.as_ref())
+                .into_owned()
+                .into();
         }
 
         match region {
@@ -2109,7 +2161,9 @@ impl MainPaneView {
                 DiffTextRegion::SplitRight => row.new.as_ref(),
                 DiffTextRegion::Inline => unreachable!(),
             };
-            return text.map(file_diff_display_text).unwrap_or(fallback);
+            return text
+                .map(|text| file_diff_display_text(tab_width, text))
+                .unwrap_or(fallback);
         }
 
         let Some(split_row) = self.patch_diff_split_row(mapped_ix) else {
@@ -2145,6 +2199,8 @@ impl MainPaneView {
         visible_ix: usize,
         region: DiffTextRegion,
     ) -> usize {
+        let tab_width = self.display_tab_width;
+
         let display_len = crate::view::diff_utils::diff_text_display_len;
 
         if self.diff_text_wrap_for_visible_ix(visible_ix).is_some() {
@@ -2168,7 +2224,7 @@ impl MainPaneView {
             }
             return self
                 .worktree_preview_line_raw_text(source_ix)
-                .map(|line| file_diff_display_len(&line))
+                .map(|line| file_diff_display_len(tab_width, &line))
                 .unwrap_or(0);
         }
 
@@ -2193,7 +2249,7 @@ impl MainPaneView {
                         .header_display_src_ix()
                         .and_then(|src_ix| {
                             self.collapsed_diff_hunk_header_display(src_ix)
-                                .map(|display| display_len(display.as_ref()))
+                                .map(|display| display_len(tab_width, display.as_ref()))
                         })
                         .unwrap_or(0);
                 }
@@ -2210,7 +2266,7 @@ impl MainPaneView {
                         {
                             return styled.text.len();
                         }
-                        return file_diff_display_len(&row.text);
+                        return file_diff_display_len(tab_width, &row.text);
                     }
                     DiffViewMode::Split => {
                         if !matches!(
@@ -2234,7 +2290,9 @@ impl MainPaneView {
                             DiffTextRegion::SplitRight => row.new.as_ref(),
                             DiffTextRegion::Inline => unreachable!(),
                         };
-                        return text.map(file_diff_display_len).unwrap_or(0);
+                        return text
+                            .map(|text| file_diff_display_len(tab_width, text))
+                            .unwrap_or(0);
                     }
                 },
             }
@@ -2255,14 +2313,14 @@ impl MainPaneView {
                     {
                         return styled.text.len();
                     }
-                    return file_diff_display_len(&row.text);
+                    return file_diff_display_len(tab_width, &row.text);
                 } else if let Some(line) = self.file_diff_inline_row(mapped_ix) {
                     let cache_epoch = self.file_diff_inline_style_cache_epoch(&line);
                     if let Some(styled) = self.diff_text_segments_cache_get(mapped_ix, cache_epoch)
                     {
                         return styled.text.len();
                     }
-                    return display_len(diff_content_text(&line));
+                    return display_len(tab_width, diff_content_text(&line));
                 }
                 return 0;
             }
@@ -2285,7 +2343,7 @@ impl MainPaneView {
             {
                 return display.len();
             }
-            return display_len(line.text.as_ref());
+            return crate::view::tab_width::expanded_patch_len(tab_width, line.text.as_ref());
         }
 
         match region {
@@ -2308,7 +2366,9 @@ impl MainPaneView {
                 DiffTextRegion::SplitRight => row.new.as_ref(),
                 DiffTextRegion::Inline => unreachable!(),
             };
-            return text.map(file_diff_display_len).unwrap_or(0);
+            return text
+                .map(|text| file_diff_display_len(tab_width, text))
+                .unwrap_or(0);
         }
 
         let Some(split_row) = self.patch_diff_split_row(mapped_ix) else {
@@ -2326,7 +2386,7 @@ impl MainPaneView {
                 {
                     return display.len();
                 }
-                display_len(line.text.as_ref())
+                display_len(tab_width, line.text.as_ref())
             }
             PatchSplitRow::Aligned { row, .. } => {
                 let text = match region {
@@ -2334,7 +2394,7 @@ impl MainPaneView {
                     DiffTextRegion::SplitRight => row.new.as_deref().unwrap_or(""),
                     DiffTextRegion::Inline => unreachable!(),
                 };
-                display_len(text)
+                display_len(tab_width, text)
             }
         }
     }
@@ -2398,13 +2458,15 @@ impl MainPaneView {
         range: Range<usize>,
         expanded_tabs: &mut String,
     ) {
+        let tab_width = self.display_tab_width;
+
         if range.start >= range.end {
             return;
         }
 
         if self.diff_text_wrap_for_visible_ix(visible_ix).is_some() {
             let text = self.diff_text_line_for_region(visible_ix, region);
-            append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+            append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
             return;
         }
 
@@ -2428,6 +2490,8 @@ impl MainPaneView {
         range: Range<usize>,
         expanded_tabs: &mut String,
     ) {
+        let tab_width = self.display_tab_width;
+
         if range.start >= range.end {
             return;
         }
@@ -2448,7 +2512,13 @@ impl MainPaneView {
                 return;
             }
             if let Some(raw_text) = self.worktree_preview_line_raw_text(source_visible_ix) {
-                append_file_diff_display_text_slice(out, &raw_text, range, expanded_tabs);
+                append_file_diff_display_text_slice(
+                    tab_width,
+                    out,
+                    &raw_text,
+                    range,
+                    expanded_tabs,
+                );
             }
             return;
         }
@@ -2463,6 +2533,7 @@ impl MainPaneView {
                     ) => {
                         if let Some(row) = self.file_diff_inline_render_data(row_ix) {
                             append_file_diff_display_text_slice(
+                                tab_width,
                                 out,
                                 &row.text,
                                 range,
@@ -2485,6 +2556,7 @@ impl MainPaneView {
                                 });
                         if let Some(raw_text) = raw_text {
                             append_file_diff_display_text_slice(
+                                tab_width,
                                 out,
                                 &raw_text,
                                 range,
@@ -2497,7 +2569,7 @@ impl MainPaneView {
                 }
             }
             let text = self.diff_text_full_line_for_region(source_visible_ix, region);
-            append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+            append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
             return;
         }
 
@@ -2510,7 +2582,13 @@ impl MainPaneView {
                 return;
             }
             if let Some(row) = self.file_diff_inline_render_data(mapped_ix) {
-                append_file_diff_display_text_slice(out, &row.text, range, expanded_tabs);
+                append_file_diff_display_text_slice(
+                    tab_width,
+                    out,
+                    &row.text,
+                    range,
+                    expanded_tabs,
+                );
             }
             return;
         }
@@ -2525,13 +2603,13 @@ impl MainPaneView {
                 DiffTextRegion::Inline => return,
             };
             if let Some(text) = text {
-                append_file_diff_display_text_slice(out, text, range, expanded_tabs);
+                append_file_diff_display_text_slice(tab_width, out, text, range, expanded_tabs);
             }
             return;
         }
 
         let text = self.diff_text_full_line_for_region(source_visible_ix, region);
-        append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+        append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
     }
 
     fn diff_text_string_for_region(
@@ -2738,7 +2816,7 @@ impl MainPaneView {
     fn diff_copy_source(&self) -> crate::clipboard::CopySource {
         match self
             .active_repo()
-            .and_then(|repo| repo.diff_state.diff_target.as_ref())
+            .and_then(|repo| self.bound_diff_state(repo).diff_target.as_ref())
         {
             Some(DiffTarget::Commit { .. }) => crate::clipboard::CopySource::CommitDetailsDiff,
             Some(DiffTarget::CommitRange { .. }) => crate::clipboard::CopySource::CommitRangeDiff,
@@ -2777,7 +2855,7 @@ impl MainPaneView {
         let repo_id = repo.id;
         let workdir = repo.spec.workdir.clone();
 
-        let (area, allow_apply) = match repo.diff_state.diff_target.as_ref() {
+        let (area, allow_apply) = match self.bound_diff_state(repo).diff_target.as_ref() {
             Some(DiffTarget::WorkingTree { area, .. }) => (*area, true),
             _ => (DiffArea::Unstaged, false),
         };
@@ -2996,7 +3074,8 @@ impl MainPaneView {
                 })
             });
 
-        let allow_patch_actions = allow_apply && !is_file_preview;
+        let allow_patch_actions =
+            allow_apply && !is_file_preview && !self.has_large_file_text_diff();
 
         let selection = text_selection
             .or_else(|| self.diff_selection_range.map(|(a, b)| (a.min(b), a.max(b))))
@@ -3081,10 +3160,10 @@ impl MainPaneView {
 
                 (
                     hunks_count,
-                    hunk_patch,
+                    hunk_patch.map(Into::into),
                     lines_count,
-                    lines_patch,
-                    discard_lines_patch,
+                    lines_patch.map(Into::into),
+                    discard_lines_patch.map(Into::into),
                 )
             } else {
                 (0, None, 0, None, None)
@@ -3144,8 +3223,8 @@ impl MainPaneView {
         let old_offset = handle.offset();
         let mouse = self.diff_text_last_mouse_pos;
 
-        let delta_x = autoscroll_delta_for_axis(mouse.x, bounds.left(), bounds.right());
-        let delta_y = autoscroll_delta_for_axis(mouse.y, bounds.top(), bounds.bottom());
+        let delta_x = drag_autoscroll_step(mouse.x, bounds.left(), bounds.right());
+        let delta_y = drag_autoscroll_step(mouse.y, bounds.top(), bounds.bottom());
 
         let new_x = (old_offset.x + delta_x).clamp(-max_offset.x, px(0.0));
         let new_y = (old_offset.y + delta_y).clamp(-max_offset.y, px(0.0));
@@ -3205,23 +3284,6 @@ impl MainPaneView {
                 .base_handle
                 .clone(),
         }
-    }
-}
-
-fn autoscroll_delta_for_axis(cursor: Pixels, min: Pixels, max: Pixels) -> Pixels {
-    fn speed(distance: Pixels) -> Pixels {
-        // 2–48px per tick, scaling with how far outside the container the cursor is.
-        let min_step = px(2.0);
-        let max_step = px(48.0);
-        (distance * 0.4).max(min_step).min(max_step)
-    }
-
-    if cursor < min {
-        speed(min - cursor)
-    } else if cursor > max {
-        -speed(cursor - max)
-    } else {
-        px(0.0)
     }
 }
 

@@ -129,6 +129,8 @@ impl ConflictThreeWayScrollFixture {
     }
 
     pub fn run_scroll_step(&self, start: usize, window: usize) -> u64 {
+        let tab_width = 4;
+
         if self.visible_map.is_empty() || window == 0 {
             return 0;
         }
@@ -166,6 +168,7 @@ impl ConflictThreeWayScrollFixture {
             ] {
                 if let Some(line) = lines.get(line_ix) {
                     let styled = super::diff_text::build_cached_diff_styled_text(
+                        tab_width,
                         self.theme,
                         line.as_ref(),
                         word_ranges_for_line(highlights, line_ix),
@@ -195,6 +198,8 @@ impl ConflictThreeWayScrollFixture {
     /// This exercises the post-background-parse rendering path that the real
     /// conflict resolver uses once tree-sitter documents are ready.
     pub fn run_prepared_scroll_step(&self, start: usize, window: usize) -> u64 {
+        let tab_width = 4;
+
         if self.visible_map.is_empty() || window == 0 {
             return 0;
         }
@@ -251,7 +256,7 @@ impl ConflictThreeWayScrollFixture {
                     let prepared_line =
                         super::diff_text::PreparedDiffSyntaxLine { document, line_ix };
                     let result =
-                        super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking(
+                        super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking(tab_width,
                             self.theme,
                             line.as_ref(),
                             word_ranges_for_line(highlights, line_ix),
@@ -477,6 +482,7 @@ fn build_block_local_two_way_benchmark_rows(
 }
 
 fn prewarm_two_way_split_stable_cache(
+    tab_width: usize,
     diff_rows: &[gitcomet_core::file_diff::FileDiffRow],
     diff_word_highlights_split: &TwoWayWordHighlights,
     theme: AppTheme,
@@ -505,6 +511,7 @@ fn prewarm_two_way_split_stable_cache(
                 stable_cache.insert(
                     key,
                     super::diff_text::build_cached_diff_styled_text_with_source_identity(
+                        tab_width,
                         theme,
                         text.as_ref(),
                         Some(super::diff_text::DiffTextSourceIdentity::from_str(
@@ -526,6 +533,8 @@ fn prewarm_two_way_split_stable_cache(
 
 impl ConflictTwoWaySplitScrollFixture {
     pub fn new(lines: usize, conflict_blocks: usize) -> Self {
+        let tab_width = 4;
+
         let theme = AppTheme::gitcomet_dark();
         let segments = build_synthetic_two_way_segments(lines, conflict_blocks);
         let conflict_count = conflict_block_count_for_segments(&segments);
@@ -538,6 +547,7 @@ impl ConflictTwoWaySplitScrollFixture {
         let language = diff_syntax_language_for_path("src/conflict.rs");
         let syntax_mode = DiffSyntaxMode::Auto;
         let stable_cache = prewarm_two_way_split_stable_cache(
+            tab_width,
             &diff_rows,
             &diff_word_highlights_split,
             theme,
@@ -812,6 +822,9 @@ fn stage_loaded_stage_parts_from_payload(
 ) -> (Option<Arc<[u8]>>, Option<Arc<str>>) {
     match payload {
         ConflictPayload::Text(text) => (None, Some(Arc::<str>::from(text.as_ref()))),
+        ConflictPayload::EncodedText { text, bytes } => {
+            (Some(bytes.clone()), Some(Arc::<str>::from(text.as_ref())))
+        }
         ConflictPayload::Binary(bytes) => (Some(bytes.clone()), None),
         ConflictPayload::Absent => (None, None),
     }
@@ -1053,6 +1066,8 @@ impl ConflictSearchQueryUpdateFixture {
         syntax_lang: Option<DiffSyntaxLanguage>,
         syntax_mode: DiffSyntaxMode,
     ) -> Option<ConflictSearchQueryStyledSource> {
+        let tab_width = 4;
+
         let text = text?;
         if text.is_empty() {
             return None;
@@ -1069,6 +1084,7 @@ impl ConflictSearchQueryUpdateFixture {
             stable_cache.insert(
                 key,
                 super::diff_text::build_cached_diff_styled_text_with_source_identity(
+                    tab_width,
                     theme,
                     text,
                     source_identity,
@@ -1092,6 +1108,7 @@ impl ConflictSearchQueryUpdateFixture {
                     )
                 } else {
                     super::diff_text::build_cached_diff_styled_text_with_source_identity(
+                        tab_width,
                         theme,
                         text,
                         source_identity,
@@ -3213,11 +3230,9 @@ impl ConflictResolvedOutputLiveSyntaxFixture {
     pub fn new(lines: usize, conflict_blocks: usize) -> Self {
         let mut text = String::new();
         let mut mask = Vec::new();
-        let conflict_every = if conflict_blocks == 0 {
-            usize::MAX
-        } else {
-            (lines / conflict_blocks).max(1)
-        };
+        let conflict_every = lines
+            .checked_div(conflict_blocks)
+            .map_or(usize::MAX, |every| every.max(1));
         for ix in 0..lines {
             if ix > 0 && conflict_every != usize::MAX && ix % conflict_every == 0 {
                 // An unresolved block renders as one placeholder row, which the
@@ -3235,7 +3250,7 @@ impl ConflictResolvedOutputLiveSyntaxFixture {
             ));
         }
 
-        let rope = crate::kit::rope::Rope::from_str(&text);
+        let rope = crate::kit::rope::Rope::from_text(&text);
         let mask: Arc<[Range<usize>]> = mask.into();
         let theme = AppTheme::gitcomet_dark();
         let document = super::diff_text::LiveSyntaxDocument::new(

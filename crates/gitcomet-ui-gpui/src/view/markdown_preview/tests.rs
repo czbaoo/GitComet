@@ -585,7 +585,7 @@ fn cell_texts(row: &MarkdownPreviewRow) -> Vec<&str> {
     table
         .cells
         .iter()
-        .map(|range| &row.text[range.clone()])
+        .map(|range| &row.text[range.range.clone()])
         .collect()
 }
 
@@ -606,22 +606,34 @@ fn table_rows_are_flattened() {
 }
 
 #[test]
-fn table_rows_share_column_alignments() {
+fn table_cells_resolve_column_alignments() {
     let doc = parse("| L | C | R | N |\n|:--|:-:|--:|---|\n| 1 | 2 | 3 | 4 |\n");
     let rows = table_rows(&doc);
-    let table = &rows[0].table.as_ref().expect("cells").table;
-    assert_eq!(
-        table.alignments,
-        vec![
-            MarkdownTableAlign::Left,
-            MarkdownTableAlign::Center,
-            MarkdownTableAlign::Right,
-            MarkdownTableAlign::None,
-        ]
-    );
     assert!(
-        Arc::ptr_eq(table, &rows[1].table.as_ref().expect("cells").table),
-        "every row of a table shares one description"
+        rows[0]
+            .table
+            .as_ref()
+            .expect("cells")
+            .cells
+            .iter()
+            .all(|cell| cell.align == MarkdownTextAlign::Center),
+        "headers retain their default centering"
+    );
+    assert_eq!(
+        rows[1]
+            .table
+            .as_ref()
+            .expect("cells")
+            .cells
+            .iter()
+            .map(|cell| cell.align)
+            .collect::<Vec<_>>(),
+        vec![
+            MarkdownTextAlign::Left,
+            MarkdownTextAlign::Center,
+            MarkdownTextAlign::Right,
+            MarkdownTextAlign::None,
+        ]
     );
 }
 
@@ -1370,18 +1382,33 @@ fn normalize_whitespace_collapses_runs() {
 
 #[test]
 fn unsupported_html_degrades_cleanly() {
-    let doc = parse("<div>block html</div>\n");
+    let doc = parse("<section>cell</section>\n");
     assert_eq!(doc.rows.len(), 1);
     assert_eq!(doc.rows[0].kind, MarkdownPreviewRowKind::PlainFallback);
-    assert_eq!(doc.rows[0].text.as_ref(), "<div>block html</div>");
+    assert_eq!(doc.rows[0].text.as_ref(), "<section>cell</section>");
+
+    // A `<div>` is a container the preview reads through.
+    let doc = parse("<div>block html</div>\n");
+    assert_eq!(row_texts(&doc), vec!["block html"]);
+    assert_eq!(doc.rows[0].kind, MarkdownPreviewRowKind::Paragraph);
 }
 
 #[test]
-fn inline_html_is_preserved_inside_paragraphs() {
+fn inline_formatting_html_styles_paragraph_text() {
     let doc = parse("Text with <b>html</b> inline\n");
     assert_eq!(doc.rows.len(), 1);
     assert_eq!(doc.rows[0].kind, MarkdownPreviewRowKind::Paragraph);
-    assert_eq!(doc.rows[0].text.as_ref(), "Text with <b>html</b> inline");
+    assert_eq!(doc.rows[0].text.as_ref(), "Text with html inline");
+    let bold = spans_with_style(&doc.rows[0], MarkdownInlineStyle::Bold);
+    assert_eq!(bold.len(), 1);
+    assert_eq!(&doc.rows[0].text[bold[0].byte_range.clone()], "html");
+}
+
+#[test]
+fn an_unclosed_formatting_tag_ends_with_its_paragraph() {
+    let doc = parse("Some <b>bold\n\nPlain\n");
+    assert_eq!(row_texts(&doc), vec!["Some bold", "Plain"]);
+    assert!(doc.rows[1].inline_spans.is_empty(), "{:?}", doc.rows[1]);
 }
 
 #[test]
@@ -1763,7 +1790,7 @@ fn two_tables_that_touch_stay_separate() {
     // Folding them together padded both to the widest table's columns and
     // drew them as one grid.
     let doc = parse(
-        "| a | b |\n| --- | --- |\n| c | d |\n\n| wiiiiiiiiiide | x |\n| --- | --- |\n| e | f |\n",
+        "| a | b |\n| --- | --- |\n| c | d |\n\n| wiiiiiiiiiide | x | y |\n| --- | --- | --- |\n| e | f | g |\n",
     );
 
     let tables: Vec<Range<usize>> = markdown_document_blocks(&doc)
@@ -1775,20 +1802,15 @@ fn two_tables_that_touch_stay_separate() {
         .collect();
     assert_eq!(tables.len(), 2, "rows: {:?}", row_texts(&doc));
 
-    let widths_of = |rows: &Range<usize>| {
-        doc.rows[rows.start]
-            .table
-            .as_ref()
-            .expect("cells")
-            .table
-            .column_widths
-            .clone()
-    };
-    assert_eq!(widths_of(&tables[0]), vec![1, 1]);
+    assert_eq!(cell_texts(&doc.rows[tables[0].start]), vec!["a", "b"]);
+    assert_eq!(cell_texts(&doc.rows[tables[0].end - 1]), vec!["c", "d"]);
     assert_eq!(
-        widths_of(&tables[1]),
-        vec![13, 1],
-        "each table measures its own columns, not the other's"
+        cell_texts(&doc.rows[tables[1].start]),
+        vec!["wiiiiiiiiiide", "x", "y"]
+    );
+    assert_eq!(
+        cell_texts(&doc.rows[tables[1].end - 1]),
+        vec!["e", "f", "g"]
     );
 }
 
@@ -1921,10 +1943,8 @@ fn a_picture_before_a_nested_list_stays_with_its_parent_item() {
 }
 
 #[test]
-fn a_picture_in_a_table_cell_stays_in_its_column_as_text() {
-    // A table row paints as one string whose columns are aligned by
-    // padding, so a picture recorded against the row would draw at its
-    // leading or trailing edge — out of its column.
+fn a_picture_in_a_table_cell_keeps_its_image_and_copy_text() {
+    // Alt text remains logical copy/search text; the cell paints the image.
     let doc = parse("| ![icon](i.png) | Enabled |\n| --- | --- |\n| b | c |\n");
 
     let header = doc
@@ -1942,10 +1962,12 @@ fn a_picture_in_a_table_cell_stays_in_its_column_as_text() {
         "the picture's description holds its cell: {:?}",
         header.text
     );
-    assert!(
-        doc.rows.iter().all(|row| row.inline_images.is_empty()),
-        "no picture escapes the table to render beside it"
-    );
+    assert_eq!(header.inline_images.len(), 1);
+    assert_eq!(header.inline_images[0].image.source.as_ref(), "i.png");
+    assert!(matches!(
+        header.table.as_ref().unwrap().cells[0].content[0],
+        MarkdownTableCellPart::Image { index: 0, .. }
+    ));
     assert!(
         image_rows(&doc).is_empty(),
         "and none becomes a block either"
@@ -1954,8 +1976,7 @@ fn a_picture_in_a_table_cell_stays_in_its_column_as_text() {
 
 #[test]
 fn an_html_picture_in_a_table_cell_also_stays_in_its_column() {
-    // The `<img>` producer records pictures separately from the markdown
-    // one, so it needs the same guard.
+    // HTML images in Markdown tables use the same cell image model.
     let doc = parse("| <img alt=\"icon\" src=\"i.png\" /> | Enabled |\n| --- | --- |\n| b | c |\n");
 
     let header = doc
@@ -1973,10 +1994,12 @@ fn an_html_picture_in_a_table_cell_also_stays_in_its_column() {
         "the tag's description holds its cell: {:?}",
         header.text
     );
-    assert!(
-        doc.rows.iter().all(|row| row.inline_images.is_empty()),
-        "no picture escapes the table to render beside it"
-    );
+    assert_eq!(header.inline_images.len(), 1);
+    assert_eq!(header.inline_images[0].image.source.as_ref(), "i.png");
+    assert!(matches!(
+        header.table.as_ref().unwrap().cells[0].content[0],
+        MarkdownTableCellPart::Image { index: 0, .. }
+    ));
 }
 
 #[test]
@@ -2607,6 +2630,11 @@ fn inline_spans_stay_on_char_boundaries_for_multibyte_markdown() {
         "```rust\nlet x = \"—\";\n```",
         "---",
         "<b>html — bold</b>",
+        "<p align=\"center\">\n  <a href=\"#x\">x — y</a> •\n  <b>b—</b>&nbsp;z\n</p>",
+        "<div align=\"center\">",
+        "</div>",
+        "<h1 align=\"center\"><img src=\"x.png\"><br>—title</h1>",
+        "a <em>—</em><br><code>c—</code>&amp;",
         "<details><summary>sum — **mary**</summary></details>",
         "<img alt=\"alt — text\" src=\"x.png\">",
         "text[^1] — ref\n\n[^1]: note — body",
@@ -2690,6 +2718,16 @@ fn inline_spans_stay_on_char_boundaries_for_random_markdown_soup() {
         "</summary>",
         "<details>",
         "</details>",
+        "<p align=center>",
+        "</p>",
+        "<div>",
+        "</div>",
+        "<h2>",
+        "</h2>",
+        "&nbsp;",
+        "&#x1F600;",
+        "<!--",
+        "-->",
         "[^1]",
         "[^1]: ",
         "---",
@@ -3526,4 +3564,666 @@ fn a_picture_is_one_row_that_knows_the_room_it_needs() {
         80,
         "a width alone is taken as a square"
     );
+}
+
+// ── HTML containers ─────────────────────────────────────────────────
+
+fn row_with_text<'a>(doc: &'a MarkdownPreviewDocument, text: &str) -> &'a MarkdownPreviewRow {
+    doc.rows
+        .iter()
+        .find(|row| row.text.as_ref() == text)
+        .unwrap_or_else(|| panic!("no row {text:?} in {:?}", row_texts(doc)))
+}
+
+fn assert_no_tags_shown(doc: &MarkdownPreviewDocument) {
+    assert!(
+        doc.rows.iter().all(|row| !row.text.contains('<')
+            && !matches!(row.kind, MarkdownPreviewRowKind::PlainFallback)),
+        "rows: {:?}",
+        doc.rows
+            .iter()
+            .map(|row| (row.kind, row.text.as_ref()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn p_tags_are_not_shown() {
+    let doc = parse("<p>Hello</p>\n");
+    assert_eq!(row_texts(&doc), vec!["Hello"]);
+    assert_eq!(doc.rows[0].kind, MarkdownPreviewRowKind::Paragraph);
+    assert_eq!(doc.rows[0].align, MarkdownTextAlign::None);
+}
+
+#[test]
+fn a_centred_p_over_several_lines_is_one_centred_paragraph() {
+    let doc = parse("<p align=\"center\">\n  A fast,\n  native client\n</p>\n");
+    assert_no_tags_shown(&doc);
+    assert_eq!(row_texts(&doc), vec!["A fast, native client"]);
+    assert_eq!(doc.rows[0].kind, MarkdownPreviewRowKind::Paragraph);
+    assert_eq!(doc.rows[0].align, MarkdownTextAlign::Center);
+    // The row owns the tags around it, so a diff that only touches them
+    // still marks it.
+    assert_eq!(doc.rows[0].source_line_range, 0..4);
+}
+
+#[test]
+fn a_centred_logo_is_a_centred_image_block() {
+    let doc =
+        parse("<p align=\"center\">\n  <img src=\"logo.png\" width=\"120\" alt=\"Logo\">\n</p>\n");
+    assert_eq!(doc.rows.len(), 1, "rows: {:?}", row_texts(&doc));
+    let images = image_rows(&doc);
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].align, MarkdownTextAlign::Center);
+    assert_eq!(images[0].text.as_ref(), "Logo");
+    assert_eq!(images[0].image.as_ref().expect("image").width_px, Some(120));
+}
+
+#[test]
+fn centred_badges_on_separate_lines_share_one_row() {
+    let doc = parse(
+        "<p align=\"center\">\n  <a href=\"https://a.example\"><img src=\"a.svg\" alt=\"A\"></a>&nbsp;\n  <a href=\"https://b.example\"><img src=\"b.svg\" alt=\"B\"></a>\n</p>\n",
+    );
+    assert_no_tags_shown(&doc);
+    assert_eq!(doc.rows.len(), 1, "rows: {:?}", row_texts(&doc));
+    let row = &doc.rows[0];
+    assert_eq!(row.align, MarkdownTextAlign::Center);
+    assert_eq!(row.text.as_ref(), "");
+    let links: Vec<_> = row
+        .inline_images
+        .iter()
+        .map(|inline| inline.link_url.as_ref().map(|url| url.as_ref()))
+        .collect();
+    assert_eq!(
+        links,
+        vec![Some("https://a.example"), Some("https://b.example")]
+    );
+}
+
+#[test]
+fn links_in_a_block_line_keep_the_text_after_them() {
+    let doc = parse(
+        "<p align=\"center\">\n  <a href=\"#install\">Install</a> •\n  <a href=\"#usage\">Usage</a>\n</p>\n",
+    );
+    assert_no_tags_shown(&doc);
+    assert_eq!(row_texts(&doc), vec!["Install • Usage"]);
+    let row = &doc.rows[0];
+    let links: Vec<_> = spans_with_style(row, MarkdownInlineStyle::Link)
+        .into_iter()
+        .map(|span| {
+            (
+                &row.text[span.byte_range.clone()],
+                span.link_url.as_ref().map(|url| url.as_ref()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        links,
+        vec![("Install", Some("#install")), ("Usage", Some("#usage"))]
+    );
+}
+
+#[test]
+fn html_headings_become_aligned_heading_rows() {
+    let doc = parse("<h1 align=\"center\">GitComet</h1>\n\nIntro\n");
+    assert_eq!(
+        row_kinds(&doc),
+        vec![
+            &MarkdownPreviewRowKind::Heading { level: 1 },
+            &MarkdownPreviewRowKind::Spacer,
+            &MarkdownPreviewRowKind::Paragraph,
+        ]
+    );
+    assert_eq!(doc.rows[0].text.as_ref(), "GitComet");
+    assert_eq!(doc.rows[0].align, MarkdownTextAlign::Center);
+    assert_eq!(doc.rows[2].align, MarkdownTextAlign::None);
+    assert_eq!(markdown_preview_anchor_row(&doc, "gitcomet"), Some(0));
+
+    let doc = parse("<h3 align=\"right\">\n  Sub\n</h3>\n");
+    assert_eq!(row_texts(&doc), vec!["Sub"]);
+    assert_eq!(
+        doc.rows[0].kind,
+        MarkdownPreviewRowKind::Heading { level: 3 }
+    );
+    assert_eq!(doc.rows[0].align, MarkdownTextAlign::Right);
+}
+
+#[test]
+fn a_logo_and_a_br_in_an_html_heading_stay_one_heading() {
+    let doc = parse(
+        "<h1 align=\"center\">\n  <img src=\"logo.svg\" width=\"64\" alt=\"logo\"><br>\n  GitComet\n</h1>\n",
+    );
+    assert_eq!(doc.rows.len(), 1, "rows: {:?}", row_texts(&doc));
+    let row = &doc.rows[0];
+    assert_eq!(row.kind, MarkdownPreviewRowKind::Heading { level: 1 });
+    assert_eq!(row.text.as_ref(), "GitComet");
+    assert_eq!(row.inline_images.len(), 1);
+    assert_eq!(row.align, MarkdownTextAlign::Center);
+}
+
+#[test]
+fn a_centred_div_aligns_the_markdown_inside_it() {
+    let doc = parse("<div align=\"center\">\n\n# Title\n\nSome **bold** text\n\n</div>\n\nAfter\n");
+    assert_no_tags_shown(&doc);
+    assert_eq!(
+        row_with_text(&doc, "Title").align,
+        MarkdownTextAlign::Center
+    );
+    let body = row_with_text(&doc, "Some bold text");
+    assert_eq!(body.align, MarkdownTextAlign::Center);
+    assert_eq!(spans_with_style(body, MarkdownInlineStyle::Bold).len(), 1);
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+}
+
+#[test]
+fn align_values_and_the_center_tag() {
+    let align = |source: &str| parse(source).rows[0].align;
+    assert_eq!(
+        align("<center>Middle</center>\n"),
+        MarkdownTextAlign::Center
+    );
+    assert_eq!(
+        align("<p align=\"RIGHT\">r</p>\n"),
+        MarkdownTextAlign::Right
+    );
+    assert_eq!(align("<p align=right>r</p>\n"), MarkdownTextAlign::Right);
+    assert_eq!(align("<p align='left'>l</p>\n"), MarkdownTextAlign::Left);
+    assert_eq!(
+        align("<p align=\"justify\">j</p>\n"),
+        MarkdownTextAlign::None
+    );
+
+    // The innermost explicit `align` wins, as `text-align` inherits.
+    let doc = parse("<div align=\"center\">\n\n<p align=\"left\">x</p>\n\ny\n\n</div>\n");
+    assert_eq!(row_with_text(&doc, "x").align, MarkdownTextAlign::Left);
+    assert_eq!(row_with_text(&doc, "y").align, MarkdownTextAlign::Center);
+}
+
+#[test]
+fn stray_and_unclosed_containers() {
+    let doc = parse("</p>\n\nText\n\n</div>\n");
+    assert_eq!(row_texts(&doc), vec!["Text"]);
+
+    // An unclosed `<div>` runs to the end of the document, as it does on
+    // GitHub.
+    let doc = parse("<div align=\"center\">\n\nOne\n\nTwo\n");
+    assert_eq!(row_texts(&doc), vec!["One", "Two"]);
+    assert!(
+        doc.rows
+            .iter()
+            .all(|row| row.align == MarkdownTextAlign::Center)
+    );
+}
+
+#[test]
+fn a_br_splits_a_centred_p_into_centred_rows() {
+    let doc = parse("<p align=\"center\">one<br>two</p>\n");
+    assert_eq!(row_texts(&doc), vec!["one", "two"]);
+    assert!(
+        doc.rows
+            .iter()
+            .all(|row| row.align == MarkdownTextAlign::Center)
+    );
+}
+
+#[test]
+fn a_br_after_a_logo_puts_the_text_under_it() {
+    let doc =
+        parse("<p align=\"center\">\n  <img src=\"logo.png\" alt=\"logo\"><br>\n  Name\n</p>\n");
+    assert_eq!(
+        row_kinds(&doc),
+        vec![
+            &MarkdownPreviewRowKind::Image,
+            &MarkdownPreviewRowKind::Paragraph
+        ]
+    );
+    assert_eq!(row_texts(&doc), vec!["logo", "Name"]);
+    assert!(
+        doc.rows
+            .iter()
+            .all(|row| row.align == MarkdownTextAlign::Center)
+    );
+}
+
+#[test]
+fn entities_in_block_html_text_are_decoded() {
+    let doc = parse("<p>Fish &amp; chips &lt;3 &#169; &#xA9; &bogus; x&nbsp;y</p>\n");
+    assert_eq!(
+        row_texts(&doc),
+        vec!["Fish & chips <3 © © &bogus; x\u{a0}y"]
+    );
+}
+
+#[test]
+fn tags_and_comments_split_over_lines_and_crlf() {
+    let doc =
+        parse("<p align=\"center\">\n  <img src=\"a.png\"\n       width=\"40\" alt=\"A\">\n</p>\n");
+    let images = image_rows(&doc);
+    assert_eq!(doc.rows.len(), 1, "rows: {:?}", row_texts(&doc));
+    assert_eq!(images[0].image.as_ref().expect("image").width_px, Some(40));
+    assert_eq!(images[0].align, MarkdownTextAlign::Center);
+
+    let doc = parse("<p align=\"center\">\n<!-- a\ncomment -->\nText\n</p>\n");
+    assert_eq!(row_texts(&doc), vec!["Text"]);
+
+    let doc = parse("<p align=\"center\">\r\n  A\r\n  B\r\n</p>\r\n");
+    assert_eq!(row_texts(&doc), vec!["A B"]);
+    assert_eq!(doc.rows[0].align, MarkdownTextAlign::Center);
+}
+
+#[test]
+fn an_html_container_does_not_outlive_its_list_item_or_quote() {
+    let doc = parse("- item\n  <div align=\"center\">x</div>\n- next\n\nAfter\n");
+    assert_no_tags_shown(&doc);
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+
+    let doc = parse("> <div align=\"center\">\n>\n> quoted\n\nAfter\n");
+    assert_no_tags_shown(&doc);
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+}
+
+#[test]
+fn inline_formatting_tags_become_styles() {
+    let doc = parse(
+        "<em>e</em> <code>c</code> <del>d</del> <kbd>K</kbd> <strong>s</strong> <i>i</i> <u>u</u>\n",
+    );
+    let row = &doc.rows[0];
+    assert_eq!(row.text.as_ref(), "e c d K s i u");
+    let styled: Vec<_> = row
+        .inline_spans
+        .iter()
+        .map(|span| (&row.text[span.byte_range.clone()], span.style))
+        .collect();
+    assert_eq!(
+        styled,
+        vec![
+            ("e", MarkdownInlineStyle::Italic),
+            ("c", MarkdownInlineStyle::Code),
+            ("d", MarkdownInlineStyle::Strikethrough),
+            ("K", MarkdownInlineStyle::Code),
+            ("s", MarkdownInlineStyle::Bold),
+            ("i", MarkdownInlineStyle::Italic),
+            ("u", MarkdownInlineStyle::Underline),
+        ]
+    );
+
+    // A tag the preview has no meaning for is still shown as written.
+    let doc = parse("a <custom-tag>b</custom-tag>\n");
+    assert_eq!(doc.rows[0].text.as_ref(), "a <custom-tag>b</custom-tag>");
+}
+
+#[test]
+fn formatting_tags_inside_a_centred_p_are_styled() {
+    let doc = parse("<p align=\"center\">\n  <b>Bold</b> tagline\n</p>\n");
+    assert_no_tags_shown(&doc);
+    let row = &doc.rows[0];
+    assert_eq!(row.text.as_ref(), "Bold tagline");
+    assert_eq!(
+        spans_with_style(row, MarkdownInlineStyle::Bold)
+            .iter()
+            .map(|span| &row.text[span.byte_range.clone()])
+            .collect::<Vec<_>>(),
+        vec!["Bold"]
+    );
+}
+
+#[test]
+fn a_changed_align_marks_the_row_in_a_diff() {
+    let preview =
+        build_markdown_diff_preview("<p>x</p>\n", "<p align=\"center\">x</p>\n").expect("parses");
+    let new_row = preview
+        .new
+        .rows
+        .iter()
+        .find(|row| row.text.as_ref() == "x")
+        .expect("new row");
+    assert_eq!(new_row.align, MarkdownTextAlign::Center);
+    assert_ne!(new_row.change_hint, MarkdownChangeHint::None);
+    assert!(
+        preview
+            .inline
+            .rows
+            .iter()
+            .all(|row| !row.text.contains('<'))
+    );
+}
+
+#[test]
+fn container_tags_inside_a_table_cell_or_heading_do_not_split_it() {
+    let doc = parse("| A | <p>B</p><p>C</p> |\n|---|---|\n| c | <div align=\"center\">d</div> |\n");
+    assert_eq!(
+        row_kinds(&doc),
+        vec![
+            &MarkdownPreviewRowKind::TableRow { is_header: true },
+            &MarkdownPreviewRowKind::TableRow { is_header: false },
+        ]
+    );
+    assert_eq!(row_texts(&doc), vec!["A\tB C", "c\td"]);
+
+    let doc = parse("# Title <center>x</center>\n\n## Sub <h3>y</h3>\n");
+    assert_eq!(row_texts(&doc), vec!["Title x", "Sub y"]);
+    assert_eq!(
+        row_kinds(&doc),
+        vec![
+            &MarkdownPreviewRowKind::Heading { level: 1 },
+            &MarkdownPreviewRowKind::Heading { level: 2 },
+        ]
+    );
+}
+
+#[test]
+fn a_container_closed_on_a_verbatim_line_still_closes() {
+    // An unsupported element takes the line-by-line path; its last line
+    // closes the div among other markup.
+    let doc = parse("<div align=\"center\">\n<unknown>x\n</unknown></div>\n\nIntro text\n");
+    assert_eq!(
+        row_with_text(&doc, "Intro text").align,
+        MarkdownTextAlign::None
+    );
+}
+
+#[test]
+fn an_unclosed_html_heading_ends_with_its_list_item() {
+    let doc = parse("- Item <h3>Note\n- next\n\nPlain paragraph\n");
+    assert_eq!(
+        row_with_text(&doc, "Plain paragraph").kind,
+        MarkdownPreviewRowKind::Paragraph
+    );
+}
+
+#[test]
+fn a_block_opened_inside_an_html_heading_keeps_the_heading() {
+    let doc = parse("<h1 align=\"center\">GitComet<div>tagline</div></h1>\n");
+    let heading = row_with_text(&doc, "GitComet");
+    assert_eq!(heading.kind, MarkdownPreviewRowKind::Heading { level: 1 });
+    assert_eq!(heading.align, MarkdownTextAlign::Center);
+    assert!(markdown_preview_anchor_row(&doc, "gitcomet").is_some());
+}
+
+#[test]
+fn markdown_and_html_formatting_close_their_own_style() {
+    let doc = parse("**bold <i>it** rest</i> tail\n");
+    let row = &doc.rows[0];
+    assert_eq!(row.text.as_ref(), "bold it rest tail");
+    let style_of = |word: &str| {
+        let at = row.text.find(word).expect("word");
+        row.inline_spans
+            .iter()
+            .find(|span| span.byte_range.contains(&at))
+            .map(|span| span.style)
+    };
+    assert_eq!(style_of("bold"), Some(MarkdownInlineStyle::Bold));
+    assert_eq!(style_of("rest"), Some(MarkdownInlineStyle::Italic));
+    assert_eq!(style_of("tail"), None);
+}
+
+#[test]
+fn wide_space_entities_keep_their_width() {
+    assert_eq!(
+        decode_html_entities("a&ensp;b&emsp;c&thinsp;d"),
+        "a\u{2002}b\u{2003}c\u{2009}d"
+    );
+}
+
+#[test]
+fn an_align_only_edit_marks_the_rows_it_moves() {
+    let preview = build_markdown_diff_preview(
+        "<div align=\"center\">\n\nBody\n\n</div>\n",
+        "<div>\n\nBody\n\n</div>\n",
+    )
+    .expect("parses");
+    for side in [&preview.old, &preview.new] {
+        assert_ne!(
+            row_with_text(side, "Body").change_hint,
+            MarkdownChangeHint::None,
+            "rows: {:?}",
+            side.rows
+        );
+    }
+    let inline: Vec<_> = preview
+        .inline
+        .rows
+        .iter()
+        .filter(|row| row.text.as_ref() == "Body")
+        .collect();
+    assert!(
+        inline
+            .iter()
+            .all(|row| row.change_hint != MarkdownChangeHint::None),
+        "both versions are drawn, so both are marked: {inline:?}"
+    );
+}
+
+// ── HTML containers: second review ──────────────────────────────────
+
+#[test]
+fn container_tags_in_comments_scripts_and_attributes_do_not_count() {
+    let doc = parse("<table>\n<!--\n<div align=\"center\">\n-->\n</table>\n\nAfter\n");
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+
+    let doc = parse("<script>\nvar s = \"<div align='center'>\";\n</script>\n\nAfter\n");
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+
+    let doc = parse(
+        "<div align=\"center\">\n\n<table><tr><td><img src=\"x.png\" alt=\"</div>\"></td></tr></table>\n\nStill centred\n\n</div>\n",
+    );
+    assert_eq!(
+        row_with_text(&doc, "Still centred").align,
+        MarkdownTextAlign::Center
+    );
+}
+
+#[test]
+fn a_container_wrapping_a_verbatim_line_still_aligns_it() {
+    let doc = parse(
+        "<p align=\"center\"><img src=\"logo.png\" width=\"120\"></p>\n<table><tr><td>x</td></tr></table>\n",
+    );
+    let images = image_rows(&doc);
+    assert_eq!(images.len(), 1, "rows: {:?}", row_texts(&doc));
+    assert_eq!(images[0].align, MarkdownTextAlign::Center);
+}
+
+#[test]
+fn an_inline_html_heading_left_open_in_a_list_item_stays_in_it() {
+    let doc = parse("- a <h2>T\n  > quote\n");
+    assert_eq!(
+        row_with_text(&doc, "T").kind,
+        MarkdownPreviewRowKind::Heading { level: 2 }
+    );
+    assert_eq!(
+        row_with_text(&doc, "quote").kind,
+        MarkdownPreviewRowKind::BlockquoteLine
+    );
+
+    let doc = parse("- a <h2>T\n  - one\n\n  - two\n");
+    assert!(matches!(
+        row_with_text(&doc, "one").kind,
+        MarkdownPreviewRowKind::ListItem { .. }
+    ));
+
+    let doc = parse("- Item <h3>Note\n- next\n");
+    assert_eq!(
+        row_with_text(&doc, "Note").kind,
+        MarkdownPreviewRowKind::Heading { level: 3 }
+    );
+}
+
+#[test]
+fn hr_and_summary_do_not_send_a_block_back_to_raw_tags() {
+    let doc = parse(
+        "<p align=\"center\">\n<img src=\"a.png\">\n</p>\n<h1 align=\"center\">Project</h1>\n<hr>\n",
+    );
+    assert_no_tags_shown(&doc);
+    assert_eq!(
+        row_with_text(&doc, "Project").align,
+        MarkdownTextAlign::Center
+    );
+    assert!(
+        doc.rows
+            .iter()
+            .any(|row| row.kind == MarkdownPreviewRowKind::ThematicBreak),
+        "rows: {:?}",
+        row_texts(&doc)
+    );
+
+    let doc = parse("<details>\n<summary>Sum</summary>\n<p align=\"center\">x</p>\n</details>\n");
+    assert_no_tags_shown(&doc);
+    assert_eq!(
+        row_with_text(&doc, "Sum").kind,
+        MarkdownPreviewRowKind::DetailsSummary
+    );
+    assert_eq!(row_with_text(&doc, "x").align, MarkdownTextAlign::Center);
+}
+
+#[test]
+fn a_link_written_as_its_own_html_block_links_what_it_wraps() {
+    let doc = parse(
+        "<a href=\"https://example.com\">\n\n![Logo](logo.png)\n\nRead the **docs**\n\n</a>\n\nAfter\n",
+    );
+    let logo = image_rows(&doc)[0];
+    assert_eq!(
+        logo.inline_spans
+            .iter()
+            .find_map(|span| span.link_url.as_ref())
+            .map(|url| url.as_ref()),
+        Some("https://example.com")
+    );
+    let docs = row_with_text(&doc, "Read the docs");
+    assert!(
+        docs.inline_spans
+            .iter()
+            .any(|span| span.link_url.as_deref() == Some("https://example.com")),
+        "{docs:?}"
+    );
+    assert!(row_with_text(&doc, "After").inline_spans.is_empty());
+}
+
+#[test]
+fn a_heading_gap_moving_past_an_aligned_heading_does_not_mark_it() {
+    let preview = build_markdown_diff_preview(
+        "<h1 align=\"center\">GitComet</h1>\n\nIntro\n",
+        "<p align=\"center\"><img src=\"logo.png\"></p>\n\n<h1 align=\"center\">GitComet</h1>\n\nIntro\n",
+    )
+    .expect("parses");
+    assert_eq!(
+        row_with_text(&preview.new, "GitComet").change_hint,
+        MarkdownChangeHint::None
+    );
+    assert_eq!(
+        preview
+            .inline
+            .rows
+            .iter()
+            .filter(|row| row.text.as_ref() == "GitComet")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn adding_a_br_line_inside_block_html_marks_the_rows_it_splits() {
+    let old = "<p align=\"center\">\n  <a href=\"https://a\"><img src=\"a.png\" alt=\"A\"></a>\n  <a href=\"https://b\"><img src=\"b.png\" alt=\"B\"></a>\n</p>\n";
+    let new = "<p align=\"center\">\n  <a href=\"https://a\"><img src=\"a.png\" alt=\"A\"></a>\n  <br>\n  <a href=\"https://b\"><img src=\"b.png\" alt=\"B\"></a>\n</p>\n";
+    let preview = build_markdown_diff_preview(old, new).expect("parses");
+    assert!(
+        preview
+            .new
+            .rows
+            .iter()
+            .any(|row| row.change_hint != MarkdownChangeHint::None),
+        "rows: {:?}",
+        preview.new.rows
+    );
+}
+
+#[test]
+fn a_p_or_heading_closes_the_one_left_open_before_it() {
+    let doc = parse("<p align=\"center\">A\n<p>B\n");
+    assert_eq!(row_with_text(&doc, "B").align, MarkdownTextAlign::None);
+
+    let doc = parse("<h1 align=\"center\">A<h2>B</h2>\n");
+    let b = row_with_text(&doc, "B");
+    assert_eq!(b.kind, MarkdownPreviewRowKind::Heading { level: 2 });
+    assert_eq!(b.align, MarkdownTextAlign::None);
+}
+
+#[test]
+fn a_p_stays_open_across_raw_html_blocks() {
+    let doc = parse(
+        "<p align=\"center\">\n  <img src=\"a.png\" width=\"300\">\n\n  <img src=\"b.png\" width=\"300\">\n</p>\n\nAfter\n",
+    );
+    let images = image_rows(&doc);
+    assert_eq!(images.len(), 2, "rows: {:?}", row_texts(&doc));
+    assert!(
+        images
+            .iter()
+            .all(|row| row.align == MarkdownTextAlign::Center)
+    );
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+}
+
+#[test]
+fn non_breaking_and_wide_spaces_survive_in_paragraphs() {
+    let doc = parse("<p>a&emsp;b&nbsp;&nbsp;c</p>\n");
+    assert_eq!(row_texts(&doc), vec!["a\u{2003}b\u{a0}\u{a0}c"]);
+
+    let doc = parse("10&nbsp;MB  free\n");
+    assert_eq!(row_texts(&doc), vec!["10\u{a0}MB free"]);
+}
+
+#[test]
+fn an_abruptly_closed_empty_comment_ends_at_once() {
+    let doc = parse(
+        "<div align=\"center\">\n<!-->\n<img src=\"logo.png\" alt=\"logo\">\n<h1>Title</h1>\n</div>\n\nAfter\n",
+    );
+    assert_eq!(image_rows(&doc).len(), 1, "rows: {:?}", row_texts(&doc));
+    assert_eq!(
+        row_with_text(&doc, "Title").kind,
+        MarkdownPreviewRowKind::Heading { level: 1 }
+    );
+    assert_eq!(row_with_text(&doc, "After").align, MarkdownTextAlign::None);
+    assert_eq!(parse("<p>a<!--->b</p>\n").rows[0].text.as_ref(), "ab");
+}
+
+#[test]
+fn numeric_character_references_follow_html() {
+    assert_eq!(decode_html_entities("&#+65;"), "&#+65;");
+    assert_eq!(decode_html_entities("&#146;"), "\u{2019}");
+    assert_eq!(decode_html_entities("&#x80;"), "\u{20ac}");
+}
+
+#[test]
+fn a_stray_html_close_tag_does_not_end_markdown_formatting() {
+    let doc = parse("**a</b> b**\n");
+    let row = &doc.rows[0];
+    assert_eq!(row.text.as_ref(), "a b");
+    let bold: usize = spans_with_style(row, MarkdownInlineStyle::Bold)
+        .iter()
+        .map(|span| span.byte_range.len())
+        .sum();
+    assert_eq!(bold, "a b".len(), "{:?}", row.inline_spans);
+}
+
+#[test]
+fn summary_label_formatting_closes_its_own_style() {
+    let (text, spans) = parse_inline_markdown_fragment("**a <i>b** c</i> d");
+    assert_eq!(text, "a b c d");
+    let style_of = |word: &str| {
+        let at = text.find(word).expect("word");
+        spans
+            .iter()
+            .find(|span| span.byte_range.contains(&at))
+            .map(|span| span.style)
+    };
+    assert_eq!(style_of("c"), Some(MarkdownInlineStyle::Italic));
+    assert_eq!(style_of("d"), None);
+}
+
+#[test]
+fn rows_split_by_html_leave_no_edge_spaces() {
+    let doc = parse("<h1 align=\"center\">Title<br></h1>\n");
+    assert_eq!(row_texts(&doc), vec!["Title"]);
+
+    let doc = parse("Some text <p>x</p> more\n");
+    assert_eq!(row_texts(&doc), vec!["Some text", "x", "more"]);
 }

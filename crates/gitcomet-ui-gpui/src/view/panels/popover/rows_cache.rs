@@ -217,6 +217,15 @@ impl<T> Default for RowsCache<T> {
 }
 
 impl<T> RowsCache<T> {
+    /// Observe completed filtering without doing the work being measured.
+    pub(super) fn filtered_len_for_query(&self, query: &str) -> Option<usize> {
+        self.slot
+            .borrow()
+            .as_ref()
+            .filter(|(key, _)| key.query == query)
+            .map(|(_, rows)| rows.filtered_len())
+    }
+
     /// Drops the cached rows. Called when a picker opens so a stale list cannot
     /// flash before the first rebuild.
     pub(super) fn clear(&self) {
@@ -257,6 +266,7 @@ where
             rows.marked_index,
         )
     } else {
+        gitcomet_core::history_perf::record(gitcomet_core::history_perf::Work::PickerModelBuild);
         let (items, payloads, marked_index) = build(SystemTime::now());
         (Rc::from(items), Rc::from(payloads), marked_index)
     };
@@ -304,10 +314,10 @@ mod tests {
         });
     }
 
-    fn workspace_key(repo: &RepoState, query: &str) -> RowsCacheKey {
+    fn worktree_badge_key(repo: &RepoState, query: &str) -> RowsCacheKey {
         RowsCacheKey::new(
             RowsCacheOwner::Workspace,
-            workspace_picker::rows_signature(repo),
+            worktree_badge_picker::rows_signature(repo),
             query,
         )
     }
@@ -318,10 +328,18 @@ mod tests {
         let cache = RowsCache::default();
         let builds = std::cell::Cell::new(0);
 
-        build_once(&cache, workspace_key(&repo, ""), &builds);
-        build_once(&cache, workspace_key(&repo, ""), &builds);
+        build_once(&cache, worktree_badge_key(&repo, ""), &builds);
+        build_once(&cache, worktree_badge_key(&repo, ""), &builds);
 
         assert_eq!(builds.get(), 1, "the second frame must reuse the rows");
+        assert_eq!(cache.filtered_len_for_query(""), Some(1));
+        assert_eq!(
+            cache.filtered_len_for_query("main"),
+            None,
+            "a witness must not filter a new query"
+        );
+        cache.clear();
+        assert_eq!(cache.filtered_len_for_query(""), None);
     }
 
     /// An input missing from a signature shows stale rows with no visible error,
@@ -358,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_signature_tracks_worktrees_head_and_the_active_workdir() {
+    fn the_worktree_signature_tracks_worktrees_head_and_the_active_workdir() {
         let checks: Vec<RevisionBump> = vec![
             ("worktrees_rev", |repo| {
                 repo.worktrees_rev = repo.worktrees_rev.wrapping_add(1)
@@ -374,11 +392,11 @@ mod tests {
 
         for (label, bump) in checks {
             let mut repo = repo();
-            let before = workspace_picker::rows_signature(&repo);
+            let before = worktree_badge_picker::rows_signature(&repo);
             bump(&mut repo);
             assert_ne!(
                 before,
-                workspace_picker::rows_signature(&repo),
+                worktree_badge_picker::rows_signature(&repo),
                 "{label} must invalidate the workspace rows"
             );
         }
@@ -390,8 +408,8 @@ mod tests {
         let cache = RowsCache::default();
         let builds = std::cell::Cell::new(0);
 
-        build_once(&cache, workspace_key(&repo, ""), &builds);
-        build_once(&cache, workspace_key(&repo, "fea"), &builds);
+        build_once(&cache, worktree_badge_key(&repo, ""), &builds);
+        build_once(&cache, worktree_badge_key(&repo, "fea"), &builds);
 
         assert_eq!(builds.get(), 1);
     }

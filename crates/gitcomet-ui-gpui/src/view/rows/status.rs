@@ -136,6 +136,32 @@ fn apply_status_multi_selection_to_slice(
     set_status_multi_selection_single(selection, clicked_path, clicked_index, order_rev);
 }
 
+/// A commit or comparison file list click, by the status lists' rules on a
+/// single lane.
+pub(in crate::view) fn apply_file_list_selection_click(
+    selection: &mut FileListMultiSelection,
+    clicked_path: std::path::PathBuf,
+    clicked_index: Option<usize>,
+    modifiers: gpui::Modifiers,
+    order_rev: Option<u64>,
+    entries: Option<&[std::path::PathBuf]>,
+) {
+    apply_status_multi_selection_to_slice(
+        StatusMultiSelectionSlice {
+            selected: &mut selection.paths,
+            anchor: &mut selection.anchor,
+            anchor_index: &mut selection.anchor_index,
+            anchor_order_rev: &mut selection.anchor_order_rev,
+        },
+        clicked_path,
+        clicked_index,
+        modifiers,
+        order_rev,
+        true,
+        entries,
+    );
+}
+
 fn status_selection_entry_index_hint(
     entries: &[std::path::PathBuf],
     target: &std::path::Path,
@@ -417,6 +443,13 @@ fn render_status_rows_for_section(
         .is_some_and(|selection| selection.explicit_section.is_some())
         || !selected_paths.is_empty();
     let submodule_statuses = submodule_status_lookup(repo);
+    // Build once for the visible batch, instead of scanning all locks per row.
+    let locked_paths: FxHashSet<&std::path::Path> = repo
+        .lfs_locks
+        .ready()
+        .into_iter()
+        .flat_map(|locks| locks.iter().map(|lock| lock.path.as_path()))
+        .collect();
     let theme = this.theme;
     let ui_scale = this.ui_scale();
     let visible_signature = this.status_visible_signature(repo, section, &range, entries.len());
@@ -465,6 +498,13 @@ fn render_status_rows_for_section(
                         group.clone(),
                         cx,
                     );
+                    let list = crate::view::rows::FileListId::Status(section);
+                    let menu_invoker =
+                        crate::view::rows::file_list_folder_menu_invoker(repo_id.0, list, &key);
+                    let menu_open =
+                        this.active_context_menu_invoker.as_ref() == Some(&menu_invoker);
+                    let menu_key = Arc::clone(&key);
+                    let menu_chain = Arc::clone(&chain);
                     return Some(
                         crate::view::rows::directory_row(crate::view::rows::DirectoryRowProps {
                             theme,
@@ -479,6 +519,7 @@ fn render_status_rows_for_section(
                                 .row_height(STATUS_ROW_HEIGHT_PX, 32.0),
                             row_group: Some(group),
                             detail,
+                            menu_open,
                         })
                         .debug_selector(move || {
                             format!("status_dir_{}_{}_{}", repo_id.0, section.id_label(), ix)
@@ -501,10 +542,62 @@ fn render_status_rows_for_section(
                                 );
                             }),
                         )
+                        .on_pointer_click(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_popover_at(
+                                    PopoverKind::FileListFolderMenu {
+                                        repo_id,
+                                        list,
+                                        key: Arc::clone(&menu_key),
+                                        chain: Arc::clone(&menu_chain),
+                                        collapsed,
+                                        apply_source: None,
+                                    }
+                                    .invoked_by(menu_invoker.clone()),
+                                    e.position,
+                                    window,
+                                    cx,
+                                );
+                                cx.notify();
+                            }),
+                        )
                         .into_any_element(),
                     );
                 }
                 crate::view::rows::FileListRow::File { ordinal, depth } => (ordinal, depth),
+                crate::view::rows::FileListRow::Group {
+                    group,
+                    label,
+                    count,
+                    collapsed,
+                } => {
+                    let pane = cx.weak_entity();
+                    let list = crate::view::rows::FileListId::Status(section);
+                    let ui_scale = crate::ui_scale::UiScale::current(cx);
+                    return Some(crate::view::rows::group_header_row(
+                        crate::view::rows::GroupHeaderProps {
+                            id: ("status_group", group),
+                            selector: format!(
+                                "status_group_{}_{}_{label}",
+                                repo_id.0,
+                                section.id_label()
+                            ),
+                            label,
+                            count,
+                            collapsed,
+                        },
+                        theme,
+                        ui_scale,
+                        ui_scale.row_height(STATUS_ROW_HEIGHT_PX, 32.0),
+                        move |cx| {
+                            let _ = pane.update(cx, |pane, cx| {
+                                pane.toggle_file_list_group(repo_id, list, group, cx)
+                            });
+                        },
+                    ));
+                }
             };
             let entry = entries.get(ordinal.0)?;
             let path_display = if is_tree {
@@ -522,7 +615,7 @@ fn render_status_rows_for_section(
                 selected_paths.contains(entry.path.as_path())
             } else {
                 selected.is_some_and(|t| match t {
-                    DiffTarget::WorkingTree { path, area } => {
+                    DiffTarget::WorkingTree { path, area, .. } => {
                         *area == section.diff_area() && path == &entry.path
                     }
                     _ => false,
@@ -546,6 +639,10 @@ fn render_status_rows_for_section(
                     is_submodule,
                     submodule_status,
                     line_stats: line_stats.and_then(|stats| stats.get(&entry.path)).copied(),
+                    large_file: repo
+                        .large_file_state(section.diff_area(), &entry.path)
+                        .cloned(),
+                    locked: locked_paths.contains(entry.path.as_path()),
                 },
                 entry,
                 path_display,
@@ -614,6 +711,10 @@ struct StatusRowCtx {
     submodule_status: Option<SubmoduleStatus>,
     /// `None` for untracked, binary, or before the counts have loaded.
     line_stats: Option<gitcomet_core::domain::LineStats>,
+    /// Set when Git LFS or git-annex manages the path.
+    large_file: Option<gitcomet_core::large_files::LargeFileState>,
+    /// An LFS lock is held on the path.
+    locked: bool,
 }
 
 /// Stage/Unstage a whole folder, revealed at the row's right edge on hover.
@@ -708,6 +809,8 @@ fn status_row(
         is_submodule,
         submodule_status,
         line_stats,
+        large_file,
+        locked,
     } = ctx;
     let ix = row_ix;
     let scaled_px = crate::ui_scale::scaler(ui_scale);
@@ -756,7 +859,7 @@ fn status_row(
     let stage_tooltip: SharedString = match stage_label {
         "Stage" => "Stage file".into(),
         "Unstage" => "Unstage file".into(),
-        "Resolve…" => "Resolve… file".into(),
+        "Resolve…" => "Resolve conflict".into(),
         _ => format!("{stage_label} file").into(),
     };
     // The invoker string is only needed when a menu is open (to mark its row)
@@ -776,7 +879,7 @@ fn status_row(
 
             if is_conflicted {
                 this.open_popover_at(
-                    (PopoverKind::StatusFileMenu {
+                    (PopoverKind::StatusConflictMenu {
                         repo_id,
                         area,
                         path: (*path_for_stage).clone(),
@@ -919,6 +1022,12 @@ fn status_row(
                     .render(cx),
                 ),
         )
+        .when_some(large_file, |row, state| {
+            row.child(
+                components::large_file_chip(theme, ui_scale, &state, locked)
+                    .debug_selector(move || format!("status_row_large_file_{ix}")),
+            )
+        })
         .when(show_line_stats, |row| {
             row.child(div().flex_none().child(components::diff_stat_optional(
                 theme,
@@ -955,10 +1064,7 @@ fn status_row(
                 let modifiers = _e.modifiers();
                 this.focus_status_section(section, window, cx);
                 let modifies_selection = modifiers.shift || modifiers.control || modifiers.platform;
-                let target = DiffTarget::WorkingTree {
-                    path: (*path_for_row).clone(),
-                    area,
-                };
+                let target = DiffTarget::working_tree((*path_for_row).clone(), area);
                 let should_unselect = _e.standard_click()
                     && this.status_selected_paths_for_area(repo_id, area)
                         == std::slice::from_ref(path_for_row.as_ref())
@@ -1108,20 +1214,8 @@ mod tests {
         ];
         let all: Vec<usize> = (0..entries.len()).collect();
         let mut stats = rustc_hash::FxHashMap::default();
-        stats.insert(
-            pb("small.rs"),
-            LineStats {
-                additions: Some(1),
-                deletions: Some(1),
-            },
-        );
-        stats.insert(
-            pb("big.rs"),
-            LineStats {
-                additions: Some(90),
-                deletions: Some(10),
-            },
-        );
+        stats.insert(pb("small.rs"), LineStats::from((Some(1), Some(1))));
+        stats.insert(pb("big.rs"), LineStats::from((Some(90), Some(10))));
         // `unknown.rs` is absent on purpose — a binary file, say.
 
         let largest = crate::view::rows::status_section_sorted_indexes(
@@ -1142,6 +1236,41 @@ mod tests {
             smallest.as_ref(),
             &[0, 1, 2],
             "unknowns stay last in both directions"
+        );
+    }
+
+    /// A section's lane carries the edits; files sharing one sit together.
+    #[test]
+    fn edits_sort_groups_a_sections_repeated_edits() {
+        use crate::view::rows::tests::edit;
+        use gitcomet_core::domain::LineStats;
+
+        let entries = vec![
+            file_status("c.rs", FileStatusKind::Modified),
+            file_status("b.rs", FileStatusKind::Modified),
+            file_status("a.rs", FileStatusKind::Modified),
+            file_status("d.rs", FileStatusKind::Modified),
+        ];
+        let all: Vec<usize> = (0..entries.len()).collect();
+        let stats: rustc_hash::FxHashMap<_, _> = [("a.rs", "x"), ("b.rs", "y"), ("d.rs", "y")]
+            .into_iter()
+            .map(|(path, text)| {
+                let mut stats = LineStats::from((Some(1), Some(0)));
+                stats.edit = edit(text);
+                (pb(path), stats)
+            })
+            .collect();
+
+        let ordered = crate::view::rows::status_section_sorted_indexes(
+            &entries,
+            &all,
+            crate::view::rows::CommitFileSort::Edits,
+            Some(&stats),
+        );
+        assert_eq!(
+            ordered.as_ref(),
+            &[1, 3, 2, 0],
+            "b+d, then a, then c (unknown)"
         );
     }
 

@@ -3,11 +3,12 @@
 This file documents the keyboard shortcuts currently wired in the GPUI application.
 
 Source of truth:
-- `crates/gitcomet-ui-gpui/src/app.rs`
-- `crates/gitcomet-ui-gpui/src/focused_diff.rs`
+- `crates/gitcomet-ui-gpui/src/app/bindings.rs`
+- `crates/gitcomet-ui-gpui/src/view/gitcomet_view_render.rs`
 - `crates/gitcomet-ui-gpui/src/view/terminal_panel.rs`
 - `crates/gitcomet-ui-gpui/src/view/panels/main/diff_view.rs`
-- `crates/gitcomet-ui-gpui/src/view/conflict_resolver.rs`
+- `crates/gitcomet-ui-gpui/src/view/panes/history/find.rs`
+- `crates/gitcomet-ui-gpui/src/view/panes/main/conflict_actions/`
 
 Notes:
 - `Cmd` and `Option` are the macOS names. `Ctrl` and `Alt` are the Windows/Linux equivalents.
@@ -23,6 +24,7 @@ These shortcuts apply in the normal GitComet window.
 | Open a new window | `Cmd-N`, `Cmd-Shift-N` | `Ctrl-N`, `Ctrl-Shift-N` | |
 | Open Settings | `Cmd-,` | `Ctrl-,` | |
 | Open a repository | `Cmd-O` | `Ctrl-O` | |
+| Open a workspace | `Cmd-Shift-R` | `Ctrl-Shift-R` | Lists saved workspaces. In an empty window the chosen workspace opens there; otherwise its own window is focused or opened. Also in the command palette and the app menu. |
 | Go to a commit | `Cmd-G` | `Ctrl-G` | Opens the Go to dialog. Accepts a full or short SHA (4+ characters, unique), a branch, a tag, or any revision such as `HEAD~3`; matches are exact. In an embedded terminal the shell keeps `Ctrl-G`. |
 | Toggle open and recently closed repositories | `Ctrl-Shift-A`, `Cmd-Shift-O`, `Option-Cmd-O` | `Ctrl-Shift-A`, `Ctrl-Shift-O` | In an embedded terminal on Windows/Linux, `Ctrl-Shift-A` keeps its terminal “Select All” behavior. |
 | Open active repository in external code editor | `Cmd-Shift-E` | `Ctrl-Shift-E` | Only active when an external code editor is configured. |
@@ -41,6 +43,10 @@ macOS-only window-management shortcuts:
 - `Option-Cmd-H`: Hide other applications.
 
 ## Text input shortcuts
+
+File operation shortcuts are scoped to the Files explorer. See
+[File management and Documents](file-management.md#explorer) for selection,
+clipboard, rename, and filesystem Undo/Redo bindings.
 
 These shortcuts apply when a GitComet text input has focus.
 
@@ -86,6 +92,18 @@ Compatibility note:
 | Action | macOS | Windows / Linux | Notes |
 | --- | --- | --- | --- |
 | Commit staged changes | `Cmd-Enter` | `Ctrl-Enter` | Commit message input only, and only when the Commit action is enabled. |
+
+## History view shortcuts
+
+These shortcuts apply while the commit history list is showing.
+
+| Action | macOS | Windows / Linux | Notes |
+| --- | --- | --- | --- |
+| Find a commit | `Cmd-F` | `Ctrl-F` | Opens the find bar over the history. Matches the commit summary or the author (each on its own), or the start of the SHA (4+ hex characters), across the whole history, not only the loaded rows. Typing selects the first match. With the bar already open, refocuses it with the query selected. |
+| Find options | `Aa`, `W`, `.*` buttons | `Aa`, `W`, `.*` buttons | Match Case, Whole Word and Regex toggles, as in diff search; toggling one searches again and selects the first match. Without Match Case, plain text ignores ASCII letter case only (`É` and `é` differ), while a regex ignores Unicode case. The SHA prefix always ignores case and Whole Word, and applies only while Regex is off. An invalid regex reads "Invalid regex" and searches nothing. |
+| Next match | `Enter`, `F3` | `Enter`, `F3` | Selects the next match below the selected commit, wrapping to the top. `Enter` only from the find bar; `F3` also from the list. Also the ↓ button. |
+| Previous match | `Shift-Enter`, `F2` | `Shift-Enter`, `F2` | Selects the previous match above the selected commit, wrapping to the bottom. `Shift-Enter` only from the find bar; `F2` also from the list. Also the ↑ button. |
+| Close the find bar | `Escape` | `Escape` | Also the × button. Focus returns to the history list. |
 
 ## Picker shortcuts
 

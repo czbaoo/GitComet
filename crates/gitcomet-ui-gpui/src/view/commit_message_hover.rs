@@ -110,6 +110,13 @@ pub(in crate::view) struct CommitMessageHoverHost {
 }
 
 impl CommitMessageHoverHost {
+    /// Read-only completion witness for the opt-in live application driver.
+    pub(in crate::view) fn scenario_contains_source(&self, position: Point<Pixels>) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.source_bounds.contains(&position))
+    }
+
     pub(in crate::view) fn new(
         theme: AppTheme,
         store: Arc<AppStore>,
@@ -416,7 +423,8 @@ impl Render for CommitMessageHoverHost {
         // unwrap and no panic path through `render`.
         let body = self.body.get_or_insert_with(|| {
             let message = hover_card_message(&state, loaded.as_ref());
-            let highlights = commit_message_highlights(message.as_ref(), theme);
+            let highlights =
+                commit_message_highlights(message.as_ref(), theme, state.commit_id.as_ref().len());
             CommitMessageHoverBody {
                 commit_id: state.commit_id.clone(),
                 loaded: loaded.is_some(),

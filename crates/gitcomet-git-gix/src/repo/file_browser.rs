@@ -49,8 +49,13 @@ impl GixRepo {
         commit_id: &CommitId,
     ) -> Result<Vec<FileEntry>> {
         let repo = self.repo();
-        let oid = gix::ObjectId::from_hex(commit_id.0.as_bytes())
-            .map_err(|e| Error::new(ErrorKind::Backend(format!("invalid commit id: {e}"))))?;
+        let oid =
+            super::object_id_from_commit_id(commit_id, repo.object_hash()).ok_or_else(|| {
+                Error::new(ErrorKind::Backend(format!(
+                    "invalid commit id for this repository: {}",
+                    commit_id.as_ref()
+                )))
+            })?;
         let commit = repo
             .find_commit(oid)
             .map_err(|e| Error::new(ErrorKind::Backend(format!("gix find_commit: {e}"))))?;
@@ -86,6 +91,14 @@ impl gix::dir::walk::Delegate for CollectWorktreePaths {
             Some(Kind::Untrackable) | None => return gix::dir::walk::Action::Continue(()),
         };
 
+        // Staging areas the filesystem service may leave in a worktree.
+        if entry
+            .rela_path
+            .split(|byte| *byte == b'/')
+            .any(gitcomet_core::path_utils::is_service_owned_name)
+        {
+            return gix::dir::walk::Action::Continue(());
+        }
         let path = entry.rela_path.to_string();
         if !path.is_empty() {
             self.paths.push((path, is_directory));
@@ -150,6 +163,7 @@ fn flatten_worktree_dir(
             path: Arc::clone(&child_path),
             kind: FileEntryKind::Directory,
             depth,
+            ignored: false,
         });
         flatten_worktree_dir(
             child,
@@ -165,6 +179,7 @@ fn flatten_worktree_dir(
             path: Arc::new(PathBuf::from(join(name))),
             kind: FileEntryKind::File,
             depth,
+            ignored: false,
         });
     }
 }
@@ -228,6 +243,7 @@ fn collect_tree_entries(
                 path: Arc::clone(&child_path),
                 kind: FileEntryKind::Directory,
                 depth,
+                ignored: false,
             });
 
             let child_object = repo
@@ -249,6 +265,7 @@ fn collect_tree_entries(
                 path: Arc::new(PathBuf::from(path)),
                 kind: FileEntryKind::File,
                 depth,
+                ignored: false,
             });
         }
     }
@@ -335,6 +352,24 @@ mod tests {
         assert_eq!(entries[1].name, "main.rs");
         assert_eq!(entries[1].kind, FileEntryKind::File);
         assert_eq!(entries[1].depth, 0);
+    }
+
+    #[test]
+    fn list_worktree_files_hides_service_owned_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+        commit_file(workdir, "src/main.rs", "fn main() {}", "first");
+        write_file(workdir, "src/.gitcomet-operation-abc/item", "parked");
+        write_file(workdir, ".gitcomet-operation-def/recovery.log", "move");
+        write_file(workdir, "src/.gitcomet-save-xyz", "staged");
+        write_file(workdir, "src/new.rs", "untracked");
+
+        let entries = open_repo(workdir)
+            .list_worktree_files_impl()
+            .expect("list worktree files");
+
+        assert_eq!(paths_of(&entries), ["src", "src/main.rs", "src/new.rs"]);
     }
 
     #[test]

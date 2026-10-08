@@ -114,8 +114,12 @@ impl gpui::Element for MarkdownPreviewSharedHighlightsText {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let mut inner = gpui::StyledText::new(self.text.clone())
-            .with_default_highlights(&window.text_style(), self.highlights.iter().cloned());
+        let runs = crate::text_runs::text_runs_for_highlights(
+            &self.text,
+            &window.text_style(),
+            &self.highlights,
+        );
+        let mut inner = gpui::StyledText::new(self.text.clone()).with_runs(runs);
         let layout = inner.request_layout(id, inspector_id, window, cx);
         self.inner = Some(inner);
         layout
@@ -171,10 +175,11 @@ impl gpui::IntoElement for MarkdownPreviewSharedHighlightsText {
 
 /// Map a `row.text` byte range onto the tab-expanded text that is painted.
 ///
-/// Styled preview text replaces every tab with [`DIFF_WRAP_TAB_EXPANDED_COLUMNS`]
+/// Styled preview text expands every tab to its tab stop
 /// spaces, so raw offsets would slice the painted text in the wrong place —
 /// shifted by three bytes per preceding tab, and cutting the tail short.
 pub(in crate::view) fn markdown_preview_expanded_slice_range(
+    tab_width: usize,
     raw_text: &str,
     expanded_len: usize,
     range: &Range<usize>,
@@ -184,12 +189,7 @@ pub(in crate::view) fn markdown_preview_expanded_slice_range(
     }
 
     let expand = |offset: usize| {
-        let offset = offset.min(raw_text.len());
-        let tabs = raw_text.as_bytes()[..offset]
-            .iter()
-            .filter(|byte| **byte == b'\t')
-            .count();
-        offset + tabs * (DIFF_WRAP_TAB_EXPANDED_COLUMNS - 1)
+        crate::view::tab_width::display_offset_for_raw_offset(tab_width, raw_text, offset)
     };
 
     expand(range.start)..expand(range.end)
@@ -361,10 +361,9 @@ pub(in crate::view) fn markdown_preview_local_link_target(
     let (document_path, source) = match target {
         DiffTarget::WorkingTree { path, .. } => (path.as_path(), FileSource::WorkingDirectory),
         DiffTarget::Commit {
-            commit_id,
-            path: Some(path),
+            commit_id, path, ..
         } => (path.as_path(), FileSource::Commit(commit_id.clone())),
-        DiffTarget::Commit { path: None, .. } | DiffTarget::CommitRange { .. } => return None,
+        DiffTarget::CommitRange { .. } => return None,
     };
     let document_path = markdown_preview_document_path(workdir, document_path)?;
     let path = markdown_preview_local_link_path(document_path, destination)?;
@@ -418,34 +417,7 @@ pub(in crate::view) fn markdown_preview_local_link_missing(
 
 /// Decode `%XX` escapes in a link path. A malformed escape or a result that
 /// is not UTF-8 keeps the text as written, which then names no file.
-pub(in crate::view) fn percent_decode_link_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if !path.contains('%') {
-        return std::borrow::Cow::Borrowed(path);
-    }
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut ix = 0;
-    while ix < bytes.len() {
-        if bytes[ix] == b'%' {
-            let Some(byte) = bytes
-                .get(ix + 1..ix + 3)
-                .and_then(|hex| std::str::from_utf8(hex).ok())
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-            else {
-                return std::borrow::Cow::Borrowed(path);
-            };
-            decoded.push(byte);
-            ix += 3;
-        } else {
-            decoded.push(bytes[ix]);
-            ix += 1;
-        }
-    }
-    match String::from_utf8(decoded) {
-        Ok(decoded) => std::borrow::Cow::Owned(decoded),
-        Err(_) => std::borrow::Cow::Borrowed(path),
-    }
-}
+pub(in crate::view) use gitcomet_core::url_encoding::decode_utf8 as percent_decode_link_path;
 
 /// The `http(s)` URL an image source names, if it names one.
 ///
@@ -582,6 +554,7 @@ pub(in crate::view) fn markdown_preview_reveal_offset_y(
 /// frame rather than stored. Rows with no match return the base untouched, so
 /// the extra work is a substring scan per visible row.
 pub(in crate::view) fn markdown_preview_styled_row_with_query<'a>(
+    tab_width: usize,
     theme: AppTheme,
     row: &'a MarkdownPreviewRow,
     visible_ix: usize,
@@ -590,8 +563,8 @@ pub(in crate::view) fn markdown_preview_styled_row_with_query<'a>(
 ) -> std::borrow::Cow<'a, CachedDiffStyledText> {
     // Only the hovered row pays for a restyle; every other row keeps its cache.
     let base = match hovered_link {
-        Some(range) => markdown_preview_hovered_link_styled_text(theme, row, range),
-        None => markdown_preview_row_styled_text(theme, row),
+        Some(range) => markdown_preview_hovered_link_styled_text(tab_width, theme, row, range),
+        None => markdown_preview_row_styled_text(tab_width, theme, row),
     };
     let Some(query) = query.filter(|query| query.matcher.is_match(base.text.as_ref())) else {
         return std::borrow::Cow::Owned(base);
@@ -606,6 +579,7 @@ pub(in crate::view) fn markdown_preview_styled_row_with_query<'a>(
 
 /// The row's styling with the link in `hovered` underlined.
 fn markdown_preview_hovered_link_styled_text(
+    tab_width: usize,
     theme: AppTheme,
     row: &MarkdownPreviewRow,
     hovered: &Range<usize>,
@@ -625,7 +599,11 @@ fn markdown_preview_hovered_link_styled_text(
             (style != gpui::HighlightStyle::default()).then_some((span.byte_range.clone(), style))
         })
         .collect::<Vec<_>>();
-    build_cached_diff_styled_text_from_relative_highlights(row.text.as_ref(), &highlights)
+    build_cached_diff_styled_text_from_relative_highlights(
+        tab_width,
+        row.text.as_ref(),
+        &highlights,
+    )
 }
 
 /// The underline a link shows while the pointer is on it.
@@ -719,6 +697,20 @@ pub(in crate::view) fn markdown_preview_flow_image(
     let label_color = theme.colors.foreground.secondary;
     let font_size = theme.markdown_px(MARKDOWN_PREVIEW_BASE_FONT_PX, ui_scale_percent);
     let skeleton = markdown_preview_picture_skeleton(row, ui_scale_percent, picture_sizes);
+    // An HTML block's `align` moves the picture across the document's width;
+    // the block itself stays full width, which selection reads its box from.
+    let align = row.align;
+    let place = move |block: gpui::Div| match align {
+        MarkdownTextAlign::Center => block.flex().flex_col().items_center(),
+        MarkdownTextAlign::Right => block.flex().flex_col().items_end(),
+        MarkdownTextAlign::None | MarkdownTextAlign::Left => block,
+    };
+    let placeholder = move |label: SharedString| {
+        markdown_preview_justify(
+            markdown_preview_image_placeholder_element(label, font_size, label_color),
+            align,
+        )
+    };
 
     let source = row.image.as_ref().map(|image| image.source.as_ref());
     if let Some(url) = source.and_then(markdown_preview_remote_image_url)
@@ -733,9 +725,7 @@ pub(in crate::view) fn markdown_preview_flow_image(
             remote_image_access,
             false,
         );
-        return div()
-            .w_full()
-            .min_w(px(0.0))
+        return place(div().w_full().min_w(px(0.0)))
             .child(skeleton.size_element(div().child(blocked)))
             .into_any_element();
     }
@@ -743,12 +733,8 @@ pub(in crate::view) fn markdown_preview_flow_image(
         pictures.resolved_picture(source, ("markdown_preview_block_image", row_ix).into())
     });
     let Some(image) = picture else {
-        return markdown_preview_image_placeholder_element(
-            markdown_preview_image_label(row, "Image unavailable"),
-            font_size,
-            label_color,
-        )
-        .into_any_element();
+        return placeholder(markdown_preview_image_label(row, "Image unavailable"))
+            .into_any_element();
     };
 
     let declared = row
@@ -757,6 +743,9 @@ pub(in crate::view) fn markdown_preview_flow_image(
         .map(|image| (image.width_px, image.height_px))
         .unwrap_or_default();
     let failed_label = markdown_preview_image_label(row, "Failed to load");
+    // A picture keeps its declared or its own size, up to the width of the
+    // document: wider, it would overflow it, and an aligned block would push
+    // it past the edge it cannot be scrolled to.
     let image = match declared {
         (Some(width), Some(height)) => image
             .w(markdown_preview_scaled_px(width as f32, ui_scale_percent))
@@ -766,25 +755,15 @@ pub(in crate::view) fn markdown_preview_flow_image(
         (None, Some(height)) => {
             image.h(markdown_preview_scaled_px(height as f32, ui_scale_percent))
         }
-        // Without a declared size the picture keeps its own, up to the width
-        // of the document.
-        (None, None) => image.max_w_full(),
-    };
+        (None, None) => image,
+    }
+    .max_w_full();
 
-    div()
-        .w_full()
-        .min_w(px(0.0))
+    place(div().w_full().min_w(px(0.0)))
         .child(
             image
                 .debug_selector(move || format!("markdown_preview_block_image_{row_ix}"))
-                .with_fallback(move || {
-                    markdown_preview_image_placeholder_element(
-                        failed_label.clone(),
-                        font_size,
-                        label_color,
-                    )
-                    .into_any_element()
-                })
+                .with_fallback(move || placeholder(failed_label.clone()).into_any_element())
                 .with_loading(move || skeleton.render(theme)),
         )
         .into_any_element()
@@ -877,6 +856,18 @@ pub(in crate::view) fn markdown_preview_picture_skeleton(
     }
 }
 
+/// Moves a flex row's children along it by an HTML block's `align`.
+pub(in crate::view) fn markdown_preview_justify(
+    row: gpui::Div,
+    align: MarkdownTextAlign,
+) -> gpui::Div {
+    match align {
+        MarkdownTextAlign::Center => row.justify_center(),
+        MarkdownTextAlign::Right => row.justify_end(),
+        MarkdownTextAlign::None | MarkdownTextAlign::Left => row,
+    }
+}
+
 /// Tallest an inline picture may be when the document declares no size, so a
 /// stray screenshot written mid-sentence cannot push the line open.
 pub(in crate::view) const MARKDOWN_PREVIEW_INLINE_IMAGE_MAX_HEIGHT_PX: f32 = 26.0;
@@ -894,9 +885,12 @@ pub(in crate::view) const MARKDOWN_PREVIEW_INLINE_IMAGE_GAP_PX: f32 = 4.0;
 ///
 /// Badges, shields, and a logo beside a heading are all written inline, so they
 /// are sized to the line rather than to the document: a declared width wins,
-/// and anything else keeps its own size up to the inline height cap.
+/// and anything else keeps its own size up to the inline height cap — unless
+/// it sits before or after the words rather than inside them (`own_size`),
+/// where it keeps its own size up to the line's width, as on GitHub.
 pub(in crate::view) fn markdown_preview_inline_image(
     inline: &MarkdownInlineImage,
+    own_size: bool,
     theme: AppTheme,
     ui_scale_percent: u32,
     pictures: MarkdownPictureContext<'_>,
@@ -914,26 +908,33 @@ pub(in crate::view) fn markdown_preview_inline_image(
     } else {
         inline.alt.clone()
     };
-    let measured_aspect_ratio = picture_sizes
+    let measured = picture_sizes
         .get(&inline.image.source)
         .filter(|(width, height)| *width > 0 && *height > 0)
-        .map(|(width, height)| *width as f32 / *height as f32);
+        .copied();
+    let measured_aspect_ratio = measured.map(|(width, height)| width as f32 / height as f32);
+    // A picture with its line to itself is drawn at its own size, which its
+    // header gives before it decodes.
+    let uncapped = own_size && inline.image.width_px.is_none() && inline.image.height_px.is_none();
+    let measured_size = measured
+        .filter(|_| uncapped)
+        .map(|(width, height)| (px(width as f32), px(height as f32)));
     // A blocked picture must hold the same slot as the loading picture. Remote
     // intrinsic dimensions are deliberately unavailable until permission is
     // granted, but HTML width/height declarations remain authoritative.
-    let loading_height = inline.image.height_px.map_or_else(
-        || {
-            markdown_preview_scaled_px(
-                MARKDOWN_PREVIEW_INLINE_IMAGE_MAX_HEIGHT_PX,
-                ui_scale_percent,
-            )
-        },
-        |height| markdown_preview_scaled_px(height as f32, ui_scale_percent),
-    );
-    let loading_width = match (inline.image.width_px, measured_aspect_ratio) {
-        (Some(width), _) => markdown_preview_scaled_px(width as f32, ui_scale_percent),
-        (None, Some(ratio)) => loading_height * ratio,
+    let loading_height = match (inline.image.height_px, measured_size) {
+        (Some(height), _) => markdown_preview_scaled_px(height as f32, ui_scale_percent),
+        (None, Some((_, height))) => height,
         (None, None) => markdown_preview_scaled_px(
+            MARKDOWN_PREVIEW_INLINE_IMAGE_MAX_HEIGHT_PX,
+            ui_scale_percent,
+        ),
+    };
+    let loading_width = match (inline.image.width_px, measured_size, measured_aspect_ratio) {
+        (Some(width), _, _) => markdown_preview_scaled_px(width as f32, ui_scale_percent),
+        (None, Some((width, _)), _) => width,
+        (None, None, Some(ratio)) => loading_height * ratio,
+        (None, None, None) => markdown_preview_scaled_px(
             MARKDOWN_PREVIEW_INLINE_IMAGE_LOADING_WIDTH_PX,
             ui_scale_percent,
         ),
@@ -987,6 +988,7 @@ pub(in crate::view) fn markdown_preview_inline_image(
         (None, Some(height)) => {
             image.h(markdown_preview_scaled_px(height as f32, ui_scale_percent))
         }
+        (None, None) if uncapped => image,
         (None, None) => image.max_h(markdown_preview_scaled_px(
             MARKDOWN_PREVIEW_INLINE_IMAGE_MAX_HEIGHT_PX,
             ui_scale_percent,
@@ -1260,6 +1262,7 @@ pub(in crate::view) fn markdown_preview_theme_signature(theme: AppTheme) -> u64 
 }
 
 pub(in crate::view) fn markdown_preview_row_styled_text(
+    tab_width: usize,
     theme: AppTheme,
     row: &MarkdownPreviewRow,
 ) -> CachedDiffStyledText {
@@ -1267,6 +1270,7 @@ pub(in crate::view) fn markdown_preview_row_styled_text(
     row.styled_text_cache.get_or_insert_with(signature, || {
         if matches!(row.kind, MarkdownPreviewRowKind::CodeLine { .. }) {
             return build_cached_diff_styled_text(
+                tab_width,
                 theme,
                 row.text.as_ref(),
                 &[],
@@ -1286,7 +1290,11 @@ pub(in crate::view) fn markdown_preview_row_styled_text(
                     .then_some((span.byte_range.start..span.byte_range.end, style))
             })
             .collect::<Vec<_>>();
-        build_cached_diff_styled_text_from_relative_highlights(row.text.as_ref(), &highlights)
+        build_cached_diff_styled_text_from_relative_highlights(
+            tab_width,
+            row.text.as_ref(),
+            &highlights,
+        )
     })
 }
 

@@ -2,9 +2,10 @@ use super::*;
 use crate::kit::interaction_paint::InteractionPaint;
 use crate::view::panes::HistoryRowHoverArea;
 use gitcomet_state::msg::CommitSelectMode;
+use gitcomet_ui_kit::text_layout::TextLayoutExt as _;
 use gpui::{
-    Bounds, ContentMask, CursorStyle, DispatchPhase, HitboxBehavior, MouseButton, TruncateFrom,
-    fill, point, px, size,
+    Bounds, ContentMask, CursorStyle, DispatchPhase, MouseButton, TruncateFrom, fill, point, px,
+    size,
 };
 use palette::IntoColor;
 use rustc_hash::FxHasher;
@@ -205,6 +206,35 @@ fn shape_truncated_line_cached_from(
         font_family,
         truncate_from,
         "…",
+        &[],
+    )
+}
+
+/// [`shape_truncated_line_cached`] with find matches drawn in `highlights`.
+#[allow(clippy::too_many_arguments)]
+fn shape_highlighted_line_cached(
+    window: &mut Window,
+    base_style: &gpui::TextStyle,
+    font_size: Pixels,
+    text: &SharedString,
+    text_hash: u64,
+    max_width: Pixels,
+    color: gpui::Rgba,
+    font_family: Option<&'static str>,
+    highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
+) -> gpui::ShapedLine {
+    shape_truncated_line_cached_from_with_affix(
+        window,
+        base_style,
+        font_size,
+        text,
+        text_hash,
+        max_width,
+        color,
+        font_family,
+        TruncateFrom::End,
+        "…",
+        highlights,
     )
 }
 
@@ -231,6 +261,7 @@ fn shape_clipped_chip_line_cached_from(
         font_family,
         truncate_from,
         "",
+        &[],
     )
 }
 
@@ -246,6 +277,7 @@ fn shape_truncated_line_cached_from_with_affix(
     font_family: Option<&'static str>,
     truncate_from: TruncateFrom,
     truncation_affix: &'static str,
+    highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
 ) -> gpui::ShapedLine {
     use std::hash::{Hash, Hasher};
 
@@ -264,6 +296,11 @@ fn shape_truncated_line_cached_from_with_affix(
         color.alpha.to_bits().hash(&mut hasher);
         matches!(truncate_from, TruncateFrom::Start).hash(&mut hasher);
         truncation_affix.hash(&mut hasher);
+        highlights.len().hash(&mut hasher);
+        for (range, style) in highlights {
+            range.hash(&mut hasher);
+            crate::text_runs::hash_highlight_style(style, &mut hasher);
+        }
         hasher.finish()
     };
 
@@ -278,24 +315,77 @@ fn shape_truncated_line_cached_from_with_affix(
     if let Some(family) = font_family {
         style.font_family = family.into();
     }
-    let runs = vec![style.to_run(text.len())];
-    let mut wrapper = window.text_system().line_wrapper(style.font(), font_size);
-    let (truncated, runs) = wrapper.truncate_line(
-        text.clone(),
-        max_width.max(px(0.0)),
-        truncation_affix,
-        &runs,
-        truncate_from,
-    );
-    let shaped = window
-        .text_system()
-        .shape_line(truncated, font_size, runs.as_ref(), None);
+    let runs = crate::text_runs::text_runs_for_highlights(text, &style, highlights);
+    let text_system = Arc::clone(window.text_system());
+    let shaped = if highlights.is_empty() || truncate_from != TruncateFrom::End {
+        let (truncated, runs) = gpui::TextLayout::truncate_line(
+            text.clone(),
+            font_size,
+            max_width.max(px(0.0)),
+            truncation_affix,
+            &runs,
+            truncate_from,
+            window,
+        );
+        text_system.shape_line(truncated, font_size, runs.as_ref())
+    } else {
+        // The wrapper cuts by base-font widths, so bold matches would
+        // overflow and be clipped mid-glyph; cut the shaped line instead.
+        let full = text_system.shape_line(text.clone(), font_size, &runs);
+        let affix = || {
+            text_system
+                .shape_line(
+                    truncation_affix.into(),
+                    font_size,
+                    &[style.to_run(truncation_affix.len())],
+                )
+                .width
+        };
+        match highlighted_cut(full.width, max_width, affix, |x| full.index_for_x(x)) {
+            None => full,
+            Some(cut) => {
+                // Like the wrapper, drop trailing blanks and punctuation.
+                let prefix = text[..cut]
+                    .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
+                let kept: Vec<_> = highlights
+                    .iter()
+                    .filter_map(|(range, highlight)| {
+                        let end = range.end.min(prefix.len());
+                        (range.start < end).then_some((range.start..end, *highlight))
+                    })
+                    .collect();
+                let mut runs = crate::text_runs::text_runs_for_highlights(prefix, &style, &kept);
+                runs.push(style.to_run(truncation_affix.len()));
+                text_system.shape_line(
+                    format!("{prefix}{truncation_affix}").into(),
+                    font_size,
+                    &runs,
+                )
+            }
+        }
+    };
 
     HISTORY_TEXT_LAYOUT_CACHE.with(|cache| {
         cache.borrow_mut().put(key, shaped.clone());
     });
 
     shaped
+}
+
+/// Where to cut a highlighted line so its shaped width, with the affix,
+/// fits `max_width`; `None` when the whole line fits. `index_for_x` is the
+/// shaped line's: the glyph under `x`, whose start is at or before it.
+fn highlighted_cut(
+    width: Pixels,
+    max_width: Pixels,
+    affix_width: impl FnOnce() -> Pixels,
+    index_for_x: impl FnOnce(Pixels) -> Option<usize>,
+) -> Option<usize> {
+    if width <= max_width {
+        return None;
+    }
+    let room = (max_width - affix_width()).max(px(0.0));
+    Some(index_for_x(room).unwrap_or(0))
 }
 
 /// Which visual family a ref chip belongs to. Tags stay accent-tinted pills,
@@ -864,6 +954,7 @@ fn paint_history_ref_chips(
     window.with_content_mask(
         Some(ContentMask {
             bounds: content_bounds,
+            ..Default::default()
         }),
         |window| {
             // paint_quad has no layout-level radius clamping, so a
@@ -1119,20 +1210,28 @@ pub(super) fn history_commit_row_canvas(
     selected_branch: Option<SelectedHistoryBranch>,
     selected_lane: Option<super::history_graph_paint::SelectedLane>,
     lane_branch_name: Option<SharedString>,
-    author: HistoryTextVm,
+    author: HistoryAuthorVm,
     summary: HistoryTextVm,
     when: HistoryTextVm,
     // Raw commit time, so the date cell's tooltip can be rendered in full
     // only when someone actually hovers it.
     commit_time: std::time::SystemTime,
     short_sha: HistoryTextVm,
+    find_highlights: Option<crate::view::panes::history::find::HistoryFindHighlights>,
     active_context_menu_invoker: Option<SharedString>,
     // The same resolver paints the row and its graph-node cutouts.
     row_paint: InteractionPaint,
+    annotation: gitcomet_extension_api::HistoryRowAnnotation,
 ) -> AnyElement {
+    let interaction = row_paint.clone();
+    let prepaint_interaction = row_paint.clone();
     super::canvas::keyed_canvas(
         ("history_commit_row_canvas", row_id),
-        move |bounds, window, _cx| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |_, _, _| {
+            prepaint_interaction
+                .canvas_hitbox()
+                .expect("canvas interaction prepaint")
+        },
         move |bounds, hitbox, window, cx| {
             let Some(graph_row) = graph_rows.get(graph_row_ix) else {
                 return;
@@ -1175,11 +1274,55 @@ pub(super) fn history_commit_row_canvas(
                 .line_height
                 .to_pixels(xxs_font.into(), window.rem_size());
             let cell_pad_x = scaled_px(HISTORY_COL_HANDLE_PX / 2.0);
+            // Find matches look like the sidebar's search matches.
+            let find_match_style = gpui::HighlightStyle {
+                color: Some(theme.colors.accent.foreground.into_color()),
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..gpui::HighlightStyle::default()
+            };
+            let find_match_runs = |ranges: &[std::ops::Range<usize>]| -> Vec<_> {
+                ranges
+                    .iter()
+                    .map(|range| (range.clone(), find_match_style))
+                    .collect()
+            };
+            let (summary_matches, author_matches, sha_matches) = find_highlights
+                .as_ref()
+                .map(|found| {
+                    let sha = (found.sha > 0).then_some((0..found.sha, find_match_style));
+                    (
+                        find_match_runs(&found.summary),
+                        find_match_runs(&found.author),
+                        sha.into_iter().collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default();
 
             let center_y = |line_height: Pixels| {
                 let extra = (bounds.size.height - line_height).max(px(0.0));
                 bounds.top() + extra * 0.5
             };
+
+            if let Some(range) = &annotation.range {
+                let color: gpui::Rgba = range.color.into_color();
+                let start = if range.starts {
+                    bounds.size.height * 0.5
+                } else {
+                    px(0.0)
+                };
+                let end = if range.ends {
+                    bounds.size.height * 0.5
+                } else {
+                    bounds.size.height
+                };
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left(), bounds.top() + start),
+                        size(px(3.0), (end - start).max(px(2.0))),
+                    ),
+                    color,
+                ));
+            }
 
             let column_layout = history_canvas_column_layout(
                 bounds,
@@ -1201,10 +1344,91 @@ pub(super) fn history_commit_row_canvas(
             );
             let branch_bounds = column_layout.branch;
             let graph_bounds = column_layout.graph;
-            let summary_bounds = column_layout.summary;
+            let mut summary_bounds = column_layout.summary;
             let author_bounds = column_layout.author;
             let date_bounds = column_layout.date;
             let sha_bounds = column_layout.sha;
+
+            // Marks share the existing summary canvas, reserving their width so
+            // neither the commit subject nor adjacent columns are obscured. A
+            // text glyph shapes with the label; an icon glyph leads it.
+            for (leading, mark) in [
+                (true, annotation.leading.as_ref()),
+                (false, annotation.trailing.as_ref()),
+            ] {
+                let Some(mark) = mark else {
+                    continue;
+                };
+                let color: gpui::Rgba = mark.color.into_color();
+                let (icon, text) = match &mark.glyph {
+                    Some(gitcomet_extension_api::RowGlyph::Icon(path)) => {
+                        (Some(path), mark.label.clone())
+                    }
+                    Some(gitcomet_extension_api::RowGlyph::Text(glyph)) => (
+                        None,
+                        Some(match &mark.label {
+                            Some(label) => format!("{glyph} {label}").into(),
+                            None => glyph.clone(),
+                        }),
+                    ),
+                    _ => (None, mark.label.clone()),
+                };
+                let icon_size = xxs_line_height.min(bounds.size.height);
+                let icon_width = if icon.is_some() {
+                    icon_size + scaled_px(2.0)
+                } else {
+                    px(0.0)
+                };
+                let available = (summary_bounds.size.width * 0.3).min(scaled_px(96.0));
+                let text = text.map(|text| {
+                    let mut hasher = FxHasher::default();
+                    text.hash(&mut hasher);
+                    shape_truncated_line_cached(
+                        window,
+                        &base_style,
+                        xxs_font,
+                        &text,
+                        hasher.finish(),
+                        (available - icon_width).max(px(0.0)),
+                        color,
+                        None,
+                    )
+                });
+                let content = icon_width + text.as_ref().map_or(px(0.0), |text| text.width);
+                if content <= px(0.0) {
+                    continue;
+                }
+                let width = (content + scaled_px(8.0)).min(summary_bounds.size.width);
+                let x = if leading {
+                    summary_bounds.left() + scaled_px(4.0)
+                } else {
+                    summary_bounds.right() - width
+                };
+                if let Some(path) = icon {
+                    super::diff_canvas::paint_centered_svg_icon(
+                        path.clone(),
+                        Bounds::new(point(x, center_y(icon_size)), size(icon_size, icon_size)),
+                        icon_size,
+                        color,
+                        window,
+                        cx,
+                    );
+                }
+                if let Some(text) = text {
+                    let _ = text.paint(
+                        point(x + icon_width, center_y(xxs_line_height)),
+                        xxs_line_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                summary_bounds.size.width -= width;
+                if leading {
+                    summary_bounds.origin.x += width;
+                }
+            }
 
             // Everything coloured from this row's lane -- the node, the
             // message border, the fade wash and the hover badge -- washes with
@@ -1239,6 +1463,7 @@ pub(super) fn history_commit_row_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: graph_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         window.paint_layer(graph_bounds, |window| {
@@ -1334,6 +1559,7 @@ pub(super) fn history_commit_row_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: branch_content_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         let _ = shaped.paint(
@@ -1384,7 +1610,7 @@ pub(super) fn history_commit_row_canvas(
                 summary_bounds
             };
             if !summary.is_empty() {
-                let shaped = shape_truncated_line_cached(
+                let shaped = shape_highlighted_line_cached(
                     window,
                     &base_style,
                     sm_font,
@@ -1393,10 +1619,12 @@ pub(super) fn history_commit_row_canvas(
                     summary_text_bounds.size.width.max(px(0.0)),
                     history_summary_color(theme, is_selected_branch_tip, related_to_selection),
                     None,
+                    &summary_matches,
                 );
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: summary_text_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         let _ = shaped.paint(
@@ -1437,8 +1665,7 @@ pub(super) fn history_commit_row_canvas(
                         .corner_radii(avatar_d * 0.5),
                     );
 
-                    let initials: SharedString =
-                        components::author_initials(author.as_ref()).into();
+                    let initials = author.initials.shared();
                     let initials_font = scaled_px(components::AVATAR_FONT_PX);
                     let initials_line_height = initials_style
                         .line_height
@@ -1447,14 +1674,14 @@ pub(super) fn history_commit_row_canvas(
                         window,
                         &initials_style,
                         initials_font,
-                        &initials,
-                        fx_hash_str(initials.as_ref()),
+                        initials,
+                        author.initials.text_hash(),
                         avatar_d,
                         identity_color,
                         None,
                     );
                     let initials_cap_height = initials_shaped
-                        .runs
+                        .paint_fragments
                         .first()
                         .map(|run| window.text_system().cap_height(run.font_id, initials_font))
                         .unwrap_or(initials_font * 0.7);
@@ -1536,7 +1763,7 @@ pub(super) fn history_commit_row_canvas(
                         author_bounds.size.height,
                     ),
                 );
-                let shaped = shape_truncated_line_cached(
+                let shaped = shape_highlighted_line_cached(
                     window,
                     &base_style,
                     xs_font,
@@ -1545,10 +1772,12 @@ pub(super) fn history_commit_row_canvas(
                     author_text_bounds.size.width.max(px(0.0)),
                     theme.colors.foreground.secondary,
                     None,
+                    &author_matches,
                 );
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: author_text_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         let _ = shaped.paint(
@@ -1587,6 +1816,7 @@ pub(super) fn history_commit_row_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: date_text_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         let _ = shaped.paint(
@@ -1609,7 +1839,7 @@ pub(super) fn history_commit_row_canvas(
                         sha_bounds.size.height,
                     ),
                 );
-                let shaped = shape_truncated_line_cached(
+                let shaped = shape_highlighted_line_cached(
                     window,
                     &base_style,
                     xxs_font,
@@ -1618,11 +1848,13 @@ pub(super) fn history_commit_row_canvas(
                     sha_text_bounds.size.width.max(px(0.0)),
                     theme.colors.foreground.secondary,
                     Some(UI_MONOSPACE_FONT_FAMILY),
+                    &sha_matches,
                 );
                 let origin_x = (sha_text_bounds.right() - shaped.width).max(sha_text_bounds.left());
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: sha_text_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         let _ = shaped.paint(
@@ -1794,13 +2026,13 @@ pub(super) fn history_commit_row_canvas(
                         // focus must still move to the clicked commit so the
                         // details pane matches the menu target. Outside the
                         // selection this collapses to the clicked commit.
-                        this.store.dispatch(Msg::SelectCommitMulti {
+                        this.cancel_history_find_navigation();
+                        this.select_history_commit(
                             repo_id,
-                            commit_id: commit_id.clone(),
-                            mode: CommitSelectMode::PreserveIfSelected,
-                            clicked_index: None,
-                            visible_order: None,
-                        });
+                            commit_id.clone(),
+                            CommitSelectMode::PreserveIfSelected,
+                            None,
+                        );
                         let context_menu_invoker =
                             format!("history_commit_menu_{}_{}", repo_id.0, commit_id.as_ref())
                                 .into();
@@ -1823,6 +2055,7 @@ pub(super) fn history_commit_row_canvas(
     )
     .h_full()
     .w_full()
+    .track_interaction(interaction)
     .into_any_element()
 }
 
@@ -1994,7 +2227,10 @@ mod tests {
     #[test]
     fn the_ref_chip_keeps_its_proportion_in_a_comfortable_row() {
         use crate::appearance::{Appearance, UiDensity};
-        let compact = Appearance::default();
+        let compact = Appearance {
+            density: UiDensity::Compact,
+            ..Appearance::default()
+        };
         let comfortable = Appearance {
             density: UiDensity::Comfortable,
             ..Appearance::default()
@@ -2007,10 +2243,12 @@ mod tests {
         };
 
         assert!(chip(comfortable) > chip(compact));
-        assert!(
-            HISTORY_TAG_CHIP_COMFORTABLE_PADDING_X_PX > HISTORY_TAG_CHIP_PADDING_X_PX,
-            "the padding has to follow the chip or the label crowds its edges"
-        );
+        const {
+            assert!(
+                HISTORY_TAG_CHIP_COMFORTABLE_PADDING_X_PX > HISTORY_TAG_CHIP_PADDING_X_PX,
+                "the padding has to follow the chip or the label crowds its edges"
+            )
+        };
 
         for metrics in UiDensity::ALL.into_iter().map(|density| Appearance {
             density,
@@ -2154,6 +2392,140 @@ mod tests {
                 clipped.text.chars().count()
                     > ellipsized.text.trim_start_matches('…').chars().count(),
                 "removing the ellipsis should expose more of the branch name"
+            );
+        })
+        .expect("history canvas test window should stay open");
+    }
+
+    /// Test text systems measure bold like regular text, so this models a
+    /// shaped line instead: 10px glyphs, bold ones 14px, a 10px ellipsis.
+    /// The wrapper's base-font cut let bold matches overflow the cell.
+    #[test]
+    fn highlighted_lines_are_cut_where_their_bold_matches_really_end() {
+        let bold = |ix: usize| (4..10).contains(&ix) || (14..20).contains(&ix);
+        let glyphs = 24usize;
+        let start = |ix: usize| {
+            (0..ix)
+                .map(|ix| if bold(ix) { 14.0 } else { 10.0 })
+                .sum::<f32>()
+        };
+        let width = px(start(glyphs));
+        // As `LineLayout::index_for_x`: the last glyph starting at or before x.
+        let index_for_x = |x: Pixels| {
+            (x < width).then(|| {
+                (0..glyphs)
+                    .rev()
+                    .find(|&ix| px(start(ix)) <= x)
+                    .unwrap_or(0)
+            })
+        };
+        for max in 0..=320 {
+            let max_width = px(max as f32);
+            let drawn = match highlighted_cut(width, max_width, || px(10.0), index_for_x) {
+                None => start(glyphs),
+                Some(cut) => start(cut) + 10.0,
+            };
+            assert!(
+                drawn <= max as f32 || max < 10,
+                "{drawn}px drawn in a {max}px cell"
+            );
+        }
+        assert_eq!(
+            highlighted_cut(width, width, || px(10.0), index_for_x),
+            None
+        );
+    }
+
+    #[gpui::test]
+    fn highlighted_lines_truncate_on_character_boundaries(cx: &mut gpui::TestAppContext) {
+        let window_handle = cx.add_window(|_window, _cx| gpui::Empty);
+        cx.update_window(window_handle.into(), |_, window, _| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let text: SharedString = "Élodie fixé — naïve déjà vu, and more words".into();
+            let color = AppTheme::gitcomet_dark().colors.foreground.primary;
+            let bold = gpui::HighlightStyle {
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..gpui::HighlightStyle::default()
+            };
+            let full = shape_highlighted_line_cached(
+                window,
+                &style,
+                font_size,
+                &text,
+                fx_hash_str(text.as_ref()),
+                px(10_000.0),
+                color,
+                None,
+                &[(7..13, bold)],
+            );
+            assert_eq!(full.text, text);
+            for max in [0.0, 20.0, 60.0, 120.0, f32::from(full.width) - 1.0] {
+                let shaped = shape_highlighted_line_cached(
+                    window,
+                    &style,
+                    font_size,
+                    &text,
+                    fx_hash_str(text.as_ref()),
+                    px(max),
+                    color,
+                    None,
+                    &[(7..13, bold)],
+                );
+                assert!(shaped.text.ends_with('…'), "{max}: {}", shaped.text);
+                assert!(
+                    text.starts_with(shaped.text.trim_end_matches('…')),
+                    "{max}: {}",
+                    shaped.text
+                );
+                assert!(
+                    shaped.width <= px(max) || shaped.text.as_ref() == "…",
+                    "{max}: {:?}",
+                    shaped.width
+                );
+            }
+        })
+        .expect("history canvas test window should stay open");
+    }
+
+    /// A row painted before the find bar opened must not keep its plain
+    /// cached line once its text matches.
+    #[gpui::test]
+    fn find_match_highlights_are_part_of_the_layout_cache_key(cx: &mut gpui::TestAppContext) {
+        let window_handle = cx.add_window(|_window, _cx| gpui::Empty);
+        cx.update_window(window_handle.into(), |_, window, _| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let text: SharedString = "highlight cache key: Fix login bug".into();
+            let color = AppTheme::gitcomet_dark().colors.foreground.primary;
+            let bold = gpui::HighlightStyle {
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..gpui::HighlightStyle::default()
+            };
+            let cached = || HISTORY_TEXT_LAYOUT_CACHE.with(|cache| cache.borrow().len());
+            let shape = |window: &mut Window, highlights: &[(std::ops::Range<usize>, _)]| {
+                shape_highlighted_line_cached(
+                    window,
+                    &style,
+                    font_size,
+                    &text,
+                    fx_hash_str(text.as_ref()),
+                    px(1000.0),
+                    color,
+                    None,
+                    highlights,
+                );
+            };
+
+            let before = cached();
+            shape(window, &[]);
+            shape(window, &[(21..24, bold)]);
+            shape(window, &[(21..24, bold)]);
+            shape(window, &[(25..30, bold)]);
+            assert_eq!(
+                cached() - before,
+                3,
+                "plain, one match and another match are three layouts"
             );
         })
         .expect("history canvas test window should stay open");

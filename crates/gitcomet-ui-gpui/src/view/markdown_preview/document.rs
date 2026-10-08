@@ -219,11 +219,28 @@ pub(crate) fn markdown_diff_row_groups(
     }
 
     for group in &mut groups {
-        let changed = group
+        // A row whose lines are untouched still changed when the `<div align>`
+        // around it did: that line has no row of its own to mark. Spacers can
+        // move between versions without anything changing, so only real rows
+        // are paired.
+        let old_rows = group
             .old
             .iter()
-            .chain(&group.new)
-            .any(|row| row.change_hint != MarkdownChangeHint::None);
+            .filter(|row| !matches!(row.kind, MarkdownPreviewRowKind::Spacer));
+        let new_rows = group
+            .new
+            .iter()
+            .filter(|row| !matches!(row.kind, MarkdownPreviewRowKind::Spacer));
+        let realigned = old_rows.clone().count() == new_rows.clone().count()
+            && old_rows
+                .zip(new_rows)
+                .any(|(old, new)| old.align != new.align || !same_table_presentation(old, new));
+        let changed = realigned
+            || group
+                .old
+                .iter()
+                .chain(&group.new)
+                .any(|row| row.change_hint != MarkdownChangeHint::None);
         if !changed {
             continue;
         }
@@ -372,7 +389,26 @@ pub(crate) fn markdown_inline_diff_rows_can_merge(
         && old_row.alert_kind == new_row.alert_kind
         && old_row.starts_alert == new_row.starts_alert
         && old_row.continues_item == new_row.continues_item
+        && old_row.align == new_row.align
+        && same_table_presentation(old_row, new_row)
         && old_row.task.map(|task| task.checked) == new_row.task.map(|task| task.checked)
+}
+
+/// Compare table boundaries and cell presentation, excluding source positions.
+fn same_table_presentation(old: &MarkdownPreviewRow, new: &MarkdownPreviewRow) -> bool {
+    match (&old.table, &new.table) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            old.kind == new.kind
+                && a.starts_table == b.starts_table
+                && a.cells.len() == b.cells.len()
+                && a.cells
+                    .iter()
+                    .zip(b.cells.iter())
+                    .all(|(a, b)| a.is_header == b.is_header && a.align == b.align)
+        }
+        _ => false,
+    }
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
@@ -446,13 +482,7 @@ pub(crate) fn scrollbar_flag_for_change_hint(hint: MarkdownChangeHint) -> u8 {
 
 /// Build a vec of byte offsets for the start of each line.
 pub(crate) fn build_line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
+    gitcomet_core::text_utils::line_starts(source)
 }
 
 /// Convert a byte offset to a 0-based line index.

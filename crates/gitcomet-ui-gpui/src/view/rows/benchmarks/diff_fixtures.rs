@@ -50,10 +50,8 @@ pub struct PatchDiffPagedRowsFixture {
 
 impl PatchDiffPagedRowsFixture {
     pub fn new(lines: usize) -> Self {
-        let target = DiffTarget::WorkingTree {
-            path: std::path::PathBuf::from("src/lib.rs"),
-            area: DiffArea::Unstaged,
-        };
+        let target =
+            DiffTarget::working_tree(std::path::PathBuf::from("src/lib.rs"), DiffArea::Unstaged);
         let text = build_synthetic_unified_patch(lines);
         let diff = Arc::new(Diff::from_unified(target, text.as_str()));
         let mut pending_removes = 0usize;
@@ -84,6 +82,8 @@ impl PatchDiffPagedRowsFixture {
     }
 
     pub fn run_eager_full_materialize_step(&self) -> u64 {
+        let tab_width = 4;
+
         let annotated = annotate_unified(&self.diff);
         let split = build_patch_split_rows(&annotated);
         let theme = AppTheme::gitcomet_dark();
@@ -144,6 +144,7 @@ impl PatchDiffPagedRowsFixture {
                 continue;
             }
             let styled = super::diff_text::build_cached_diff_styled_text(
+                tab_width,
                 theme,
                 diff_content_text(line),
                 &[],
@@ -159,6 +160,8 @@ impl PatchDiffPagedRowsFixture {
     }
 
     pub fn run_paged_first_window_step(&self, window: usize) -> u64 {
+        let tab_width = 4;
+
         let window = window.max(1);
         let rows_provider = Arc::new(PagedPatchDiffRows::new(Arc::clone(&self.diff), 256));
         let split_provider = PagedPatchSplitRows::new_with_len_hint(
@@ -190,6 +193,7 @@ impl PatchDiffPagedRowsFixture {
             ) {
                 let content_text = diff_content_text(&line);
                 let styled = super::diff_text::build_cached_diff_styled_text_with_source_identity(
+                    tab_width,
                     theme,
                     content_text,
                     Some(super::diff_text::DiffTextSourceIdentity::from_str(
@@ -331,6 +335,8 @@ impl PatchDiffPagedRowsFixture {
     /// `len_hint()` to avoid indexing past the end.  Used for deep-scroll
     /// benchmarks.
     pub fn run_paged_window_at_step(&self, start_row: usize, window: usize) -> u64 {
+        let tab_width = 4;
+
         let window = window.max(1);
         let rows_provider = Arc::new(PagedPatchDiffRows::new(Arc::clone(&self.diff), 256));
         let split_provider = PagedPatchSplitRows::new_with_len_hint(
@@ -341,7 +347,7 @@ impl PatchDiffPagedRowsFixture {
         let language = diff_syntax_language_for_path("src/lib.rs");
 
         // Compute per-provider deep offsets clamped to valid range.
-        let patch_start = start_row.min(rows_provider.len_hint().saturating_sub(window).max(0));
+        let patch_start = start_row.min(rows_provider.len_hint().saturating_sub(window));
         let split_start = split_provider
             .len_hint()
             .saturating_mul(9)
@@ -375,6 +381,7 @@ impl PatchDiffPagedRowsFixture {
             ) {
                 let content_text = diff_content_text(&line);
                 let styled = super::diff_text::build_cached_diff_styled_text_with_source_identity(
+                    tab_width,
                     theme,
                     content_text,
                     Some(super::diff_text::DiffTextSourceIdentity::from_str(
@@ -2127,6 +2134,8 @@ impl PatchDiffSearchQueryUpdateFixture {
     }
 
     fn row_styled(&mut self, src_ix: usize, query: &str) -> Option<CachedDiffStyledText> {
+        let tab_width = 4;
+
         let query = query.trim();
         let query_active = !query.is_empty();
         let click_kind = self
@@ -2160,6 +2169,7 @@ impl PatchDiffSearchQueryUpdateFixture {
                 };
 
                 super::diff_text::build_cached_diff_styled_text(
+                    tab_width,
                     self.theme,
                     diff_content_text(line),
                     word_ranges,
@@ -2170,6 +2180,7 @@ impl PatchDiffSearchQueryUpdateFixture {
                 )
             } else {
                 super::diff_text::build_cached_diff_styled_text(
+                    tab_width,
                     self.theme,
                     line.text.as_ref(),
                     &[],

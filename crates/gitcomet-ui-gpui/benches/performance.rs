@@ -31,7 +31,10 @@ macro_rules! exact_filtered_target {
     };
 }
 
+exact_filtered_target!(bench_extensions_selected => bench_extensions, ["diff_view_open_first_window", "diff_scroll/overlay_lane_window", "diff_scroll/insets_window", "file_list", "shell/view_switch",
+        "shell/empty_registry", "settings_window_render", "history_annotations"]);
 exact_filtered_target!(bench_open_repo_selected => bench_open_repo);
+exact_filtered_target!(bench_sidebar_sticky_selected => bench_sidebar_sticky);
 exact_filtered_target!(bench_branch_sidebar_selected => bench_branch_sidebar, [
     "branch_sidebar/local_heavy",
     "branch_sidebar/remote_fanout",
@@ -241,7 +244,9 @@ criterion_group! {
     name = benches;
     config = performance_benches::benchmark_criterion();
     targets =
+    bench_extensions_selected,
         bench_open_repo_selected,
+        bench_sidebar_sticky_selected,
         bench_branch_sidebar_selected,
         bench_branch_sidebar_extreme_scale_selected,
         bench_branch_sidebar_cache_selected,

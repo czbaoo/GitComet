@@ -15,6 +15,53 @@ pub(super) use std::path::Path;
 pub(super) use std::sync::Arc;
 pub(super) use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Holds the shared filesystem worker, so editor saves queued meanwhile stay
+/// in flight until [`HeldEditorSaves::release`]. The UI thread must not read
+/// through the editor while held: that read takes the same lock.
+pub(super) struct HeldEditorSaves(
+    Option<std::sync::MutexGuard<'static, gitcomet_core::filesystem::Filesystem>>,
+);
+
+pub(super) fn hold_editor_saves() -> HeldEditorSaves {
+    HeldEditorSaves(Some(
+        gitcomet_core::filesystem::global()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    ))
+}
+
+impl HeldEditorSaves {
+    /// Let the queued saves run. To make them fail, change the file on disk
+    /// first: the worker then refuses the save as a conflict.
+    pub(super) fn release(mut self) {
+        self.0.take();
+    }
+}
+
+/// Filesystem effects run on the real shared worker. Pump the results into the
+/// pane without replacing the synthetic repository the fixture pushed.
+pub(super) fn finish_editor_saves(
+    view: &gpui::Entity<GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let drained = cx.update(|_, app| {
+            let main = view.read(app).main_pane.clone();
+            main.update(app, |pane, cx| {
+                let snapshot = pane.store.snapshot();
+                pane.process_file_editor_saves(&snapshot, cx);
+                pane.file_editor_saves.is_empty()
+            })
+        });
+        if drained {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("filesystem save did not finish");
+}
+
 pub(super) fn simulate_counted_click(
     cx: &mut gpui::VisualTestContext,
     position: gpui::Point<Pixels>,
@@ -637,6 +684,7 @@ pub(super) fn seed_file_image_diff_state_with_rev(
                     path: path.to_path_buf(),
                     old: old.map(|bytes| bytes.to_vec()),
                     new: new.map(|bytes| bytes.to_vec()),
+                    ..Default::default()
                 }),
             ));
 
@@ -891,6 +939,7 @@ pub(super) fn assert_file_preview_ctrl_a_ctrl_c_copies_all(
                     Some(Arc::new(gitcomet_core::domain::DiffPreviewTextFile {
                         path: source_path.clone(),
                         side: gitcomet_core::domain::DiffPreviewTextSide::Old,
+                        large_file: None,
                     })),
                 );
                 repo.diff_state.diff_state_rev = repo.diff_state.diff_state_rev.wrapping_add(1);
@@ -1022,6 +1071,7 @@ pub(super) fn assert_markdown_file_preview_toggle_visible(
                     Some(Arc::new(gitcomet_core::domain::DiffPreviewTextFile {
                         path: preview_source_path,
                         side,
+                        large_file: None,
                     })),
                 );
             }
@@ -1225,8 +1275,7 @@ pub(super) fn set_test_file_status_with_conflict(
             Some(_)
         )
     );
-    repo.diff_state.diff_target =
-        Some(gitcomet_core::domain::DiffTarget::WorkingTree { path, area });
+    repo.diff_state.diff_target = Some(gitcomet_core::domain::DiffTarget::working_tree(path, area));
     repo.diff_state.diff_state_rev = repo.diff_state.diff_state_rev.wrapping_add(1);
 }
 
@@ -1356,29 +1405,32 @@ pub(super) fn set_ui_scale_percent_for_test(
     view: &gpui::Entity<super::super::GitCometView>,
     percent: u32,
 ) {
-    // Apply to the test window through the view first: `set_app_ui_scale_percent`
-    // reaches open windows via `WindowHandle::update`, which silently fails here
-    // because the test window is already borrowed by this `cx.update`, leaving the
-    // window rem size (and thus text scaling) untouched.
+    // Zooms the test window. Applied through the view directly:
+    // `set_window_ui_scale_percent` goes through `WindowHandle::update`, which
+    // fails while this `cx.update` holds the window.
     cx.update(|window, app| {
+        crate::ui_scale::set_window_percent(app, window.window_handle().window_id(), Some(percent));
         view.update(app, |view, cx| {
             view.apply_ui_scale_percent(percent, window, cx);
         });
-        crate::app::set_app_ui_scale_percent(app, percent);
     });
 }
 
+mod commit_file_selection;
 mod comparison;
 mod conflict;
 mod control_interaction;
 mod diff_marker_refresh;
 mod diff_stage_gutter;
+mod error_details;
 mod file_diff;
 mod file_disk_notice;
 mod file_editor;
 mod file_preview;
 mod file_status;
+mod folder_menus;
 mod large_file_diff;
 mod markdown;
 mod shortcuts;
 mod status_staging;
+mod text_encoding;

@@ -1,3 +1,4 @@
+use gitcomet_core::error::{ErrorKind, GitFailureId};
 #[cfg(unix)]
 use gitcomet_core::process::{
     GitExecutablePreference, current_git_executable_preference, install_git_executable_path,
@@ -1433,6 +1434,207 @@ fn pull_local_branch_with_pruning_does_not_treat_dot_as_a_named_remote() {
     assert!(repo.join("dev.txt").exists(), "expected dev to be merged");
 }
 
+/// `main` and `dev` both rewrite base.txt, so integrating one into the other conflicts.
+fn init_conflicting_local_branches(repo: &Path) {
+    init_repo_with_user(repo);
+    run_git(repo, &["branch", "-m", "main"]);
+    fs::write(repo.join("base.txt"), "base\n").expect("write base file");
+    run_git(repo, &["add", "base.txt"]);
+    run_git(repo, &["commit", "-m", "base"]);
+    run_git(repo, &["checkout", "-b", "dev"]);
+    fs::write(repo.join("base.txt"), "dev\n").expect("write dev change");
+    run_git(repo, &["commit", "-am", "dev"]);
+    run_git(repo, &["checkout", "main"]);
+    fs::write(repo.join("base.txt"), "main\n").expect("write main change");
+    run_git(repo, &["commit", "-am", "main"]);
+}
+
+fn stopped_at_conflicts_detail(error: &gitcomet_core::error::Error) -> String {
+    match error.kind() {
+        ErrorKind::Git(failure) if failure.id() == GitFailureId::StoppedAtConflicts => {
+            failure.detail().expect("conflict detail").to_string()
+        }
+        other => panic!("expected a stopped-at-conflicts failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn pull_local_branch_stopped_at_conflicts_says_so() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path();
+    init_conflicting_local_branches(repo);
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).expect("open repository");
+    let error = opened
+        .pull_branch_with_output_prune(".", "dev", true)
+        .expect_err("conflicting pull");
+
+    let detail = stopped_at_conflicts_detail(&error);
+    assert!(
+        detail.starts_with(
+            "Merge conflict in base.txt. Resolve it, then commit, or abort the merge."
+        ),
+        "{detail}"
+    );
+    // Git's own output follows, conflict lines included.
+    assert!(detail.contains("CONFLICT (content)"), "{detail}");
+    assert!(repo.join(".git/MERGE_HEAD").exists());
+
+    // With the merge in progress git refuses to pull; that is a plain failure.
+    let error = opened
+        .pull_branch_with_output_prune(".", "dev", true)
+        .expect_err("pull during a merge");
+    assert!(
+        matches!(error.kind(), ErrorKind::Git(failure) if failure.id() == GitFailureId::CommandFailed),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn pull_rebase_stopped_at_conflicts_says_so() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path();
+    init_conflicting_local_branches(repo);
+    run_git(repo, &["branch", "--set-upstream-to=dev", "main"]);
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).expect("open repository");
+    let error = opened
+        .pull_with_output(PullMode::Rebase)
+        .expect_err("conflicting rebase pull");
+
+    let detail = stopped_at_conflicts_detail(&error);
+    assert!(
+        detail.starts_with(
+            "Rebase stopped at a conflict in base.txt. Resolve it and continue the rebase, or abort it."
+        ),
+        "{detail}"
+    );
+}
+
+#[test]
+fn pull_stopped_at_conflicts_keeps_a_local_branch_upstream() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let origin = dir.path().join("origin");
+    let clone = dir.path().join("clone");
+    fs::create_dir(&origin).expect("create origin");
+    init_repo_with_user(&origin);
+    run_git(&origin, &["branch", "-m", "main"]);
+    fs::write(origin.join("base.txt"), "base\n").expect("write base");
+    run_git(&origin, &["add", "base.txt"]);
+    run_git(&origin, &["commit", "-m", "base"]);
+    run_git(&origin, &["checkout", "-b", "feature"]);
+    fs::write(origin.join("base.txt"), "origin\n").expect("write origin change");
+    run_git(&origin, &["commit", "-am", "origin feature"]);
+    run_git(&origin, &["checkout", "main"]);
+
+    let origin_url = origin.to_string_lossy().to_string();
+    run_git(dir.path(), &["clone", "-q", &origin_url, "clone"]);
+    run_git(&clone, &["config", "user.email", "you@example.com"]);
+    run_git(&clone, &["config", "user.name", "You"]);
+    run_git(&clone, &["config", "commit.gpgsign", "false"]);
+    // `feature` tracks the local `main`, which the backend does not treat as
+    // a configured upstream, so the pull goes to `origin feature`.
+    run_git(
+        &clone,
+        &["checkout", "-q", "-b", "feature", "--track", "main"],
+    );
+    fs::write(clone.join("base.txt"), "local\n").expect("write local change");
+    run_git(&clone, &["commit", "-am", "local feature"]);
+
+    let backend = GixBackend;
+    let opened = backend.open(&clone).expect("open repository");
+    let error = opened
+        .pull_with_output(PullMode::Default)
+        .expect_err("conflicting pull");
+    stopped_at_conflicts_detail(&error);
+    run_git(&clone, &["merge", "--abort"]);
+
+    assert_eq!(
+        run_git_capture(&clone, &["config", "branch.feature.remote"]).trim(),
+        ".",
+        "a pull that stopped at conflicts must not rewrite the branch's tracking"
+    );
+}
+
+#[test]
+fn pull_after_a_committed_cherry_pick_step_still_reports_conflicts() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path();
+    init_conflicting_local_branches(repo);
+    // A two-commit cherry-pick that stops at its first, conflicting, step.
+    run_git(repo, &["checkout", "-q", "-b", "side", "main~1"]);
+    fs::write(repo.join("base.txt"), "side\n").expect("write side change");
+    run_git(repo, &["commit", "-am", "side A"]);
+    fs::write(repo.join("extra.txt"), "x\n").expect("write extra");
+    run_git(repo, &["add", "extra.txt"]);
+    run_git(repo, &["commit", "-m", "side B"]);
+    run_git(repo, &["checkout", "-q", "main"]);
+    assert!(!run_git_status(repo, &["cherry-pick", "side~1", "side"]).success());
+    fs::write(repo.join("base.txt"), "resolved\n").expect("resolve");
+    run_git(repo, &["add", "base.txt"]);
+    // Committing the step clears CHERRY_PICK_HEAD but keeps .git/sequencer.
+    run_git(repo, &["commit", "--no-edit"]);
+    assert!(repo.join(".git/sequencer").exists());
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).expect("open repository");
+    let error = opened
+        .pull_branch_with_output_prune(".", "dev", false)
+        .expect_err("conflicting pull");
+    stopped_at_conflicts_detail(&error);
+}
+
+#[test]
+fn pull_with_rerere_resolved_conflicts_reports_the_merge_in_progress() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path();
+    init_conflicting_local_branches(repo);
+    run_git(repo, &["config", "rerere.enabled", "true"]);
+    run_git(repo, &["config", "rerere.autoUpdate", "true"]);
+    // Record a resolution, then undo the merge so the conflict recurs.
+    assert!(!run_git_status(repo, &["merge", "dev"]).success());
+    fs::write(repo.join("base.txt"), "resolved\n").expect("resolve");
+    run_git(repo, &["add", "base.txt"]);
+    run_git(repo, &["commit", "--no-edit"]);
+    run_git(repo, &["reset", "-q", "--hard", "HEAD~1"]);
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).expect("open repository");
+    let error = opened
+        .pull_branch_with_output_prune(".", "dev", false)
+        .expect_err("pull stopped by rerere");
+    let detail = stopped_at_conflicts_detail(&error);
+    assert!(detail.contains("base.txt"), "{detail}");
+    assert!(repo.join(".git/MERGE_HEAD").exists());
+}
+
+#[test]
+fn merge_ref_stopped_at_conflicts_says_so() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path();
+    init_conflicting_local_branches(repo);
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).expect("open repository");
+    let error = opened
+        .merge_ref_with_output("dev")
+        .expect_err("conflicting merge");
+
+    let detail = stopped_at_conflicts_detail(&error);
+    assert!(
+        detail.starts_with("Merge conflict in base.txt."),
+        "{detail}"
+    );
+}
+
 #[test]
 fn pull_branch_with_output_merges_named_remote_branch() {
     let _guard = remote_management_test_lock();
@@ -2366,4 +2568,181 @@ fn delete_remote_branch_succeeds_when_the_upstream_cleanup_cannot_write_config()
         !ref_exists(&work_repo, "refs/remotes/origin/feature"),
         "the remote branch deletion itself must still take effect"
     );
+}
+
+/// A git-annex special remote is a `[remote]` section with `annex-*` keys and
+/// no URL. `git annex init` can auto-enable one without setting
+/// `skipFetchAll`, and `git fetch --all` then fails on it ("'name' does not
+/// appear to be a git repository"), taking every real remote down with it.
+#[test]
+fn fetch_all_skips_git_annex_special_remotes_without_a_url() {
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let (remote_repo, work_repo) = init_work_repo_with_remote(dir.path(), "origin");
+    for (key, value) in [
+        ("remote.computecanada-public.annex-httpalso", "true"),
+        (
+            "remote.computecanada-public.annex-uuid",
+            "bedc0087-3c8e-4519-a212-17ff40f8b29b",
+        ),
+    ] {
+        run_git(&work_repo, &["config", key, value]);
+    }
+
+    // A new commit on the real remote proves the fetch still reached it.
+    let other = dir.path().join("other");
+    run_git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            git_remote_url(&remote_repo).as_str(),
+            other.to_str().unwrap(),
+        ],
+    );
+    configure_repo_with_user(&other);
+    fs::write(other.join("new.txt"), "new\n").expect("write new file");
+    run_git(&other, &["add", "new.txt"]);
+    run_git(
+        &other,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "new"],
+    );
+    run_git(&other, &["push", "-q", "origin", "main"]);
+    let new_commit = run_git_capture(&other, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+
+    let opened = GixBackend.open(&work_repo).expect("open work repo");
+    for prune in [false, true] {
+        let output = opened
+            .fetch_all_with_output_prune(prune)
+            .unwrap_or_else(|e| {
+                panic!("fetch all (prune={prune}) must skip the special remote: {e}")
+            });
+        assert!(
+            output.command.starts_with("git fetch --multiple "),
+            "{}",
+            output.command
+        );
+    }
+    assert_eq!(
+        run_git_capture(&work_repo, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+        new_commit
+    );
+    assert_eq!(
+        run_git_capture(
+            &work_repo,
+            &["config", "--get", "remote.computecanada-public.annex-uuid"]
+        )
+        .trim(),
+        "bedc0087-3c8e-4519-a212-17ff40f8b29b",
+        "the user's remote configuration is left untouched"
+    );
+}
+
+#[test]
+fn review_fetch_all_respects_order_of_skip_aliases_for_annex_special_remote() {
+    let _guard = remote_management_test_lock();
+    for keys in [
+        ["skipDefaultUpdate", "skipFetchAll"],
+        ["skipFetchAll", "skipDefaultUpdate"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, work_repo) = init_work_repo_with_remote(dir.path(), "origin");
+        run_git(
+            &work_repo,
+            &["config", "remote.backup.annex-uuid", "special-backup"],
+        );
+        run_git(
+            &work_repo,
+            &["config", &format!("remote.backup.{}", keys[0]), "true"],
+        );
+        run_git(
+            &work_repo,
+            &["config", &format!("remote.backup.{}", keys[1]), "false"],
+        );
+        assert!(
+            !run_git_status(&work_repo, &["fetch", "--all"]).success(),
+            "Git uses the last alias, so it attempts the URL-less remote"
+        );
+        let opened = GixBackend.open(&work_repo).unwrap();
+        for prune in [false, true] {
+            let output = opened.fetch_all_with_output_prune(prune).expect("Fetch All must exclude the special remote even when the last skip setting is false");
+            assert!(
+                output.command.starts_with("git fetch --multiple "),
+                "{}",
+                output.command
+            );
+        }
+    }
+}
+
+#[test]
+fn fetch_streams_progress_but_returns_output_without_meters() {
+    use gitcomet_core::git_operation::{self, GitOperationContext, GitOperationEvent};
+    use std::sync::Arc;
+
+    let _guard = remote_management_test_lock();
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let root = dir.path();
+    let remote_repo = root.join("remote.git");
+    let work_repo = root.join("work");
+    let writer_repo = root.join("writer");
+    fs::create_dir_all(&remote_repo).expect("create remote repo dir");
+    fs::create_dir_all(&work_repo).expect("create work repo dir");
+    run_git(&remote_repo, &["init", "--bare"]);
+    init_repo_with_user(&work_repo);
+    let remote_str = git_remote_url(&remote_repo);
+    run_git(&work_repo, &["remote", "add", "origin", &remote_str]);
+    fs::write(work_repo.join("file.txt"), "base\n").expect("write base file");
+    run_git(&work_repo, &["add", "file.txt"]);
+    run_git(
+        &work_repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+    );
+    run_git(&work_repo, &["push", "-u", "origin", "HEAD"]);
+
+    run_git(root, &["clone", "--quiet", &remote_str, "writer"]);
+    configure_repo_with_user(&writer_repo);
+    for index in 0..3 {
+        fs::write(
+            writer_repo.join(format!("new-{index}.txt")),
+            format!("{index}\n"),
+        )
+        .expect("write new file");
+    }
+    run_git(&writer_repo, &["add", "."]);
+    run_git(
+        &writer_repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "new"],
+    );
+    run_git(&writer_repo, &["push", "origin", "HEAD"]);
+
+    let streamed = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&streamed);
+    let context = GitOperationContext::new("fetch", move |_, event| {
+        if let GitOperationEvent::Output { chunks } = event {
+            let mut streamed = sink.lock().unwrap();
+            for chunk in chunks {
+                streamed.push_str(&chunk.text);
+            }
+        }
+    });
+    let opened = GixBackend.open(&work_repo).expect("open work repo");
+    let output = {
+        let _scope = git_operation::attach(&context);
+        opened
+            .fetch_all_with_output_prune(false)
+            .expect("fetch all")
+    };
+
+    let streamed = streamed.lock().unwrap().clone();
+    assert!(
+        gitcomet_core::git_progress::latest_progress(&streamed).is_some(),
+        "the live output carries git's meters: {streamed:?}"
+    );
+    assert!(!output.stderr.contains('\r'), "{:?}", output.stderr);
+    assert!(!output.stderr.contains("objects:"), "{:?}", output.stderr);
+    assert!(!output.stderr.contains("Total "), "{:?}", output.stderr);
+    assert!(output.stderr.contains("origin/"), "{:?}", output.stderr);
 }

@@ -244,10 +244,15 @@ pub(super) fn spawn_alacritty_terminal(
     let env: Vec<(String, String)> = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
-        ("TERM_PROGRAM".to_string(), "GitComet".to_string()),
+        (
+            "TERM_PROGRAM".to_string(),
+            gitcomet_core::identity::current()
+                .display_name()
+                .to_string(),
+        ),
         (
             "TERM_PROGRAM_VERSION".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
+            gitcomet_core::identity::current().version().to_string(),
         ),
     ];
 
@@ -1766,6 +1771,7 @@ mod tests {
             font_size: px(14.0).into(),
             font_style: FontStyle::Normal,
             font_weight: FontWeight::NORMAL,
+            font_width: Default::default(),
             line_height: px(20.0).into(),
             background_color: Some(gpui::Hsla::default()),
             white_space: WhiteSpace::Normal,
@@ -2374,10 +2380,7 @@ mod tests {
             mode,
         )
         .unwrap();
-        assert_eq!(
-            report,
-            vec![0x1b, b'[', b'M', 32 + 0, 32 + 1 + 0, 32 + 1 + 0]
-        );
+        assert_eq!(report, vec![0x1b, b'[', b'M', 32, (32 + 1), (32 + 1)]);
     }
 
     #[test]
@@ -2392,10 +2395,7 @@ mod tests {
             mode,
         )
         .unwrap();
-        assert_eq!(
-            report,
-            vec![0x1b, b'[', b'M', 32 + 3, 32 + 1 + 0, 32 + 1 + 0]
-        );
+        assert_eq!(report, vec![0x1b, b'[', b'M', 32 + 3, (32 + 1), (32 + 1)]);
     }
 
     #[test]

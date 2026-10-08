@@ -511,6 +511,36 @@ pub(in crate::view) fn history_text_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// Cached once with row presentation, including Unicode case expansion.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::view) struct HistoryAuthorVm {
+    name: HistoryTextVm,
+    pub(in crate::view) initials: HistoryTextVm,
+}
+
+impl HistoryAuthorVm {
+    pub(in crate::view) fn new(name: SharedString) -> Self {
+        let initials = HistoryTextVm::new(components::author_initials(name.as_ref()).into());
+        Self {
+            name: HistoryTextVm::new(name),
+            initials,
+        }
+    }
+}
+
+impl std::ops::Deref for HistoryAuthorVm {
+    type Target = HistoryTextVm;
+    fn deref(&self) -> &Self::Target {
+        &self.name
+    }
+}
+
+impl AsRef<str> for HistoryAuthorVm {
+    fn as_ref(&self) -> &str {
+        self.name.as_ref()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::view) struct HistoryWhenVm {
     time: SystemTime,
@@ -555,7 +585,8 @@ impl HistoryWhenVm {
     }
 }
 
-const HISTORY_SHORT_SHA_LEN: usize = 8;
+/// Characters of a commit id the history list shows.
+pub(in crate::view) const HISTORY_SHORT_SHA_LEN: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(in crate::view) struct HistoryShortShaVm {
@@ -600,7 +631,7 @@ impl HistoryShortShaVm {
 
 #[derive(Clone, Debug)]
 pub(super) struct HistoryBaseRowVm {
-    pub(super) author: HistoryTextVm,
+    pub(super) author: HistoryAuthorVm,
     pub(super) summary: HistoryTextVm,
     pub(super) when: HistoryWhenVm,
     pub(super) short_sha: HistoryShortShaVm,
@@ -676,11 +707,7 @@ type HistoryRefItemsByTarget<'a> = FxHashMap<&'a str, HistoryRefItems>;
 
 #[inline]
 pub(in crate::view) fn history_commit_is_probable_stash_tip(commit: &Commit) -> bool {
-    if !(2..=3).contains(&commit.parent_ids.len()) {
-        return false;
-    }
-    let summary: &str = &commit.summary;
-    (summary.starts_with("WIP on ") || summary.starts_with("On ")) && summary.contains(": ")
+    gitcomet_core::history_find::is_probable_stash_summary(commit.parent_ids.len(), &commit.summary)
 }
 
 pub(in crate::view) fn analyze_history_stashes<'a>(
@@ -2453,5 +2480,28 @@ mod tests {
         let fingerprint_after = BranchSidebarFingerprint::from_repo(&repo);
 
         assert_ne!(fingerprint_before, fingerprint_after);
+    }
+}
+
+#[cfg(test)]
+mod author_initials_tests {
+    use super::*;
+    #[test]
+    fn history_author_initials_are_cached_with_their_hash() {
+        for (name, initials) in [
+            ("", "?"),
+            ("Élodie 李", "É李"),
+            ("ßeta", "SSE"),
+            ("Ada Lovelace", "AL"),
+        ] {
+            let author = HistoryAuthorVm::new(name.into());
+            assert_eq!(author.initials.as_ref(), initials);
+            assert_eq!(author.initials.text_hash(), history_text_hash(initials));
+            let clone = author.clone();
+            // Short SharedStrings are inline: cloning their cached value need
+            // not preserve its address and still performs no recomputation.
+            assert_eq!(clone.initials.shared(), author.initials.shared());
+            assert_eq!(clone.initials.text_hash(), author.initials.text_hash());
+        }
     }
 }

@@ -17,6 +17,7 @@ use gitcomet_core::tag_push::TagPushMode;
 
 pub(crate) struct CommandEntry {
     pub(crate) id: &'static str,
+    /// Read through [`CommandEntry::label`], which names the product for `{app}`.
     pub(crate) label: &'static str,
     pub(crate) shortcut: Shortcut,
     pub(crate) category: &'static str,
@@ -27,6 +28,17 @@ pub(crate) struct CommandEntry {
     /// What the command needs beyond a repository. Unlike `requires_repo`,
     /// which hides the command, an unmet need leaves it listed but disabled.
     pub(crate) needs: Needs,
+}
+
+impl CommandEntry {
+    /// The label as shown and matched, naming the product for `{app}`.
+    pub(crate) fn label(&self) -> std::borrow::Cow<'static, str> {
+        if self.label.contains("{app}") {
+            std::borrow::Cow::Owned(self.label.replace("{app}", crate::view::product_name()))
+        } else {
+            std::borrow::Cow::Borrowed(self.label)
+        }
+    }
 }
 
 /// A precondition a command can be listed without. The palette shows such a
@@ -45,6 +57,16 @@ pub(crate) enum Needs {
     RemoteWebPage,
     MacOs,
     Linux,
+    /// Git can run `git lfs`.
+    GitLfsTool,
+    /// Git can run `git lfs` and the repository uses it.
+    GitLfsRepo,
+    /// Git can run `git annex` and the repository uses git-annex.
+    GitAnnexRepo,
+    /// As `GitAnnexRepo`, and this clone has run `git annex init`.
+    GitAnnexInitialized,
+    /// As `GitAnnexInitialized`, on an adjusted branch.
+    GitAnnexAdjusted,
 }
 
 /// The app state commands are enabled against, taken from the root view.
@@ -62,7 +84,18 @@ pub(crate) struct PaletteContext {
     pub(crate) push_with_tags_unavailable: [Option<&'static str>; 2],
     /// Why no remote can be opened in a browser, from `remote_web_request`.
     pub(crate) remote_web_page_unavailable: Option<&'static str>,
+    /// Git cannot run `git lfs`.
+    pub(crate) git_lfs_missing: bool,
+    /// The active repository tracks or stores Git LFS files.
+    pub(crate) repo_uses_lfs: bool,
+    /// Git cannot run `git annex`.
+    pub(crate) git_annex_missing: bool,
+    pub(crate) repo_uses_annex: bool,
+    pub(crate) annex_initialized: bool,
+    pub(crate) annex_adjusted: bool,
 }
+
+const GIT_LFS_MISSING: &str = "Install Git LFS where Git can find it first";
 
 /// Why a command with `needs` cannot run under `ctx`, or `None` when it can.
 pub(crate) fn unavailable_reason(needs: Needs, ctx: &PaletteContext) -> Option<&'static str> {
@@ -102,6 +135,27 @@ pub(crate) fn unavailable_reason(needs: Needs, ctx: &PaletteContext) -> Option<&
         Needs::MacOs => (!cfg!(target_os = "macos")).then_some("Only available on macOS"),
         Needs::Linux => (!cfg!(any(target_os = "linux", target_os = "freebsd")))
             .then_some("Only available on Linux"),
+        Needs::GitLfsTool => ctx.git_lfs_missing.then_some(GIT_LFS_MISSING),
+        Needs::GitAnnexRepo | Needs::GitAnnexInitialized | Needs::GitAnnexAdjusted => {
+            if ctx.git_annex_missing {
+                Some("Install git-annex where Git can find it first")
+            } else if !ctx.repo_uses_annex {
+                Some("This repository does not use git-annex")
+            } else if needs != Needs::GitAnnexRepo && !ctx.annex_initialized {
+                Some("Initialize git-annex in this clone first")
+            } else if needs == Needs::GitAnnexAdjusted && !ctx.annex_adjusted {
+                Some("Only available on a git-annex adjusted branch")
+            } else {
+                None
+            }
+        }
+        Needs::GitLfsRepo => {
+            if ctx.git_lfs_missing {
+                Some(GIT_LFS_MISSING)
+            } else {
+                (!ctx.repo_uses_lfs).then_some("This repository does not use Git LFS")
+            }
+        }
     }
 }
 
@@ -353,6 +407,15 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         needs: Needs::Nothing,
     },
     CommandEntry {
+        id: "fetch-ref",
+        label: "Fetch ref…",
+        shortcut: Shortcut::None,
+        category: "Repository",
+        keywords: "fetch refspec branch tag change",
+        requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
         id: "fetch-all",
         label: "Fetch All",
         shortcut: Shortcut::None,
@@ -499,7 +562,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         label: "Search in Current View",
         shortcut: Shortcut::Secondary("F"),
         category: "Navigation",
-        keywords: "",
+        keywords: "find commit history sha diff file",
         requires_repo: true,
         needs: Needs::Nothing,
     },
@@ -549,6 +612,15 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         needs: Needs::Nothing,
     },
     CommandEntry {
+        id: "open-workspace",
+        label: "Open Workspace",
+        shortcut: Shortcut::Secondary("Shift+R"),
+        category: "Window",
+        keywords: "workspace switch window restore saved",
+        requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
         id: "open-settings",
         label: "Open Settings",
         shortcut: Shortcut::Secondary(","),
@@ -559,7 +631,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     },
     CommandEntry {
         id: "quit",
-        label: "Quit GitComet",
+        label: "Quit {app}",
         shortcut: Shortcut::Secondary("Q"),
         category: "Window",
         keywords: "",
@@ -577,7 +649,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     },
     CommandEntry {
         id: "hide",
-        label: "Hide GitComet",
+        label: "Hide {app}",
         shortcut: Shortcut::MacOs("Cmd+H"),
         category: "Window",
         keywords: "hide application",
@@ -745,6 +817,159 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     // TODO: "remove-submodule"       - Remove Submodule
     // TODO: "remove-worktree"        - Remove Worktree
     // TODO: "discard-all"        - Discard All Changes (Working Copy)
+    CommandEntry {
+        id: "lfs-download-all",
+        label: "Download All LFS Content",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs pull large files smudge",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-fetch-all",
+        label: "Fetch LFS Objects for All Refs",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs fetch large files",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-prune",
+        label: "Prune Old LFS Objects",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs prune cleanup disk space",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-fsck",
+        label: "Check LFS Objects",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs fsck verify integrity",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-refresh-locks",
+        label: "Refresh LFS Locks",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs locks lockable",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-install",
+        label: "Enable Git LFS in This Repository",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs install setup hooks filters",
+        requires_repo: true,
+        needs: Needs::GitLfsTool,
+    },
+    CommandEntry {
+        id: "annex-sync",
+        label: "Sync with git-annex Remotes",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex sync pull push remotes",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-pull",
+        label: "Pull with git-annex",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex pull fetch merge",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-push",
+        label: "Push with git-annex",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex push upload",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-get-all",
+        label: "Get All Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex get download content",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-fsck",
+        label: "Check Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex fsck verify integrity",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-adjust-unlocked",
+        label: "Switch to Adjusted Branch (Unlocked)",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex adjust unlock editable",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-leave-adjusted",
+        label: "Leave git-annex Adjusted Branch",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex adjusted base branch",
+        requires_repo: true,
+        needs: Needs::GitAnnexAdjusted,
+    },
+    CommandEntry {
+        id: "annex-unused",
+        label: "Find Unused Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex unused dropunused clean old versions disk space",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-webapp",
+        label: "Open git-annex Webapp",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex webapp assistant browser",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-restage",
+        label: "Refresh Annexed Files Left Stale",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex restage refresh index modified interrupted",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-init",
+        label: "Initialize git-annex in This Clone",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex init setup",
+        requires_repo: true,
+        needs: Needs::GitAnnexRepo,
+    },
 ];
 
 /// A palette entry that survived filtering, plus the label byte positions the
@@ -768,9 +993,20 @@ impl std::ops::Deref for CommandMatch {
 /// two raw scores are.
 const KEYWORD_MATCH_PENALTY: i32 = 100_000;
 
+#[cfg(test)]
 pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<CommandMatch> {
+    filtered_commands_with(&[], has_active_repo, query)
+}
+
+/// The built-in commands followed by `extensions`, filtered and ranked.
+pub(crate) fn filtered_commands_with(
+    extensions: &'static [CommandEntry],
+    has_active_repo: bool,
+    query: &str,
+) -> Vec<CommandMatch> {
     let available = COMMANDS
         .iter()
+        .chain(extensions)
         .filter(|cmd| !cmd.requires_repo || has_active_repo);
 
     if query.is_empty() {
@@ -785,7 +1021,7 @@ pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<Comma
     let mut out: Vec<(i32, usize, CommandMatch)> = available
         .enumerate()
         .filter_map(|(order, entry)| {
-            fuzzy_subsequence_match(entry.label, query)
+            fuzzy_subsequence_match(&entry.label(), query)
                 .map(|(score, positions)| (score, order, CommandMatch { entry, positions }))
                 .or_else(|| {
                     // Keyword hits carry no highlight positions and sort behind
@@ -806,7 +1042,7 @@ pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<Comma
 
     out.sort_by(|a, b| {
         a.0.cmp(&b.0)
-            .then_with(|| a.2.label.len().cmp(&b.2.label.len()))
+            .then_with(|| a.2.label().len().cmp(&b.2.label().len()))
             .then_with(|| a.1.cmp(&b.1))
     });
     out.into_iter().map(|(_, _, m)| m).collect()
@@ -847,6 +1083,8 @@ pub(crate) struct CommandPaletteView {
     pub(crate) restore_focus: Option<FocusHandle>,
     fallback_focus: Option<FocusHandle>,
     root_view: WeakEntity<GitCometView>,
+    /// Extension commands, fixed when the window is built.
+    extension_commands: &'static [CommandEntry],
     theme: AppTheme,
     context: PaletteContext,
     open: bool,
@@ -889,6 +1127,7 @@ impl CommandPaletteView {
             restore_focus: None,
             fallback_focus: None,
             root_view,
+            extension_commands: super::extension_host::palette_entries(cx),
             theme,
             context: PaletteContext {
                 has_active_repo,
@@ -982,7 +1221,11 @@ impl CommandPaletteView {
     }
 
     fn rebuild_cached_results(&mut self) {
-        self.matches = filtered_commands(self.context.has_active_repo, self.query.as_ref());
+        self.matches = filtered_commands_with(
+            self.extension_commands,
+            self.context.has_active_repo,
+            self.query.as_ref(),
+        );
         self.rows.clear();
         self.command_row_indices.clear();
 
@@ -1248,7 +1491,7 @@ impl CommandPaletteView {
                             .flex_1()
                             .min_w(px(0.0))
                             .child(self.render_label(
-                                command.label,
+                                &command.label(),
                                 &command.positions,
                                 label_color,
                                 cx,
@@ -1456,6 +1699,77 @@ fn fuzzy_subsequence_match(label: &str, query: &str) -> Option<(i32, Vec<usize>)
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn git_annex_commands_explain_each_missing_precondition() {
+        let base = PaletteContext {
+            has_active_repo: true,
+            repo_uses_annex: true,
+            annex_initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(unavailable_reason(Needs::GitAnnexInitialized, &base), None);
+        assert_eq!(
+            unavailable_reason(Needs::GitAnnexAdjusted, &base),
+            Some("Only available on a git-annex adjusted branch")
+        );
+        let uninitialized = PaletteContext {
+            annex_initialized: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            unavailable_reason(Needs::GitAnnexRepo, &uninitialized),
+            None
+        );
+        assert!(unavailable_reason(Needs::GitAnnexInitialized, &uninitialized).is_some());
+        let missing = PaletteContext {
+            git_annex_missing: true,
+            ..base
+        };
+        assert!(
+            unavailable_reason(Needs::GitAnnexRepo, &missing)
+                .unwrap()
+                .contains("Install git-annex")
+        );
+    }
+
+    #[test]
+    fn annex_restage_needs_an_initialized_annex() {
+        let entry = COMMANDS
+            .iter()
+            .find(|entry| entry.id == "annex-restage")
+            .expect("palette lists the restage command");
+        assert!(matches!(entry.needs, Needs::GitAnnexInitialized));
+        assert!(entry.requires_repo);
+    }
+
+    #[test]
+    fn git_lfs_commands_explain_missing_tool_and_unused_repo() {
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            git_lfs_missing: true,
+            ..Default::default()
+        };
+        assert!(
+            unavailable_reason(Needs::GitLfsTool, &ctx)
+                .unwrap()
+                .contains("Install Git LFS")
+        );
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            ..Default::default()
+        };
+        assert_eq!(unavailable_reason(Needs::GitLfsTool, &ctx), None);
+        assert_eq!(
+            unavailable_reason(Needs::GitLfsRepo, &ctx),
+            Some("This repository does not use Git LFS")
+        );
+        let ctx = PaletteContext {
+            repo_uses_lfs: true,
+            ..ctx
+        };
+        assert_eq!(unavailable_reason(Needs::GitLfsRepo, &ctx), None);
+    }
     use super::*;
 
     #[test]

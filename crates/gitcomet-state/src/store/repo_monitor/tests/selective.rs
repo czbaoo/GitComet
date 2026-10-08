@@ -242,7 +242,12 @@ fn watch_plan_prunes_ignored_and_git_cache_trees() {
         );
     }
     assert!(plan.dirs.contains(&root.join("src/nested")));
-    assert!(plan.dirs.contains(&root.join(".git/refs/heads")));
+    let ref_dir = if root.join(".git/reftable").is_dir() {
+        ".git/reftable"
+    } else {
+        ".git/refs/heads"
+    };
+    assert!(plan.dirs.contains(&root.join(ref_dir)));
     assert!(plan.policy.relevant(&root.join(".git/HEAD")));
 }
 
@@ -831,7 +836,10 @@ impl RunningMonitor {
         for message in self.rx.try_iter() {
             match message {
                 Msg::RepoExternallyChanged { change: next, .. } => {
-                    change = Some(merge_change(change.unwrap_or(next), next));
+                    change = Some(match change.take() {
+                        Some(previous) => merge_change(previous, next),
+                        None => next,
+                    });
                 }
                 other => panic!("unexpected message: {other:?}"),
             }
