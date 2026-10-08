@@ -463,6 +463,7 @@ pub(super) fn fetch_branch(
         repo_id,
         remote,
         branch,
+        auth: None,
     }]
 }
 

@@ -932,11 +932,6 @@ pub enum Msg {
         context: SafePushAfterCommitContext,
     },
     Fetch(super::FetchMsg),
-    FetchBranch {
-        repo_id: RepoId,
-        remote: String,
-        branch: String,
-    },
     PruneMergedBranches {
         repo_id: RepoId,
     },

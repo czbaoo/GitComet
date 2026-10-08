@@ -210,11 +210,13 @@ fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Opti
                 refspecs,
             })
         }
-        RepoCommandKind::FetchBranch { remote, branch } => Msg::FetchBranch {
-            repo_id,
-            remote,
-            branch,
-        },
+        RepoCommandKind::FetchBranch { remote, branch } => {
+            Msg::Fetch(crate::msg::FetchMsg::Branch {
+                repo_id,
+                remote,
+                branch,
+            })
+        }
         RepoCommandKind::PruneMergedBranches => Msg::PruneMergedBranches { repo_id },
         RepoCommandKind::PruneLocalTags => Msg::PruneLocalTags { repo_id },
         RepoCommandKind::RunMaintenance => Msg::StartRepoMaintenance { repo_id },

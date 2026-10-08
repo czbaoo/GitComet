@@ -1555,7 +1555,10 @@ pub(super) fn schedule_effect(
             repo_id,
             remote,
             branch,
-        } => repo_commands::schedule_fetch_branch(executor, repos, msg_tx, repo_id, remote, branch),
+            auth,
+        } => repo_commands::schedule_fetch_branch(
+            executor, repos, msg_tx, repo_id, remote, branch, auth,
+        ),
         Effect::FetchRefspecs {
             repo_id,
             remote,

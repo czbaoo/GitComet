@@ -30,6 +30,7 @@ macro_rules! match_git_auth {
             | Effect::SafePushAfterCommit { auth: $auth, .. }
             | Effect::FetchAll { auth: $auth, .. }
             | Effect::FetchRefspecs { auth: $auth, .. }
+            | Effect::FetchBranch { auth: $auth, .. }
             | Effect::Pull { auth: $auth, .. }
             | Effect::PullBranch { auth: $auth, .. }
             | Effect::PushWithTags { auth: $auth, .. }
@@ -594,6 +595,7 @@ pub enum Effect {
         repo_id: RepoId,
         remote: String,
         branch: String,
+        auth: Option<StagedGitAuth>,
     },
     FetchRefspecs {
         repo_id: RepoId,

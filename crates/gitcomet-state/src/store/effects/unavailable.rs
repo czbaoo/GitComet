@@ -940,6 +940,7 @@ pub(super) fn send_unavailable_git_effect_result(
             repo_id,
             remote,
             branch,
+            auth: _,
         } => send(Msg::Internal(
             crate::msg::InternalMsg::RepoCommandFinished {
                 repo_id,

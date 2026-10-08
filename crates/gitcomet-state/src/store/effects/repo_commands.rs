@@ -1052,6 +1052,7 @@ pub(super) fn schedule_fetch_branch(
     repo_id: RepoId,
     remote: String,
     branch: String,
+    auth: Option<StagedGitAuth>,
 ) {
     schedule_repo_command(
         executor,
@@ -1062,7 +1063,7 @@ pub(super) fn schedule_fetch_branch(
             remote: remote.clone(),
             branch: branch.clone(),
         },
-        move |repo| repo.fetch_branch_with_output(&remote, &branch),
+        move |repo| run_with_git_auth(auth, || repo.fetch_branch_with_output(&remote, &branch)),
     );
 }
 

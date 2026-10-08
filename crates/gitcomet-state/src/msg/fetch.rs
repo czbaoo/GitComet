@@ -12,4 +12,11 @@ pub enum FetchMsg {
         remote: String,
         refspecs: Vec<String>,
     },
+    /// Fetch a single branch from a remote, mirroring GitComet's CLI fetch
+    /// (`git fetch --prune --tags <remote> <branch>:<branch>`).
+    Branch {
+        repo_id: RepoId,
+        remote: String,
+        branch: String,
+    },
 }

@@ -321,7 +321,6 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::Commit { .. }
             | Msg::CommitAmend { .. }
             | Msg::SafePushAfterCommit { .. }
-            | Msg::FetchBranch { .. }
             | Msg::Fetch(crate::msg::FetchMsg::All { .. })
             | Msg::Fetch(crate::msg::FetchMsg::Refspecs { .. })
             | Msg::PruneMergedBranches { .. }
@@ -1570,11 +1569,11 @@ fn reduce_inner(
             remote,
             refspecs,
         }) => actions_emit_effects::fetch_refspecs(repos, state, repo_id, remote, refspecs),
-        Msg::FetchBranch {
+        Msg::Fetch(crate::msg::FetchMsg::Branch {
             repo_id,
             remote,
             branch,
-        } => actions_emit_effects::fetch_branch(repos, state, repo_id, remote, branch),
+        }) => actions_emit_effects::fetch_branch(repos, state, repo_id, remote, branch),
         Msg::PruneMergedBranches { repo_id } => {
             actions_emit_effects::prune_merged_branches(repos, state, repo_id)
         }

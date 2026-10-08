@@ -1797,11 +1797,12 @@ impl PopoverHost {
                 remote,
                 branch,
             } => {
-                self.store.dispatch(Msg::FetchBranch {
-                    repo_id,
-                    remote,
-                    branch,
-                });
+                self.store
+                    .dispatch(Msg::Fetch(gitcomet_state::msg::FetchMsg::Branch {
+                        repo_id,
+                        remote,
+                        branch,
+                    }));
             }
             ContextMenuAction::PruneMergedBranches { repo_id } => {
                 self.store.dispatch(Msg::PruneMergedBranches { repo_id });
