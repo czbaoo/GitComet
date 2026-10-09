@@ -69,6 +69,14 @@ pub(super) fn command_is_known_hook_free(cmd: &Command) -> bool {
         return false;
     };
     match subcommand {
+        // `git apply` never runs hooks (only `git am` does), so tracing it only
+        // adds the trace2 temp file, tail thread and — on Windows — the process
+        // ancestry walk around every stage/unstage, which is pure overhead.
+        "apply" => true,
+        // `git diff` is read-only and never spawns a hook child either, so the
+        // same per-command trace2 bookkeeping is pure overhead around the diff
+        // reload that stage/unstage triggers.
+        "diff" => true,
         "remote" => args.next().is_some_and(|arg| arg == "set-url"),
         "config" => args.next().is_some_and(|arg| {
             matches!(

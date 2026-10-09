@@ -295,6 +295,12 @@ fn hook_free_commands_do_not_enable_trace2() {
         ],
         vec!["--no-optional-locks", "config", "--get", "core.editor"],
         vec!["config", "get", "user.name"],
+        // `git apply` and `git diff` never run hooks, so they must stay
+        // trace2-free (avoids the per-command monitor thread + Windows ancestry
+        // walk around every stage/unstage and its diff reload).
+        vec!["apply", "--cached", "patch"],
+        vec!["diff", "--cached"],
+        vec!["diff", "--no-index", "a", "b"],
     ] {
         let mut cmd = Command::new("git");
         cmd.args(args);

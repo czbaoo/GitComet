@@ -1,8 +1,9 @@
 use super::util::{
     DiffReloadMode, SelectedConflictTarget, apply_selected_diff_load_plan_state,
     apply_selected_diff_load_plan_state_with_reload_mode, diff_reload_effects,
-    format_failure_summary, push_action_log, push_command_log, refresh_full_effects,
-    refresh_primary_effects, selected_conflict_target, selected_diff_load_plan,
+    append_requested_status_refresh_effects, format_failure_summary, push_action_log,
+    push_command_log, refresh_full_effects, refresh_primary_effects,
+    selected_conflict_target, selected_diff_load_plan,
     start_conflict_target_reload, start_current_conflict_target_reload,
 };
 use crate::model::{
@@ -1643,7 +1644,24 @@ pub(super) fn repo_command_finished(
             extra_effects.extend(diff_reload_effects(repo_state, repo_id, target));
         }
     }
-    let mut effects = refresh_full_effects(repo_state, state.git_log_settings);
+    // Staging/unstaging only mutates the index; the branch, upstream divergence
+    // and history are unchanged. Skip those (potentially slow) refreshes and
+    // refresh just the working-tree + staged status — what the changes list
+    // shows. On a single repo-load worker this also stops the list refresh from
+    // queuing behind the head/upstream/log loads that `refresh_full_effects`
+    // would otherwise spawn for every stage.
+    let mut effects = if matches!(
+        &command,
+        RepoCommandKind::StageHunk
+            | RepoCommandKind::UnstageHunk
+            | RepoCommandKind::ApplyWorktreePatch { .. }
+    ) {
+        let mut status_effects = Vec::new();
+        append_requested_status_refresh_effects(repo_state, &mut status_effects);
+        status_effects
+    } else {
+        refresh_full_effects(repo_state, state.git_log_settings)
+    };
     effects.extend(extra_effects);
     effects
 }
