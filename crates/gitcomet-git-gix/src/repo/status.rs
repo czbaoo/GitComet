@@ -143,17 +143,14 @@ impl GixRepo {
             staged_status_full(&repo)?
         };
         cancellation.check_cancelled()?;
-        // Use the same direct worktree walk on the first scan as on cached
-        // scans. The generic status iterator keeps its stat updates private
-        // and can only persist them to disk; status must remain read-only.
-        // This walk retains clean-file stats in memory immediately instead
-        // of hashing touched-but-unchanged files again on the second scan.
-        let mut unstaged = Vec::new();
-        let direct = collect_index_worktree_status_direct(
+        // The worktree (unstaged) lane is the dominant cost on large
+        // repositories: it re-walks the whole tree for untracked files. After a
+        // stage/unstage that touched only a few paths, update just those paths
+        // (scoped gix walk) and reuse the prior lane for everything else.
+        let (unstaged, has_conflicted_unstaged) = self.worktree_status_compute(
             &repo,
-            &self.stat_refreshed_index,
-            &mut unstaged,
             may_have_gitlinks,
+            pending_affected.as_deref(),
             cancellation,
         )?;
         cancellation.check_cancelled()?;
@@ -167,20 +164,24 @@ impl GixRepo {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TreeIndexCacheEntry {
                 head_oid,
-                index_stamp,
+                index_stamp: index_stamp.clone(),
                 staged: staged.clone(),
             });
         }
 
         cancellation.check_cancelled()?;
-        finalize_status(
+        let status = finalize_status(
             &self.spec.workdir,
             &repo,
             may_have_gitlinks,
             staged,
             unstaged,
-            direct.has_conflicted_unstaged,
-        )
+            has_conflicted_unstaged,
+        )?;
+        // Cache the worktree lane so a subsequent stage/unstage can update only
+        // the affected paths instead of re-walking the whole tree.
+        self.store_worktree_status_cache(index_stamp, &status.unstaged);
+        Ok(status)
     }
 
     pub(super) fn worktree_status_impl(&self) -> Result<Vec<FileStatus>> {
@@ -198,19 +199,22 @@ impl GixRepo {
         }
         let index_stamp = repo_index_stamp(&repo);
         let may_have_gitlinks = self.may_have_gitlink_status_supplement(&repo, &index_stamp);
-        let mut unstaged = Vec::new();
-        let direct = collect_index_worktree_status_direct(
+        let pending_affected = self
+            .pending_affected_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let (mut unstaged, has_conflicted_unstaged) = self.worktree_status_compute(
             &repo,
-            &self.stat_refreshed_index,
-            &mut unstaged,
             may_have_gitlinks,
+            pending_affected.as_deref(),
             cancellation,
         )?;
         cancellation.check_cancelled()?;
 
         if should_supplement_unmerged_conflicts(
             crate::refs::operation_state(&repo)?.is_some(),
-            direct.has_conflicted_unstaged,
+            has_conflicted_unstaged,
         ) {
             apply_unmerged_conflicts(&repo, &mut unstaged)?;
             cancellation.check_cancelled()?;
@@ -227,7 +231,76 @@ impl GixRepo {
         }
 
         sort_and_dedup_status_entries(&mut unstaged);
+        self.store_worktree_status_cache(index_stamp, &unstaged);
         Ok(unstaged)
+    }
+
+    /// Computes the worktree (unstaged) lane. Returns the raw entries (before
+    /// conflict/gitlink supplements and sorting, which the caller applies) plus
+    /// whether the walk surfaced conflicted unstaged paths.
+    ///
+    /// When `pending_affected_paths` names a handful of paths that a stage/unstage
+    /// just touched, only those paths are re-walked (through a pathspec-scoped
+    /// gix walk) and merged into the previous lane — skipping the full-tree
+    /// untracked scan that dominates status cost on large repositories. The
+    /// non-affected entries are unchanged because the working tree was not
+    /// modified by the index edit. Falls back to a full walk when there is no
+    /// prior lane, the change is too large, a rebase/merge is in progress, or
+    /// any affected path is a directory.
+    pub(super) fn worktree_status_compute(
+        &self,
+        repo: &gix::Repository,
+        may_have_gitlinks: bool,
+        pending_affected: Option<&[PathBuf]>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<FileStatus>, bool)> {
+        if let Some(paths) = pending_affected
+            && paths.len() <= MAX_INCREMENTAL_STAGED_PATHS
+            && gix_unmerged_conflicts(repo)?.is_empty()
+        {
+            if let Some(base) = self.prior_worktree_status() {
+                if paths.iter().all(|p| !self.is_worktree_dir(p)) {
+                    if let Ok(unstaged) =
+                        worktree_status_incremental(repo, &base, paths, may_have_gitlinks, cancellation)
+                    {
+                        return Ok((unstaged, false));
+                    }
+                }
+            }
+        }
+        // Full walk — the ordinary, correctness-safe path.
+        let mut unstaged = Vec::new();
+        let direct = collect_index_worktree_status_direct(
+            repo,
+            &self.stat_refreshed_index,
+            &mut unstaged,
+            may_have_gitlinks,
+            cancellation,
+        )?;
+        Ok((unstaged, direct.has_conflicted_unstaged))
+    }
+
+    /// Returns whether `repo_relative` is a directory on disk. Directories need
+    /// recursive pathspec patterns and the dirwalk to descend, so an incremental
+    /// update bails to a full walk for them.
+    fn is_worktree_dir(&self, repo_relative: &Path) -> bool {
+        self.spec.workdir.join(repo_relative).is_dir()
+    }
+
+    fn prior_worktree_status(&self) -> Option<Vec<FileStatus>> {
+        self.worktree_status_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, entries)| entries.clone())
+    }
+
+    fn store_worktree_status_cache(&self, stamp: RepoFileStamp, status: &[FileStatus]) {
+        *self
+            .worktree_status_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((stamp, status.to_vec()));
     }
 
     pub(super) fn staged_status_impl(&self) -> Result<Vec<FileStatus>> {
@@ -544,6 +617,38 @@ fn staged_status_incremental(
         }
     }
     Ok(staged)
+}
+
+/// Updates `base` (the prior worktree lane) for the given affected `paths` only,
+/// by walking just those paths with a pathspec-scoped gix status walk. The
+/// non-affected entries are carried over unchanged, so re-walking the whole tree
+/// for untracked files is avoided. The returned entries are raw: the caller
+/// applies conflict/gitlink supplements and sorting.
+fn worktree_status_incremental(
+    repo: &gix::Repository,
+    base: &[FileStatus],
+    paths: &[PathBuf],
+    may_have_gitlinks: bool,
+    cancellation: &CancellationToken,
+) -> Result<Vec<FileStatus>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| Error::new(ErrorKind::Backend(format!("gix index: {e}"))))?;
+    let mut unstaged = base.to_vec();
+    // Drop the affected paths from the base, then re-add their current
+    // worktree state (recomputed by the scoped walk below).
+    for path in paths {
+        unstaged.retain(|entry| &entry.path != path);
+    }
+    collect_index_worktree_status_direct_from_index(
+        repo,
+        &index,
+        &mut unstaged,
+        may_have_gitlinks,
+        cancellation,
+        paths,
+    )?;
+    Ok(unstaged)
 }
 
 /// Computes the staged `FileStatus` for a single path by comparing HEAD's tree
@@ -905,6 +1010,7 @@ fn collect_index_worktree_status_direct(
         unstaged,
         may_have_gitlinks,
         cancellation,
+        &[],
     )
     .and_then(|result| {
         cancellation.check_cancelled()?;
@@ -985,6 +1091,7 @@ fn collect_index_worktree_status_direct_from_index(
     unstaged: &mut Vec<FileStatus>,
     may_have_gitlinks: bool,
     cancellation: &CancellationToken,
+    pathspec_patterns: &[PathBuf],
 ) -> Result<(DirectIndexWorktreeStatus, Vec<IndexWorktreeApplyChange>)> {
     let dirwalk_options = repo
         .dirwalk_options()
@@ -1010,6 +1117,7 @@ fn collect_index_worktree_status_direct_from_index(
             unstaged,
             submodule,
             cancellation,
+            pathspec_patterns,
         )?
     } else {
         collect_index_worktree_status_direct_with_submodule(
@@ -1019,6 +1127,7 @@ fn collect_index_worktree_status_direct_from_index(
             unstaged,
             NoopSubmoduleStatus,
             cancellation,
+            pathspec_patterns,
         )?
     };
     Ok((
@@ -1052,6 +1161,7 @@ fn collect_index_worktree_status_direct_with_submodule<S>(
     unstaged: &mut Vec<FileStatus>,
     submodule: S,
     cancellation: &CancellationToken,
+    pathspec_patterns: &[PathBuf],
 ) -> Result<StatusEntryCollection>
 where
     S: gix::status::plumbing::index_as_worktree::traits::SubmoduleStatus<
@@ -1070,13 +1180,23 @@ where
             None,
         )
         .map_err(|e| Error::new(ErrorKind::Backend(format!("gix status attributes: {e}"))))?;
+    // Build the pathspec from the affected-path patterns. Empty patterns mean
+    // "the whole tree" (the ordinary full walk); non-empty patterns scope the
+    // walk to just the files a stage/unstage touched, so an incremental update
+    // avoids re-scanning every untracked file.
+    let patterns: Vec<gix::bstr::BString> = pathspec_patterns
+        .iter()
+        .map(|p| {
+            gix::bstr::BString::from(p.as_os_str().to_string_lossy().into_owned().into_bytes())
+        })
+        .collect();
     let (pathspec, _pathspec_attr_stack) = gix::Pathspec::new(
         repo,
         false,
-        std::iter::empty::<gix::bstr::BString>(),
+        patterns,
         true,
         || -> gix::ExnResult<gix::worktree::Stack> {
-            unreachable!("empty direct-status patterns never require pathspec attributes")
+            unreachable!("direct-status patterns never require pathspec attributes")
         },
     )
     .map_err(|e| Error::new(ErrorKind::Backend(format!("gix status pathspec: {e}"))))?
@@ -1641,6 +1761,7 @@ pub(crate) mod tests {
         should_supplement_unmerged_conflicts, sort_and_dedup_status_entries, tree_id_for_commit,
     };
     use gitcomet_core::domain::{FileConflictKind, FileStatus, FileStatusKind};
+    use gitcomet_core::services::{CancellationToken, GitRepository};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
@@ -3174,5 +3295,190 @@ pub(crate) mod tests {
                 "timing worktree_status_after_touch files={files} text_auto={attributes} first={first_ms:.2}ms repeat_best={best:.2}ms repeat_cpu={repeat_cpu:.1}ms refreshed_index={clean:.2}ms refreshed_cpu={clean_cpu:.1}ms"
             );
         }
+    }
+
+    /// Canonical, order-independent form of a worktree lane for equality checks.
+    fn normalize_worktree(entries: &[FileStatus]) -> Vec<(PathBuf, FileStatusKind, Option<FileConflictKind>)> {
+        let mut out: Vec<_> = entries
+            .iter()
+            .map(|e| (e.path.clone(), e.kind, e.conflict))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// After a stage/unstage, the list refresh must update only the affected
+    /// paths against the prior lane instead of re-walking the whole tree for
+    /// untracked files. The incremental result must still equal a fresh full
+    /// walk — across unstaged-modified, untracked, and deleted shapes, in both
+    /// the stage (path leaves the lane) and unstage (path re-enters) directions.
+    #[test]
+    fn incremental_worktree_after_stage_and_unstage_matches_full_walk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+
+        write_file(workdir, "a.txt", "a\n");
+        write_file(workdir, "b.txt", "b\n");
+        write_file(workdir, "c.txt", "c\n");
+        git_success(workdir, &["add", "-A"]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+
+        // a.txt: modified in the worktree, left unstaged.
+        write_file(workdir, "a.txt", "a\nchanged\n");
+        // b.txt: modified in the worktree AND staged (clean in the worktree lane).
+        write_file(workdir, "b.txt", "b\nchanged\n");
+        git_success(workdir, &["add", "b.txt"]);
+        // c.txt: deleted from the worktree.
+        fs::remove_file(workdir.join("c.txt")).expect("remove c.txt");
+        // u.txt: a brand-new untracked file.
+        write_file(workdir, "u.txt", "untracked\n");
+
+        let gix_repo = open_repo(workdir);
+        let cancel = CancellationToken::new();
+
+        // Populate the prior full-walk lane (also exercises the empty-pathset
+        // full walk that the ordinary refresh uses).
+        let _ = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("baseline walk");
+
+        // Stage a.txt: it leaves the worktree lane. The next reload takes the
+        // incremental path and must still agree with a fresh full walk.
+        gix_repo.stage(&[Path::new("a.txt")]).expect("stage a.txt");
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("incremental walk after stage");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk after stage");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "worktree lane disagrees with full walk after staging a.txt"
+        );
+
+        // Unstage a.txt: it must re-enter the worktree lane as modified.
+        gix_repo.unstage(&[Path::new("a.txt")]).expect("unstage a.txt");
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("incremental walk after unstage");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk after unstage");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "worktree lane disagrees with full walk after unstaging a.txt"
+        );
+
+        // Stage the untracked u.txt: it leaves the worktree lane too.
+        gix_repo.stage(&[Path::new("u.txt")]).expect("stage u.txt");
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("incremental walk after staging untracked");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk after staging untracked");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "worktree lane disagrees with full walk after staging u.txt"
+        );
+
+        // And unstage it again, returning u.txt to untracked.
+        gix_repo.unstage(&[Path::new("u.txt")]).expect("unstage u.txt");
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("incremental walk after unstage untracked");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk after unstage untracked");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "worktree lane disagrees with full walk after unstaging u.txt"
+        );
+    }
+
+    /// A directory path in `pending_affected_paths` must not drive the scoped
+    /// incremental walk (the dirwalk would have to descend). The lane must fall
+    /// back to a full walk and still match it.
+    #[test]
+    fn incremental_worktree_skips_directory_paths_and_falls_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+
+        write_file(workdir, "dir/nested.txt", "nested\n");
+        write_file(workdir, "dir/other.txt", "other\n");
+        git_success(workdir, &["add", "-A"]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+        write_file(workdir, "dir/nested.txt", "changed\n");
+
+        let gix_repo = open_repo(workdir);
+        let cancel = CancellationToken::new();
+        let _ = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("baseline walk");
+
+        // Simulate a stage that recorded a directory path.
+        *gix_repo.pending_affected_paths.lock().unwrap() = Some(vec![PathBuf::from("dir")]);
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("walk with directory pending");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "directory pending path did not fall back to a correct full walk"
+        );
+    }
+
+    /// More than `MAX_INCREMENTAL_STAGED_PATHS` affected paths must fall back to
+    /// a full walk rather than risk a partial update.
+    #[test]
+    fn incremental_worktree_skips_too_many_paths_and_falls_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+
+        let count = 20usize;
+        for i in 0..count {
+            write_file(workdir, &format!("f{i:02}.txt"), "seed\n");
+        }
+        git_success(workdir, &["add", "-A"]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+        for i in 0..count {
+            write_file(workdir, &format!("f{i:02}.txt"), "changed\n");
+        }
+
+        let gix_repo = open_repo(workdir);
+        let cancel = CancellationToken::new();
+        let _ = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("baseline walk");
+
+        let many: Vec<PathBuf> = (0..count).map(|i| PathBuf::from(format!("f{i:02}.txt"))).collect();
+        *gix_repo.pending_affected_paths.lock().unwrap() = Some(many);
+        let incremental = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("walk with many pending");
+        *gix_repo.pending_affected_paths.lock().unwrap() = None;
+        let full = gix_repo
+            .worktree_status_cancellable(&cancel)
+            .expect("full walk");
+        assert_eq!(
+            normalize_worktree(&incremental),
+            normalize_worktree(&full),
+            "over-threshold pending paths did not fall back to a correct full walk"
+        );
     }
 }

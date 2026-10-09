@@ -498,6 +498,15 @@ pub(crate) struct GixRepo {
     /// the affected paths) instead of re-walking the whole tree↔index diff.
     /// Cleared once it has served a reload.
     pending_affected_paths: std::sync::Mutex<Option<Vec<PathBuf>>>,
+    /// Last full worktree (unstaged) lane, keyed by the `.git/index` stamp it
+    /// was computed against. After a stage/unstage that touched only a few
+    /// paths, the next worktree reload updates just those paths against this
+    /// base instead of re-walking the whole tree for untracked files — the
+    /// dominant cost on large repositories. Invalidated (refreshed by a full
+    /// walk) on every non-incremental status load.
+    worktree_status_cache: std::sync::Mutex<
+        Option<(RepoFileStamp, Vec<gitcomet_core::domain::FileStatus>)>,
+    >,
     log_page_cache: std::sync::Mutex<Vec<LogPageCacheEntry>>,
     history_authors_cache: std::sync::Mutex<Option<log::HistoryAuthorsCache>>,
     range_reader: std::sync::Mutex<Option<RangeReader>>,
@@ -558,6 +567,7 @@ impl GixRepo {
             large_file_scan: Default::default(),
             tree_index_cache: std::sync::Mutex::new(None),
             pending_affected_paths: std::sync::Mutex::new(None),
+            worktree_status_cache: std::sync::Mutex::new(None),
             log_page_cache: std::sync::Mutex::new(Vec::new()),
             history_authors_cache: Default::default(),
             range_reader: Default::default(),

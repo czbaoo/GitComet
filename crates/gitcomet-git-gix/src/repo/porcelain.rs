@@ -852,12 +852,20 @@ impl GixRepo {
             cmd.args(["add", "-A"]);
             return run_git_simple(cmd, "git add -A");
         }
-        run_git_simple_with_paths(
+        let result = run_git_simple_with_paths(
             &self.spec.workdir,
             "git update-index",
             &["update-index", "--add", "--remove"],
             paths,
-        )
+        );
+        // Record the touched paths so the next status reload can update only
+        // these paths in the worktree (unstaged) lane and reuse the staged
+        // cache, instead of re-walking the whole tree for untracked files — the
+        // dominant cost on large repositories.
+        if result.is_ok() {
+            self.record_affected_paths(paths);
+        }
+        result
     }
 
     fn merge_untracked_restore_conflicts_from_stash(
@@ -1066,7 +1074,7 @@ impl GixRepo {
             return Ok(());
         }
 
-        if has_commits {
+        let result = if has_commits {
             run_git_simple_with_paths(
                 &self.spec.workdir,
                 "git restore --staged",
@@ -1080,7 +1088,42 @@ impl GixRepo {
                 &["rm", "--cached"],
                 &requested,
             )
+        };
+        // Record the touched paths so the next status reload can update only
+        // these paths in the worktree (unstaged) lane, rather than re-walking
+        // the whole tree for untracked files.
+        if result.is_ok() {
+            self.record_affected_paths(&requested);
         }
+        result
+    }
+
+    /// Records the paths a stage/unstage just touched, in repo-relative form, so
+    /// the next status reload can update only those paths instead of re-walking
+    /// the whole tree. Mirrors the incremental-staged bookkeeping that the hunk
+    /// staging path (`apply_unified_patch_to_index_with_output_impl`) already
+    /// does; file-level stage/unstage was previously leaving it unset, which
+    /// forced a full tree↔index and worktree scan on every click.
+    fn record_affected_paths(&self, paths: &[&Path]) {
+        let affected: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| self.repo_relative_path(path))
+            .collect();
+        *self
+            .pending_affected_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(affected);
+    }
+
+    /// Returns `path` relative to this repository's workdir when it carries the
+    /// workdir prefix (absolute paths from the UI), otherwise returns it
+    /// unchanged (already repo-relative). The staged/worktree incremental
+    /// machinery matches paths against the index, which stores repo-relative
+    /// paths.
+    fn repo_relative_path(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.spec.workdir)
+            .unwrap_or(path)
+            .to_path_buf()
     }
 
     pub(super) fn commit_impl(&self, message: &str) -> Result<()> {
