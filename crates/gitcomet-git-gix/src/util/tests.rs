@@ -301,6 +301,11 @@ fn hook_free_commands_do_not_enable_trace2() {
         vec!["apply", "--cached", "patch"],
         vec!["diff", "--cached"],
         vec!["diff", "--no-index", "a", "b"],
+        // `git update-index` is a pure index edit and `git restore --staged`
+        // only rewrites the index; neither can run a hook, so they must stay
+        // trace2-free around every stage/unstage.
+        vec!["update-index", "--add", "--remove", "--", "path"],
+        vec!["restore", "--staged", "--", "path"],
     ] {
         let mut cmd = Command::new("git");
         cmd.args(args);
@@ -316,6 +321,9 @@ fn hook_free_commands_do_not_enable_trace2() {
         vec!["--unknown", "config", "--list"],
         vec!["custom-alias"],
         vec!["-C"],
+        // A worktree `git restore` (no `--staged`) can still run a smudge
+        // filter, so it must remain traced.
+        vec!["restore", "--", "path"],
     ] {
         let mut cmd = Command::new("git");
         cmd.args(args);

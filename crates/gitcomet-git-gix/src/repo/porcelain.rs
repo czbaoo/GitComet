@@ -838,7 +838,26 @@ impl GixRepo {
     }
 
     pub(super) fn stage_impl(&self, paths: &[&Path]) -> Result<()> {
-        run_git_simple_with_paths(&self.spec.workdir, "git add", &["add", "-A"], paths)
+        // Stage by path through `update-index` rather than `git add -A`. `git add`
+        // runs `refresh_index()`, lstat-ing every tracked file in the repository
+        // before it touches the requested path; on large repositories and slow
+        // filesystems (e.g. NTFS) that full-tree scan is the dominant cost and
+        // makes staging a single file several times slower than clients that
+        // stage by path (e.g. SourceTree). `update-index --add --remove` rewrites
+        // only the named entries and applies the same clean filters / .gitattributes
+        // conversions as `git add`, so staging behaviour is identical. The empty
+        // path set keeps the original `git add -A` "stage everything" semantics.
+        if paths.is_empty() {
+            let mut cmd = self.git_workdir_cmd();
+            cmd.args(["add", "-A"]);
+            return run_git_simple(cmd, "git add -A");
+        }
+        run_git_simple_with_paths(
+            &self.spec.workdir,
+            "git update-index",
+            &["update-index", "--add", "--remove"],
+            paths,
+        )
     }
 
     fn merge_untracked_restore_conflicts_from_stash(
@@ -1027,8 +1046,8 @@ impl GixRepo {
                 }
                 return run_git_simple_with_paths(
                     &self.spec.workdir,
-                    "git reset HEAD",
-                    &["reset", "HEAD"],
+                    "git restore --staged",
+                    &["restore", "--staged"],
                     &staged_paths,
                 );
             }
@@ -1050,8 +1069,8 @@ impl GixRepo {
         if has_commits {
             run_git_simple_with_paths(
                 &self.spec.workdir,
-                "git reset HEAD",
-                &["reset", "HEAD"],
+                "git restore --staged",
+                &["restore", "--staged"],
                 &requested,
             )
         } else {

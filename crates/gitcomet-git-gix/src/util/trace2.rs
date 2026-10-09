@@ -77,6 +77,15 @@ pub(super) fn command_is_known_hook_free(cmd: &Command) -> bool {
         // same per-command trace2 bookkeeping is pure overhead around the diff
         // reload that stage/unstage triggers.
         "diff" => true,
+        // `git update-index` is a pure index edit that never runs a hook, so the
+        // trace2 monitor around a path staged/unstaged by `update-index` is
+        // pure overhead.
+        "update-index" => true,
+        // `git restore --staged` only rewrites the index and never spawns a
+        // hook child, so it too can skip the trace2 bookkeeping. A worktree
+        // `git restore` (without `--staged`) can still run a smudge filter and
+        // is left traced.
+        "restore" => args.any(|arg| arg == "--staged"),
         "remote" => args.next().is_some_and(|arg| arg == "set-url"),
         "config" => args.next().is_some_and(|arg| {
             matches!(
