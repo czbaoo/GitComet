@@ -934,6 +934,37 @@ fn finish_repo_action(
         return effects;
     };
 
+    // Staging/unstaging completes here, but the repo-load worker runs tasks in
+    // dispatch order and may have only one thread. `refresh_primary_effects`
+    // below dispatches head-branch, upstream-divergence and log loads before the
+    // status load, so on a single worker the changes list waits behind those
+    // unrelated git subprocesses before it can repaint — the visible "spinner
+    // stops, then the list refreshes a few seconds later" gap.
+    //
+    // For an index-only action, dispatch the status refresh (and the visible
+    // diff reload) first so they run first. The status request below then
+    // coalesces into this one instead of issuing a duplicate load.
+    let index_only = repo_action_is_index_only_status(action);
+    if index_only {
+        append_requested_status_refresh_effects(repo_state, &mut effects);
+        if is_active
+            && let Some(target) = repo_state.diff_state.diff_target.clone()
+        {
+            if let Some(conflict_target) = selected_conflict_target(repo_state, &target) {
+                match conflict_target {
+                    SelectedConflictTarget::Current => {
+                        effects.extend(start_current_conflict_target_reload(repo_state));
+                    }
+                    SelectedConflictTarget::Path(path) => {
+                        effects.extend(start_conflict_target_reload(repo_state, path));
+                    }
+                }
+            } else {
+                effects.extend(diff_reload_effects(repo_state, repo_id, target));
+            }
+        }
+    }
+
     // Re-issue the primary panes (head branch, ahead/behind, rebase/merge, status, log). The flags
     // were just cleared, so request_* dispatches fresh loads under the new epoch.
     effects.extend(refresh_primary_effects(repo_state));
@@ -964,7 +995,9 @@ fn finish_repo_action(
         let history_reloads = selected_history_reloads_for_activation(repo_state);
         append_selected_history_reload_effects(repo_id, repo_state, history_reloads, &mut effects);
 
-        if let Some(target) = repo_state.diff_state.diff_target.clone() {
+        if !index_only
+            && let Some(target) = repo_state.diff_state.diff_target.clone()
+        {
             if let Some(conflict_target) = selected_conflict_target(repo_state, &target) {
                 match conflict_target {
                     SelectedConflictTarget::Current => {
@@ -1027,6 +1060,23 @@ fn repo_action_clears_head_dependent_state(action: RepoActionKind) -> bool {
             | RepoActionKind::CherryPickCommit
             | RepoActionKind::CreateBranchAndCheckout
             | RepoActionKind::RenameBranch
+    )
+}
+
+/// Whether an action only rewrites the index (stage/unstage), leaving HEAD,
+/// the branch, upstream divergence and history untouched.
+///
+/// Such an action still refreshes every pane (the epoch bump requires
+/// re-issuing whatever was in flight), but the reduced set of things it can
+/// change lets `finish_repo_action` dispatch the status refresh ahead of the
+/// head/upstream/log loads.
+fn repo_action_is_index_only_status(action: RepoActionKind) -> bool {
+    matches!(
+        action,
+        RepoActionKind::StagePath
+            | RepoActionKind::StagePaths
+            | RepoActionKind::UnstagePath
+            | RepoActionKind::UnstagePaths
     )
 }
 

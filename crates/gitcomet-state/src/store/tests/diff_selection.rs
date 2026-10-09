@@ -2108,6 +2108,59 @@ fn status_actions_close_only_matching_diffs_after_success() {
 }
 
 #[test]
+fn stage_action_dispatches_status_refresh_before_other_primary_loads() {
+    use gitcomet_core::domain::DiffArea;
+    for action in [
+        RepoActionKind::StagePath,
+        RepoActionKind::StagePaths,
+        RepoActionKind::UnstagePath,
+        RepoActionKind::UnstagePaths,
+    ] {
+        let target = DiffTarget::working_tree("shown.rs".into(), DiffArea::Unstaged);
+        let mut state = status_action_state(target);
+        state.repos[0].local_actions_in_flight = 1;
+        let effects = reduce(
+            &mut FxHashMap::default(),
+            &AtomicU64::new(3),
+            &mut state,
+            Msg::Internal(crate::msg::InternalMsg::RepoPathsActionFinished {
+                repo_id: RepoId(1),
+                action,
+                paths: vec![PathBuf::from("shown.rs")].into(),
+                result: Ok(()),
+            }),
+        );
+
+        let first_status = effects.iter().position(|effect| {
+            matches!(
+                effect,
+                Effect::LoadStatus { .. }
+                    | Effect::LoadWorktreeStatus { .. }
+                    | Effect::LoadStagedStatus { .. }
+            )
+        });
+        let first_other_primary = effects.iter().position(|effect| {
+            matches!(
+                effect,
+                Effect::LoadHeadBranch { .. }
+                    | Effect::LoadUpstreamDivergence { .. }
+                    | Effect::LoadLog { .. }
+            )
+        });
+
+        let first_status = first_status
+            .unwrap_or_else(|| panic!("action={action:?} must refresh status, got {effects:?}"));
+        let first_other_primary = first_other_primary
+            .unwrap_or_else(|| panic!("action={action:?} should still refresh the other panes"));
+        assert!(
+            first_status < first_other_primary,
+            "action={action:?} must dispatch the status refresh first so the changes list \
+             repaints before the head/upstream/log loads on a single-worker executor, got {effects:?}"
+        );
+    }
+}
+
+#[test]
 fn discarding_staged_files_closes_only_removed_additions() {
     use gitcomet_core::domain::DiffArea;
     for kind in [FileStatusKind::Added, FileStatusKind::Modified] {
