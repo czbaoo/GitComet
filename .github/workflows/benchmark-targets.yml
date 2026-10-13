@@ -38,14 +38,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: ubuntu22-x64
-            runner: ubuntu-22.04
-          - name: macos-latest-arm64
-            runner: macos-latest
+          # Fork-local: only the Windows x64 target is kept.
           - name: windows-x64
             runner: windows-latest
-          - name: windows-arm64
-            runner: windows-11-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux UI link dependencies
